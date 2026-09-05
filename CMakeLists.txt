@@ -28,11 +28,6 @@ if(HYPELIMITS_BUILD_APP AND WIN32)
     target_link_libraries(hypelimits PRIVATE hypelimits_core user32 gdi32 comctl32 shell32 advapi32 dwmapi winmm winhttp credui uxtheme iphlpapi ws2_32 bcrypt)
     target_include_directories(hypelimits PRIVATE src)
     target_compile_definitions(hypelimits PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
-    # Antigravity (Google) OAuth client secret. Never commit this; pass it on the
-    # configure line instead, e.g. -DHYPELIMITS_GOOGLE_CLIENT_SECRET=...
-    if(HYPELIMITS_GOOGLE_CLIENT_SECRET)
-        target_compile_definitions(hypelimits PRIVATE HYPELIMITS_GOOGLE_CLIENT_SECRET="${HYPELIMITS_GOOGLE_CLIENT_SECRET}")
-    endif()
     if(MSVC)
         target_compile_options(hypelimits PRIVATE /W4 /permissive- /utf-8)
         target_link_options(hypelimits PRIVATE

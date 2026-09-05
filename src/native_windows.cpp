@@ -27,13 +27,6 @@
 #include <netioapi.h>
 #include <bcrypt.h>
 
-// The Antigravity (Google) OAuth client secret is supplied at build time so no credential
-// material is stored in the repository. Configure it with:
-//   cmake -DHYPELIMITS_GOOGLE_CLIENT_SECRET=...
-#ifndef HYPELIMITS_GOOGLE_CLIENT_SECRET
-#define HYPELIMITS_GOOGLE_CLIENT_SECRET ""
-#endif
-
 #ifndef PROCESS_POWER_THROTTLING_CURRENT_VERSION
 #define PROCESS_POWER_THROTTLING_CURRENT_VERSION 1
 #endif
@@ -103,6 +96,7 @@ enum ControlId {
     IdThreshold,
     IdCreditBarFull,
     IdDisconnect,
+    IdGoogleClientSecret,
     IdClose,
     IdTrayShow = 300,
     IdTrayRefresh,
@@ -332,6 +326,21 @@ public:
         return present;
     }
 };
+
+constexpr std::wstring_view kGoogleClientSecretId{L"oauth-google-client-secret"};
+
+std::string loadGoogleClientSecret() {
+    auto stored = CredentialStore::loadUtf8(kGoogleClientSecretId);
+    if (!stored) return {};
+    return std::move(*stored);
+}
+
+bool googleClientSecretConfigured() {
+    auto secret = loadGoogleClientSecret();
+    const bool ok = !secret.empty();
+    if (!secret.empty()) SecureZeroMemory(secret.data(), secret.size());
+    return ok;
+}
 
 std::wstring userProfile() {
     wchar_t home[MAX_PATH]{};
@@ -1016,9 +1025,12 @@ bool refreshOAuth(std::wstring_view id, AuthMaterial& auth) {
                                  "&client_id=" + urlEncode("b1a00492-073a-47ea-816f-4c329264a828");
         response = httpsPost(L"auth.x.ai", L"/oauth2/token", body, L"Content-Type: application/x-www-form-urlencoded\r\n");
     } else if (id == L"antigravity") {
+        auto secret = loadGoogleClientSecret();
+        if (secret.empty()) return false;
         const std::string body = "grant_type=refresh_token&refresh_token=" + urlEncode(auth.refreshToken) +
                                  "&client_id=" + urlEncode("681255809395-oo8ft2oprdrnp9e3aqf6av3hmdib135j.apps.googleusercontent.com") +
-                                 "&client_secret=" + urlEncode(HYPELIMITS_GOOGLE_CLIENT_SECRET);
+                                 "&client_secret=" + urlEncode(secret);
+        SecureZeroMemory(secret.data(), secret.size());
         response = httpsPost(L"oauth2.googleapis.com", L"/token", body, L"Content-Type: application/x-www-form-urlencoded\r\n");
     } else if (id == L"moonshot") {
         const std::string body = "grant_type=refresh_token&refresh_token=" + urlEncode(auth.refreshToken) +
@@ -1202,7 +1214,8 @@ bool runGrokOAuth(HWND parent, AuthMaterial& auth) {
 }
 
 bool runGoogleOAuth(HWND parent, AuthMaterial& auth) {
-    if (std::string_view(HYPELIMITS_GOOGLE_CLIENT_SECRET).empty()) return false;
+    auto secret = loadGoogleClientSecret();
+    if (secret.empty()) return false;
     const std::string startBody = "client_id=" + urlEncode("681255809395-oo8ft2oprdrnp9e3aqf6av3hmdib135j.apps.googleusercontent.com") +
                                   "&scope=" + urlEncode("https://www.googleapis.com/auth/cloud-platform https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/userinfo.profile");
     const auto started = httpsPost(L"oauth2.googleapis.com", L"/device/code", startBody,
@@ -1211,14 +1224,18 @@ bool runGoogleOAuth(HWND parent, AuthMaterial& auth) {
     const auto userCode = jsonString(started.body, "user_code");
     auto verify = jsonString(started.body, "verification_url");
     if (!verify) verify = jsonString(started.body, "verification_uri");
-    if (started.status != 200 || !device || !userCode) return false;
+    if (started.status != 200 || !device || !userCode) {
+        SecureZeroMemory(secret.data(), secret.size());
+        return false;
+    }
     DevicePoll poll;
     poll.host = L"oauth2.googleapis.com";
     poll.path = L"/token";
     poll.body = "grant_type=" + urlEncode("urn:ietf:params:oauth:grant-type:device_code") +
                 "&device_code=" + urlEncode(*device) +
                 "&client_id=" + urlEncode("681255809395-oo8ft2oprdrnp9e3aqf6av3hmdib135j.apps.googleusercontent.com") +
-                "&client_secret=" + urlEncode(HYPELIMITS_GOOGLE_CLIENT_SECRET);
+                "&client_secret=" + urlEncode(secret);
+    SecureZeroMemory(secret.data(), secret.size());
     if (const auto interval = jsonNumber(started.body, "interval")) poll.intervalMs = std::max(1000, static_cast<int>(*interval * 1000.0));
     poll.complete = [](const HttpResponse& response, AuthMaterial& out) {
         if (response.status != 200 || !jsonString(response.body, "access_token")) return false;
@@ -1470,6 +1487,8 @@ private:
     void playWarning();
     void playReset();
     void playTone(bool reset);
+    void persistGoogleClientSecretField();
+    void syncGoogleSecretControls();
 
     HINSTANCE instance_{};
     HWND trayWindow_{};
@@ -1500,6 +1519,8 @@ private:
     HWND creditBarFull_{};
     HWND creditBarFullLabel_{};
     HWND disconnect_{};
+    HWND googleSecretLabel_{};
+    HWND googleSecret_{};
     HWND close_{};
     HFONT font_{};
     HICON trayIcon_{};
@@ -1587,7 +1608,7 @@ void App::createProviders() {
          L"A Grok CLI login fetches SuperGrok usage from cli-chat-proxy billing. A Management API key fetches prepaid API credit.",
          {MetricKind::Session, MetricKind::Weekly, MetricKind::ApiCredit}},
         {L"antigravity", L"Google Antigravity", L"https://antigravity.google/",
-         L"Connect with the Antigravity or Gemini CLI Google login. HypeLimits uses Cloud Code Assist loadCodeAssist and fetchAvailableModels.",
+         L"Connect with the Antigravity or Gemini CLI Google login. Paste the Google OAuth client secret on this tab before in-app Google sign-in; it is stored in Windows Credential Manager. HypeLimits uses Cloud Code Assist loadCodeAssist and fetchAvailableModels.",
          {MetricKind::Session, MetricKind::Weekly, MetricKind::ApiCredit}},
     };
     for (auto& definition : definitions) {
@@ -1672,7 +1693,7 @@ bool App::initialize(HINSTANCE instance) {
     floatingWindow_ = CreateWindowExW(WS_EX_TOOLWINDOW | (readDword(L"AlwaysOnTop", 1) ? WS_EX_TOPMOST : 0),
         floatingClass.lpszClassName, kAppName, WS_POPUP, x, y, width, 80, nullptr, nullptr, instance_, this);
     optionsWindow_ = CreateWindowExW(WS_EX_APPWINDOW, optionsClass.lpszClassName, L"HypeLimits Options",
-        WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT, 720, 780, nullptr, nullptr, instance_, this);
+        WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT, 720, 820, nullptr, nullptr, instance_, this);
     if (!trayWindow_ || !floatingWindow_ || !optionsWindow_) return false;
 
     BOOL dark = TRUE;
@@ -1776,6 +1797,10 @@ void App::createOptionsControls() {
     threshold_ = make(L"EDIT", L"10.00", WS_BORDER | WS_TABSTOP, IdThreshold);
     creditBarFullLabel_ = make(L"STATIC", L"API credit bar full ($)", SS_LEFT, 0);
     creditBarFull_ = make(L"EDIT", L"100.00", WS_BORDER | WS_TABSTOP, IdCreditBarFull);
+    googleSecretLabel_ = make(L"STATIC", L"Google OAuth client secret", SS_LEFT, 0);
+    googleSecret_ = make(L"EDIT", L"", WS_BORDER | ES_AUTOHSCROLL | ES_PASSWORD | WS_TABSTOP, IdGoogleClientSecret);
+    ShowWindow(googleSecretLabel_, SW_HIDE);
+    ShowWindow(googleSecret_, SW_HIDE);
     close_ = make(L"BUTTON", L"Close", BS_DEFPUSHBUTTON | WS_TABSTOP, IdClose);
     SetWindowTextW(interval_, std::to_wstring(readDword(L"PollingMinutes", 5)).c_str());
     Button_SetCheck(sounds_, readDword(L"SoundsEnabled", 1) ? BST_CHECKED : BST_UNCHECKED);
@@ -1814,6 +1839,36 @@ void App::syncWslControlVisibility() {
     for (HWND hwnd : wslUserChecks_) ShowWindow(hwnd, enabled ? SW_SHOW : SW_HIDE);
 }
 
+void App::syncGoogleSecretControls() {
+    const bool show = selectedProvider_ < providers_.size()
+        && providers_[selectedProvider_].definition.id == L"antigravity";
+    ShowWindow(googleSecretLabel_, show ? SW_SHOW : SW_HIDE);
+    ShowWindow(googleSecret_, show ? SW_SHOW : SW_HIDE);
+    if (!show) return;
+    SetWindowTextW(googleSecretLabel_, googleClientSecretConfigured()
+        ? L"Google OAuth client secret (saved — paste a new value to replace)"
+        : L"Google OAuth client secret (required for Google sign-in and token refresh)");
+}
+
+void App::persistGoogleClientSecretField() {
+    if (!googleSecret_) return;
+    wchar_t value[512]{};
+    GetWindowTextW(googleSecret_, value, static_cast<int>(std::size(value)));
+    std::wstring text = value;
+    SecureZeroMemory(value, sizeof(value));
+    while (!text.empty() && iswspace(text.front())) text.erase(text.begin());
+    while (!text.empty() && iswspace(text.back())) text.pop_back();
+    if (text.empty()) return;
+    if (!CredentialStore::save(kGoogleClientSecretId, text)) {
+        SecureZeroMemory(text.data(), text.size() * sizeof(wchar_t));
+        MessageBoxW(optionsWindow_, L"Windows Credential Manager rejected the Google OAuth client secret.", kAppName, MB_ICONERROR);
+        return;
+    }
+    SecureZeroMemory(text.data(), text.size() * sizeof(wchar_t));
+    SetWindowTextW(googleSecret_, L"");
+    syncGoogleSecretControls();
+}
+
 void App::layoutOptions(int width, int height) {
     const int margin = 16;
     const int innerLeft = margin + 12;
@@ -1832,6 +1887,7 @@ void App::layoutOptions(int width, int height) {
     if (ownStyleVisible(wslEmpty_)) extraBottom += 22;
     extraBottom += 24 * static_cast<int>(std::count_if(wslUserChecks_.begin(), wslUserChecks_.end(), ownStyleVisible));
     if (ownStyleVisible(creditBarFull_)) extraBottom += 34;
+    if (ownStyleVisible(googleSecret_)) extraBottom += 56;
     const int statusH = std::max(90, height - y - 298 - extraBottom);
     MoveWindow(status_, innerLeft, y, innerWidth, statusH, TRUE);
     y += statusH + 10;
@@ -1853,6 +1909,12 @@ void App::layoutOptions(int width, int height) {
 
     MoveWindow(enabled_, innerLeft, y, innerWidth, 28, TRUE);
     y += 32;
+    if (ownStyleVisible(googleSecret_)) {
+        MoveWindow(googleSecretLabel_, innerLeft, y, innerWidth, 22, TRUE);
+        y += 24;
+        MoveWindow(googleSecret_, innerLeft, y, innerWidth, 26, TRUE);
+        y += 34;
+    }
     if (ownStyleVisible(threshold_)) {
         const int fieldWidth = 88;
         MoveWindow(thresholdLabel_, innerLeft, y, std::max(80, innerWidth - fieldWidth - 8), 26, TRUE);
@@ -1929,6 +1991,7 @@ void App::updateOptions() {
     ShowWindow(creditBarFull_, hasCredit ? SW_SHOW : SW_HIDE);
     ShowWindow(creditBarFullLabel_, hasCredit ? SW_SHOW : SW_HIDE);
     ShowWindow(disconnect_, provider.connected ? SW_SHOW : SW_HIDE);
+    syncGoogleSecretControls();
     syncWslControlVisibility();
     RECT client{};
     GetClientRect(optionsWindow_, &client);
@@ -2244,6 +2307,7 @@ void App::reloadCliConnections() {
 }
 
 void App::connectProvider() {
+    persistGoogleClientSecretField();
     auto& provider = providers_[selectedProvider_];
     const bool cliReady = !loadCliAuth(provider.definition.id).token.empty();
     const bool canOAuth = providerHasSubscriptionOAuth(provider.definition.id);
@@ -2292,6 +2356,12 @@ void App::connectProvider() {
         return;
     }
     if (chosen == kSignIn) {
+        if (provider.definition.id == L"antigravity" && !googleClientSecretConfigured()) {
+            MessageBoxW(optionsWindow_,
+                L"Paste the Google OAuth client secret on this tab first. It is stored in Windows Credential Manager and is required for in-app Google sign-in and token refresh.",
+                kAppName, MB_ICONWARNING);
+            return;
+        }
         AuthMaterial auth;
         if (!runSubscriptionOAuth(optionsWindow_, provider.definition.id, auth) || auth.token.empty()) {
             MessageBoxW(optionsWindow_, L"Subscription sign-in did not complete. You can try again or paste a token.", kAppName, MB_ICONWARNING);
@@ -2606,9 +2676,13 @@ LRESULT App::onOptions(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
     switch (message) {
     case WM_CREATE: return 0;
     case WM_SIZE: layoutOptions(LOWORD(lParam), HIWORD(lParam)); return 0;
-    case WM_CLOSE: ShowWindow(hwnd, SW_HIDE); return 0;
+    case WM_CLOSE:
+        persistGoogleClientSecretField();
+        ShowWindow(hwnd, SW_HIDE);
+        return 0;
     case WM_NOTIFY:
         if (reinterpret_cast<NMHDR*>(lParam)->idFrom == IdTab && reinterpret_cast<NMHDR*>(lParam)->code == TCN_SELCHANGE) {
+            persistGoogleClientSecretField();
             selectedProvider_ = static_cast<std::size_t>(TabCtrl_GetCurSel(tab_));
             updateOptions();
         }
@@ -2676,7 +2750,13 @@ LRESULT App::onOptions(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
         }
         case IdPreviewWarning: playWarning(); return 0;
         case IdPreviewReset: playReset(); return 0;
-        case IdClose: ShowWindow(hwnd, SW_HIDE); return 0;
+        case IdClose:
+            persistGoogleClientSecretField();
+            ShowWindow(hwnd, SW_HIDE);
+            return 0;
+        case IdGoogleClientSecret:
+            if (HIWORD(wParam) == EN_KILLFOCUS) persistGoogleClientSecretField();
+            return 0;
         case IdInterval:
             if (HIWORD(wParam) == EN_KILLFOCUS) {
                 wchar_t value[16]{}; GetWindowTextW(interval_, value, static_cast<int>(std::size(value)));
@@ -2809,7 +2889,10 @@ LRESULT App::onTray(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
         case IdTrayShow: toggleMonitor(); break;
         case IdTrayRefresh: refresh(); break;
         case IdTrayOptions: showOptions(); break;
-        case IdTrayQuit: DestroyWindow(hwnd); break;
+        case IdTrayQuit:
+            persistGoogleClientSecretField();
+            DestroyWindow(hwnd);
+            break;
         }
         return 0;
     case WM_TIMER:
