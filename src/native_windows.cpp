@@ -27,12 +27,9 @@
 #include <netioapi.h>
 #include <bcrypt.h>
 
-// Antigravity (Google) OAuth application credentials are supplied at build time so no
-// credential material is stored in the repository. Configure them with:
-//   cmake -DHYPELIMITS_GOOGLE_CLIENT_ID=... -DHYPELIMITS_GOOGLE_CLIENT_SECRET=...
-#ifndef HYPELIMITS_GOOGLE_CLIENT_ID
-#define HYPELIMITS_GOOGLE_CLIENT_ID ""
-#endif
+// The Antigravity (Google) OAuth client secret is supplied at build time so no credential
+// material is stored in the repository. Configure it with:
+//   cmake -DHYPELIMITS_GOOGLE_CLIENT_SECRET=...
 #ifndef HYPELIMITS_GOOGLE_CLIENT_SECRET
 #define HYPELIMITS_GOOGLE_CLIENT_SECRET ""
 #endif
@@ -1020,7 +1017,7 @@ bool refreshOAuth(std::wstring_view id, AuthMaterial& auth) {
         response = httpsPost(L"auth.x.ai", L"/oauth2/token", body, L"Content-Type: application/x-www-form-urlencoded\r\n");
     } else if (id == L"antigravity") {
         const std::string body = "grant_type=refresh_token&refresh_token=" + urlEncode(auth.refreshToken) +
-                                 "&client_id=" + urlEncode(HYPELIMITS_GOOGLE_CLIENT_ID) +
+                                 "&client_id=" + urlEncode("681255809395-oo8ft2oprdrnp9e3aqf6av3hmdib135j.apps.googleusercontent.com") +
                                  "&client_secret=" + urlEncode(HYPELIMITS_GOOGLE_CLIENT_SECRET);
         response = httpsPost(L"oauth2.googleapis.com", L"/token", body, L"Content-Type: application/x-www-form-urlencoded\r\n");
     } else if (id == L"moonshot") {
@@ -1205,8 +1202,8 @@ bool runGrokOAuth(HWND parent, AuthMaterial& auth) {
 }
 
 bool runGoogleOAuth(HWND parent, AuthMaterial& auth) {
-    if (std::string_view(HYPELIMITS_GOOGLE_CLIENT_ID).empty() || std::string_view(HYPELIMITS_GOOGLE_CLIENT_SECRET).empty()) return false;
-    const std::string startBody = "client_id=" + urlEncode(HYPELIMITS_GOOGLE_CLIENT_ID) +
+    if (std::string_view(HYPELIMITS_GOOGLE_CLIENT_SECRET).empty()) return false;
+    const std::string startBody = "client_id=" + urlEncode("681255809395-oo8ft2oprdrnp9e3aqf6av3hmdib135j.apps.googleusercontent.com") +
                                   "&scope=" + urlEncode("https://www.googleapis.com/auth/cloud-platform https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/userinfo.profile");
     const auto started = httpsPost(L"oauth2.googleapis.com", L"/device/code", startBody,
                                    L"Content-Type: application/x-www-form-urlencoded\r\n");
@@ -1220,7 +1217,7 @@ bool runGoogleOAuth(HWND parent, AuthMaterial& auth) {
     poll.path = L"/token";
     poll.body = "grant_type=" + urlEncode("urn:ietf:params:oauth:grant-type:device_code") +
                 "&device_code=" + urlEncode(*device) +
-                "&client_id=" + urlEncode(HYPELIMITS_GOOGLE_CLIENT_ID) +
+                "&client_id=" + urlEncode("681255809395-oo8ft2oprdrnp9e3aqf6av3hmdib135j.apps.googleusercontent.com") +
                 "&client_secret=" + urlEncode(HYPELIMITS_GOOGLE_CLIENT_SECRET);
     if (const auto interval = jsonNumber(started.body, "interval")) poll.intervalMs = std::max(1000, static_cast<int>(*interval * 1000.0));
     poll.complete = [](const HttpResponse& response, AuthMaterial& out) {
