@@ -2,6 +2,7 @@
 #include "model.hpp"
 #include "provider_parsing.hpp"
 #include "token_sync.hpp"
+#include "windows_command_line.hpp"
 
 #ifndef NTDDI_VERSION
 #define NTDDI_VERSION 0x0A00000C
@@ -377,6 +378,30 @@ bool skipWslDistroName(std::wstring_view name) {
         || wideEqualsIgnoreCase(name, L"docker-desktop-data");
 }
 
+using DirectoryLookup = UINT (WINAPI*)(LPWSTR, UINT);
+
+std::optional<std::wstring> directoryFromApi(DirectoryLookup lookup) {
+    std::wstring directory(MAX_PATH, L'\0');
+    for (;;) {
+        const UINT capacity = static_cast<UINT>(directory.size());
+        const UINT length = lookup(directory.data(), capacity);
+        if (length == 0) return std::nullopt;
+        if (length < capacity) {
+            directory.resize(length);
+            return directory;
+        }
+        directory.resize(static_cast<std::size_t>(length) + 1);
+    }
+}
+
+std::optional<std::wstring> systemWslExecutable() {
+    BOOL wow64 = FALSE;
+    const bool useSysnative = IsWow64Process(GetCurrentProcess(), &wow64) && wow64;
+    const auto directory = directoryFromApi(useSysnative ? GetWindowsDirectoryW : GetSystemDirectoryW);
+    if (!directory) return std::nullopt;
+    return *directory + (useSysnative ? L"\\Sysnative\\wsl.exe" : L"\\wsl.exe");
+}
+
 std::vector<std::wstring> parseWslDistroList(std::string_view raw) {
     std::wstring text;
     if (raw.size() >= 2 && static_cast<unsigned char>(raw[0]) == 0xFF && static_cast<unsigned char>(raw[1]) == 0xFE) {
@@ -414,19 +439,25 @@ std::vector<std::wstring> listWslDistros() {
     si.hStdOutput = writer;
     si.hStdError = writer;
     PROCESS_INFORMATION pi{};
-    wchar_t wslExe[MAX_PATH]{};
-    const DWORD found = SearchPathW(nullptr, L"wsl.exe", nullptr, MAX_PATH, wslExe, nullptr);
-    std::wstring command = found ? std::wstring(wslExe) + L" -l -q" : L"wsl.exe -l -q";
     std::string raw;
-    if (CreateProcessW(nullptr, command.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
-        CloseHandle(writer);
-        writer = nullptr;
-        if (WaitForSingleObject(pi.hProcess, 4000) == WAIT_TIMEOUT) TerminateProcess(pi.hProcess, 1);
-        char buffer[1024];
-        DWORD read = 0;
-        while (ReadFile(reader, buffer, sizeof(buffer), &read, nullptr) && read > 0) raw.append(buffer, read);
-        CloseHandle(pi.hThread);
-        CloseHandle(pi.hProcess);
+    if (const auto wslExe = systemWslExecutable()) {
+        std::wstring command;
+        appendWindowsCommandLineArgument(command, *wslExe);
+        appendWindowsCommandLineArgument(command, L"-l");
+        appendWindowsCommandLineArgument(command, L"-q");
+        if (CreateProcessW(wslExe->c_str(), command.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
+            CloseHandle(writer);
+            writer = nullptr;
+            if (WaitForSingleObject(pi.hProcess, 4000) == WAIT_TIMEOUT) TerminateProcess(pi.hProcess, 1);
+            char buffer[1024];
+            DWORD read = 0;
+            while (ReadFile(reader, buffer, sizeof(buffer), &read, nullptr) && read > 0) raw.append(buffer, read);
+            CloseHandle(pi.hThread);
+            CloseHandle(pi.hProcess);
+        } else {
+            CloseHandle(writer);
+            writer = nullptr;
+        }
     } else {
         CloseHandle(writer);
         writer = nullptr;
@@ -525,12 +556,9 @@ std::optional<std::string> readWslFileViaCat(const std::wstring& unc) {
         const auto end = linux.find(L'/', 6);
         if (end != std::wstring::npos) user = linux.substr(6, end - 6);
     }
-    wchar_t wslExe[MAX_PATH]{};
-    const DWORD found = SearchPathW(nullptr, L"wsl.exe", nullptr, MAX_PATH, wslExe, nullptr);
-    std::wstring command = found ? std::wstring(wslExe) : L"wsl.exe";
-    command += L" -d " + distro;
-    if (!user.empty()) command += L" -u " + user;
-    command += L" -- cat -- " + linux;
+    const auto wslExe = systemWslExecutable();
+    if (!wslExe) return std::nullopt;
+    std::wstring command = buildWslCatCommandLine(*wslExe, distro, user, linux);
 
     SECURITY_ATTRIBUTES sa{sizeof(sa), nullptr, TRUE};
     HANDLE reader{};
@@ -544,7 +572,7 @@ std::optional<std::string> readWslFileViaCat(const std::wstring& unc) {
     si.hStdError = writer;
     PROCESS_INFORMATION pi{};
     std::string raw;
-    if (CreateProcessW(nullptr, command.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
+    if (CreateProcessW(wslExe->c_str(), command.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
         CloseHandle(writer);
         writer = nullptr;
         if (WaitForSingleObject(pi.hProcess, 5000) == WAIT_TIMEOUT) TerminateProcess(pi.hProcess, 1);
