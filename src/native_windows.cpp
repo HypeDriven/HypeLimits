@@ -1,4 +1,5 @@
 #include "alert_engine.hpp"
+#include "browser_launcher.hpp"
 #include "model.hpp"
 #include "provider_parsing.hpp"
 #include "token_sync.hpp"
@@ -364,6 +365,67 @@ bool wideEqualsIgnoreCase(std::wstring_view left, std::wstring_view right) {
         if (towlower(left[i]) != towlower(right[i])) return false;
     }
     return true;
+}
+
+std::wstring lastFocusedBrowserExecutable;
+
+std::optional<std::wstring> browserExecutableForProcess(DWORD processId) {
+    if (processId == 0) return std::nullopt;
+    HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, processId);
+    if (!process) return std::nullopt;
+
+    std::wstring executable(MAX_PATH, L'\0');
+    for (;;) {
+        DWORD length = static_cast<DWORD>(executable.size());
+        if (QueryFullProcessImageNameW(process, 0, executable.data(), &length)) {
+            CloseHandle(process);
+            executable.resize(length);
+            if (!isSupportedBrowserExecutable(executable)) return std::nullopt;
+            return executable;
+        }
+        const DWORD error = GetLastError();
+        if (error != ERROR_INSUFFICIENT_BUFFER || executable.size() >= 32768) {
+            CloseHandle(process);
+            return std::nullopt;
+        }
+        executable.resize(std::min(executable.size() * 2, std::size_t{32768}));
+    }
+}
+
+void rememberBrowserWindow(HWND window) {
+    DWORD processId{};
+    if (!window || !GetWindowThreadProcessId(window, &processId) || processId == 0 || processId == GetCurrentProcessId()) return;
+    if (const auto executable = browserExecutableForProcess(processId)) {
+        lastFocusedBrowserExecutable = *executable;
+    } else {
+        lastFocusedBrowserExecutable.clear();
+    }
+}
+
+void rememberForegroundBrowser() {
+    rememberBrowserWindow(GetForegroundWindow());
+}
+
+bool openUrlInFocusedBrowser(std::wstring_view url) {
+    if (lastFocusedBrowserExecutable.empty()) return false;
+    std::wstring command = buildBrowserUrlCommandLine(lastFocusedBrowserExecutable, url);
+    STARTUPINFOW startup{sizeof(startup)};
+    PROCESS_INFORMATION process{};
+    if (!CreateProcessW(lastFocusedBrowserExecutable.c_str(), command.data(), nullptr, nullptr, FALSE, 0,
+                        nullptr, nullptr, &startup, &process)) {
+        lastFocusedBrowserExecutable.clear();
+        return false;
+    }
+    CloseHandle(process.hThread);
+    CloseHandle(process.hProcess);
+    return true;
+}
+
+void openUrl(HWND parent, std::wstring_view url) {
+    rememberForegroundBrowser();
+    if (openUrlInFocusedBrowser(url)) return;
+    const std::wstring text(url);
+    ShellExecuteW(parent, L"open", text.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
 }
 
 std::wstring trimWide(std::wstring text) {
@@ -1097,7 +1159,7 @@ struct DevicePoll {
 };
 
 bool waitForDeviceApproval(HWND parent, const std::wstring& userCode, const std::wstring& verifyUrl, DevicePoll poll, AuthMaterial& auth) {
-    ShellExecuteW(parent, L"open", verifyUrl.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+    openUrl(parent, verifyUrl);
     struct State {
         DevicePoll* poll;
         AuthMaterial* auth;
@@ -1156,7 +1218,7 @@ bool runClaudeOAuth(HWND parent, AuthMaterial& auth) {
         "&scope=user%3Aprofile%20user%3Ainference%20user%3Asessions%3Aclaude_code%20user%3Amcp_servers"
         "&code_challenge={}&code_challenge_method=S256&state={}",
         challenge, state));
-    ShellExecuteW(parent, L"open", url.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+    openUrl(parent, url);
     CREDUI_INFOW info{sizeof(info), parent, L"Claude subscription sign-in",
                       L"Finish sign-in in the browser, then paste the authorization code (code#state) into the password field.", nullptr};
     wchar_t user[2] = L"-";
@@ -2407,7 +2469,7 @@ void App::connectProvider() {
     }
     if (chosen != kPaste) return;
 
-    ShellExecuteW(optionsWindow_, L"open", provider.definition.accountUrl.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+    openUrl(optionsWindow_, provider.definition.accountUrl);
     CREDUI_INFOW info{sizeof(info), optionsWindow_, L"Connect provider", L"Paste the provider access token or API key into the password field. It will be stored in Windows Credential Manager.", nullptr};
     wchar_t user[2] = L"-";
     wchar_t secret[1024]{};
@@ -2531,6 +2593,7 @@ void App::updateTrayIcon() {
 }
 
 void App::showOptions(std::optional<std::size_t> provider) {
+    rememberForegroundBrowser();
     if (provider && *provider < providers_.size()) selectedProvider_ = *provider;
     TabCtrl_SetCurSel(tab_, static_cast<int>(selectedProvider_));
     discoverAndBuildWslControls(true);
@@ -2549,6 +2612,7 @@ void App::toggleMonitor() {
 }
 
 void App::showTrayMenu() {
+    rememberForegroundBrowser();
     HMENU menu = CreatePopupMenu();
     AppendMenuW(menu, MF_STRING, IdTrayShow, IsWindowVisible(floatingWindow_) ? L"Hide Monitor" : L"Show Monitor");
     AppendMenuW(menu, MF_STRING, IdTrayRefresh, L"Refresh now");
@@ -2597,6 +2661,9 @@ void App::playReset() {
 
 LRESULT App::onFloating(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
     switch (message) {
+    case WM_ACTIVATE:
+        if (LOWORD(wParam) != WA_INACTIVE) rememberBrowserWindow(reinterpret_cast<HWND>(lParam));
+        break;
     case WM_CREATE: {
         tooltip_ = CreateWindowExW(WS_EX_TOPMOST, TOOLTIPS_CLASSW, nullptr, WS_POPUP | TTS_ALWAYSTIP | TTS_NOPREFIX,
                                    CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, hwnd, nullptr, instance_, nullptr);
@@ -2702,6 +2769,9 @@ LRESULT App::onFloating(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
 
 LRESULT App::onOptions(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
     switch (message) {
+    case WM_ACTIVATE:
+        if (LOWORD(wParam) != WA_INACTIVE) rememberBrowserWindow(reinterpret_cast<HWND>(lParam));
+        break;
     case WM_CREATE: return 0;
     case WM_SIZE: layoutOptions(LOWORD(lParam), HIWORD(lParam)); return 0;
     case WM_CLOSE:

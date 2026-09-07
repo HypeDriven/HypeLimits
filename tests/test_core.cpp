@@ -1,4 +1,5 @@
 #include "alert_engine.hpp"
+#include "browser_launcher.hpp"
 #include "model.hpp"
 #include "provider_parsing.hpp"
 #include "token_sync.hpp"
@@ -268,6 +269,15 @@ int main() {
     check(wslReadCommand
               == L"\"wsl.exe\" \"-d\" \"Ubuntu 24.04\" \"-u\" \"alice\" \"--exec\" \"cat\" \"--\" \"/home/alice/.config/token$(id).json\"",
           "WSL credential reads use exec mode without shell evaluation");
+    check(isSupportedBrowserExecutable(L"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe"),
+          "Chrome is a supported focused browser");
+    check(isSupportedBrowserExecutable(L"FIREFOX.EXE"), "browser detection is case-insensitive");
+    check(!isSupportedBrowserExecutable(L"C:\\Program Files\\HypeLimits\\hypelimits.exe"),
+          "non-browser executables are not launched for provider URLs");
+    check(buildBrowserUrlCommandLine(L"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+                                    L"https://platform.example.test/login?a=1&b=2")
+              == L"\"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe\" \"https://platform.example.test/login?a=1&b=2\"",
+          "browser URL remains a separately quoted command-line argument");
     TokenRecord oldest;
     oldest.accessToken = "a";
     oldest.refreshToken = "ar";
