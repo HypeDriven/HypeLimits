@@ -2,6 +2,7 @@
 #include "model.hpp"
 #include "provider_parsing.hpp"
 #include "token_sync.hpp"
+#include "windows_command_line.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -249,6 +250,24 @@ int main() {
           "Kimi expires_at seconds are converted to milliseconds");
     check(wslUserSettingKey("Ubuntu-24.04", "albert") == "WslUser.Ubuntu-24.04/albert",
           "WSL user setting key is distro/user");
+    check(quoteWindowsCommandLineArgument(L"Ubuntu 24.04") == L"\"Ubuntu 24.04\"",
+          "Windows command arguments with spaces are quoted");
+    check(quoteWindowsCommandLineArgument(L"Ubuntu\"; calc.exe") == L"\"Ubuntu\\\"; calc.exe\"",
+          "embedded quotes cannot terminate a Windows command argument");
+    check(quoteWindowsCommandLineArgument(L"C:\\WSL home\\") == L"\"C:\\WSL home\\\\\"",
+          "trailing backslashes are escaped before a closing Windows command quote");
+    check(quoteWindowsCommandLineArgument(L"") == L"\"\"", "empty Windows command arguments are preserved");
+    std::wstring wslCommand;
+    appendWindowsCommandLineArgument(wslCommand, L"wsl.exe");
+    appendWindowsCommandLineArgument(wslCommand, L"-d");
+    appendWindowsCommandLineArgument(wslCommand, L"Ubuntu 24.04");
+    check(wslCommand == L"\"wsl.exe\" \"-d\" \"Ubuntu 24.04\"",
+          "Windows command arguments remain separately quoted");
+    const auto wslReadCommand = buildWslCatCommandLine(
+        L"wsl.exe", L"Ubuntu 24.04", L"alice", L"/home/alice/.config/token$(id).json");
+    check(wslReadCommand
+              == L"\"wsl.exe\" \"-d\" \"Ubuntu 24.04\" \"-u\" \"alice\" \"--exec\" \"cat\" \"--\" \"/home/alice/.config/token$(id).json\"",
+          "WSL credential reads use exec mode without shell evaluation");
     TokenRecord oldest;
     oldest.accessToken = "a";
     oldest.refreshToken = "ar";
