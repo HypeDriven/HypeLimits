@@ -30,6 +30,28 @@ inline bool isSupportedBrowserExecutable(std::wstring_view executable) {
     return false;
 }
 
+class FocusedBrowserCache {
+public:
+    void remember(std::wstring_view executable) {
+        if (isSupportedBrowserExecutable(executable)) executable_ = executable;
+    }
+
+    [[nodiscard]] bool empty() const {
+        return executable_.empty();
+    }
+
+    [[nodiscard]] const std::wstring& executable() const {
+        return executable_;
+    }
+
+    void clear() {
+        executable_.clear();
+    }
+
+private:
+    std::wstring executable_;
+};
+
 inline std::wstring buildBrowserUrlCommandLine(std::wstring_view executable, std::wstring_view url) {
     std::wstring commandLine;
     appendWindowsCommandLineArgument(commandLine, executable);

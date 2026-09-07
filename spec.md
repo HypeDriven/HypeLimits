@@ -95,7 +95,7 @@ Each provider tab contains:
 - Detailed session, weekly, and API-credit information when applicable, including used, capacity, remaining amount or percentage, reset time, refresh state, and last successful refresh.
 - Clear stale, unavailable, authentication-required, unsupported, and error labels with concise diagnostics.
 - A **Log in** or **Connect** button. When the provider's official tools use OAuth or device-code subscription login (Claude, Codex, Grok, Antigravity), HypeLimits runs that flow, stores the tokens in Windows Credential Manager, and reads the same session/weekly plan usage those tools show. The user can instead paste a token or API key, or reuse an official CLI login already on the PC. Kimi Code and DeepSeek use API keys. Opening a website alone does not connect the account.
-- Provider account, OAuth, and device-verification URLs prefer the recognized browser focused immediately before HypeLimits becomes active. If that browser cannot be identified or launched, use the Windows default browser association.
+- Provider account, OAuth, and device-verification URLs prefer the most recently foreground recognized browser in the current user session. If that browser cannot be identified or launched, use the Windows default browser association.
 - On the Google Antigravity tab, a password field for the Google OAuth client secret. It is required for in-app Google sign-in and for refreshing a Google session. The field is hidden on other tabs. Paste a new value to replace a saved secret. Disconnecting the Google account does not remove this secret.
 - Provider-specific controls such as enable/disable, refresh, and, when their prerequisites exist, API-credit low-balance threshold, API-credit bar full amount (default $100), and disconnect. The $ progress bar is remaining balance divided by that full amount, clamped at 100%.
 
@@ -166,7 +166,7 @@ Networking and provider parsing run off the UI thread. Updates are delivered to 
 - Hovering over a provider row or bar shows available usage, remaining balance, reset, refresh, and status details in a tooltip without fabricating unknown values.
 - Right-clicking the tray icon and choosing **Options** opens a detailed window with one tab per provider.
 - Every provider tab includes a login or connection button that opens the provider's official website and supports the safest authorized connection flow available.
-- Provider account, OAuth, and device-verification URLs prefer the browser focused immediately before HypeLimits activates, falling back to the Windows default browser when no recognized browser is available.
+- Provider account, OAuth, and device-verification URLs prefer the most recently foreground recognized browser, falling back to the Windows default browser when no recognized browser is available.
 - Supported session, weekly, and topped-up fund data appear per provider without fabricating unavailable values.
 - Crossing 90% exhaustion produces exactly one warning sound per metric and reset period.
 - A verified allowance refresh produces one happy sound.
@@ -176,12 +176,12 @@ Networking and provider parsing run off the UI thread. Updates are delivered to 
 - WSL discovery and fallback file reads launch only `wsl.exe` resolved from the Windows native system directory (using `Sysnative` under WOW64) through an explicit application path, with independently quoted command-line arguments, WSL `--exec` mode for file reads, and no current-directory or `PATH` lookup.
 - Secrets are stored using native credential storage and never appear in logs. The Google OAuth client secret is configured in Options and is not present in the distributed binary.
 - Provider and network failures are visible, non-blocking, and do not freeze the UI.
-- Automated tests cover normalization, icon color interpolation, threshold deduplication, reset detection, stale data, adapter parsing with sanitized fixtures, and which providers and metrics appear on the floating monitor.
+- Automated tests cover normalization, icon color interpolation, threshold deduplication, reset detection, stale data, adapter parsing with sanitized fixtures, focused-browser selection, and which providers and metrics appear on the floating monitor.
 
 ## 10. Implementation Status
 
 - Dependency-free Windows 11 application shell implemented with native Win32 APIs.
-- Floating monitor, tray menu, provider-tabbed Options window, focused-browser-preferred login links with Windows-default fallback, secure credential storage, refresh scheduling, stale-value caching, launch-at-login, and sound alerts implemented.
+- Floating monitor, tray menu, provider-tabbed Options window, login links that retain the most recently foreground recognized browser with Windows-default fallback, secure credential storage, refresh scheduling, stale-value caching, launch-at-login, and sound alerts implemented.
 - Floating monitor shows only configured accounts and ready metrics, sizes text so it is not clipped, and scales from an offscreen bitmap when the user resizes its width. Usage rows appear only after a metric has a value to display. Authentication failure keeps the last known usage on the monitor instead of clearing the account. Rows that consumed allowance since the last poll are brighter; idle rows are darker.
 - Process, UI thread, refresh worker, memory, page, and EcoQoS power priorities are set to background/idle classes.
 - Options hides threshold, API-credit bar full amount, and disconnect controls until their prerequisites exist. The $ monitor bar uses the configured full amount, defaulting to $100. The Google Antigravity tab includes a password field for the Google OAuth client secret; it is stored in Credential Manager separately from the account token and is not compiled into the binary.

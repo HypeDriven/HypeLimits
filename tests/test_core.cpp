@@ -274,6 +274,13 @@ int main() {
     check(isSupportedBrowserExecutable(L"FIREFOX.EXE"), "browser detection is case-insensitive");
     check(!isSupportedBrowserExecutable(L"C:\\Program Files\\HypeLimits\\hypelimits.exe"),
           "non-browser executables are not launched for provider URLs");
+    FocusedBrowserCache focusedBrowser;
+    focusedBrowser.remember(L"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe");
+    focusedBrowser.remember(L"C:\\Windows\\System32\\notepad.exe");
+    check(focusedBrowser.executable() == L"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+          "non-browser foreground windows retain the last recognized browser");
+    focusedBrowser.clear();
+    check(focusedBrowser.empty(), "clearing the focused browser restores default-browser fallback");
     check(buildBrowserUrlCommandLine(L"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
                                     L"https://platform.example.test/login?a=1&b=2")
               == L"\"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe\" \"https://platform.example.test/login?a=1&b=2\"",

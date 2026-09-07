@@ -367,7 +367,7 @@ bool wideEqualsIgnoreCase(std::wstring_view left, std::wstring_view right) {
     return true;
 }
 
-std::wstring lastFocusedBrowserExecutable;
+FocusedBrowserCache lastFocusedBrowser;
 
 std::optional<std::wstring> browserExecutableForProcess(DWORD processId) {
     if (processId == 0) return std::nullopt;
@@ -395,11 +395,7 @@ std::optional<std::wstring> browserExecutableForProcess(DWORD processId) {
 void rememberBrowserWindow(HWND window) {
     DWORD processId{};
     if (!window || !GetWindowThreadProcessId(window, &processId) || processId == 0 || processId == GetCurrentProcessId()) return;
-    if (const auto executable = browserExecutableForProcess(processId)) {
-        lastFocusedBrowserExecutable = *executable;
-    } else {
-        lastFocusedBrowserExecutable.clear();
-    }
+    if (const auto executable = browserExecutableForProcess(processId)) lastFocusedBrowser.remember(*executable);
 }
 
 void rememberForegroundBrowser() {
@@ -407,13 +403,13 @@ void rememberForegroundBrowser() {
 }
 
 bool openUrlInFocusedBrowser(std::wstring_view url) {
-    if (lastFocusedBrowserExecutable.empty()) return false;
-    std::wstring command = buildBrowserUrlCommandLine(lastFocusedBrowserExecutable, url);
+    if (lastFocusedBrowser.empty()) return false;
+    std::wstring command = buildBrowserUrlCommandLine(lastFocusedBrowser.executable(), url);
     STARTUPINFOW startup{sizeof(startup)};
     PROCESS_INFORMATION process{};
-    if (!CreateProcessW(lastFocusedBrowserExecutable.c_str(), command.data(), nullptr, nullptr, FALSE, 0,
+    if (!CreateProcessW(lastFocusedBrowser.executable().c_str(), command.data(), nullptr, nullptr, FALSE, 0,
                         nullptr, nullptr, &startup, &process)) {
-        lastFocusedBrowserExecutable.clear();
+        lastFocusedBrowser.clear();
         return false;
     }
     CloseHandle(process.hThread);
@@ -1617,6 +1613,7 @@ private:
     HBRUSH darkBrush_{};
     HBRUSH editBrush_{};
     HANDLE networkNotification_{};
+    HWINEVENTHOOK foregroundHook_{};
     UINT taskbarCreatedMessage_{};
     std::vector<Provider> providers_;
     std::vector<MetricHit> hits_;
@@ -1643,6 +1640,10 @@ private:
 
 VOID CALLBACK networkChangedCallback(PVOID context, PMIB_IPINTERFACE_ROW, MIB_NOTIFICATION_TYPE) {
     static_cast<App*>(context)->notifyNetworkChanged();
+}
+
+VOID CALLBACK foregroundChangedCallback(HWINEVENTHOOK, DWORD, HWND hwnd, LONG, LONG, DWORD, DWORD) {
+    rememberBrowserWindow(hwnd);
 }
 
 App* appFrom(HWND hwnd) {
@@ -1785,6 +1786,9 @@ bool App::initialize(HINSTANCE instance) {
     optionsWindow_ = CreateWindowExW(WS_EX_APPWINDOW, optionsClass.lpszClassName, L"HypeLimits Options",
         WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT, 720, 820, nullptr, nullptr, instance_, this);
     if (!trayWindow_ || !floatingWindow_ || !optionsWindow_) return false;
+    foregroundHook_ = SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, nullptr,
+                                      foregroundChangedCallback, 0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+    rememberForegroundBrowser();
 
     BOOL dark = TRUE;
     DwmSetWindowAttribute(optionsWindow_, 20, &dark, sizeof(dark));
@@ -2999,6 +3003,7 @@ LRESULT App::onTray(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
     case WM_DESTROY: {
         NOTIFYICONDATAW data{sizeof(data)}; data.hWnd = hwnd; data.uID = 1;
         Shell_NotifyIconW(NIM_DELETE, &data);
+        if (foregroundHook_) UnhookWinEvent(foregroundHook_);
         if (networkNotification_) CancelMibChangeNotify2(networkNotification_);
         if (trayIcon_) DestroyIcon(trayIcon_);
         if (font_) DeleteObject(font_);
