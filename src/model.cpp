@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <ranges>
+#include <string_view>
 
 namespace hypelimits {
 
@@ -52,6 +53,39 @@ bool monitorIncludesProvider(const ProviderSnapshot& provider) {
         return false;
     }
     return std::ranges::any_of(provider.metrics, [](const Metric& metric) { return metric.visibleOnMonitor(); });
+}
+
+bool providerAuthenticationFailed(const ProviderSnapshot& provider) {
+    return std::ranges::any_of(provider.metrics, [](const Metric& metric) {
+        return metric.visibleOnMonitor() && metric.state == MetricState::AuthenticationRequired;
+    });
+}
+
+bool shouldAutoReauthenticate(bool providerSupportsOfficialSignIn, bool accountUsedOfficialSignIn, bool alreadyTried) {
+    return providerSupportsOfficialSignIn && accountUsedOfficialSignIn && !alreadyTried;
+}
+
+std::optional<std::string> extractAuthorizationCode(std::string_view text) {
+    auto takeToken = [](std::string_view raw) -> std::optional<std::string> {
+        while (!raw.empty() && (raw.back() == '\r' || raw.back() == '\n' || raw.back() == '"' || raw.back() == '\'')) {
+            raw.remove_suffix(1);
+        }
+        if (raw.size() < 8) return std::nullopt;
+        return std::string{raw};
+    };
+    const auto keyed = text.find("code=");
+    if (keyed != std::string_view::npos) {
+        auto rest = text.substr(keyed + 5);
+        const auto end = rest.find_first_of("&?#\"' <>");
+        if (auto code = takeToken(end == std::string_view::npos ? rest : rest.substr(0, end))) return code;
+    }
+    const auto hash = text.find('#');
+    if (hash != std::string_view::npos && hash >= 8) {
+        auto start = text.find_last_of(" \n\r\"'=<>", hash);
+        start = (start == std::string_view::npos) ? 0 : start + 1;
+        if (auto code = takeToken(text.substr(start, hash - start))) return code;
+    }
+    return std::nullopt;
 }
 
 std::optional<double> Metric::alertRemainingFraction() const {

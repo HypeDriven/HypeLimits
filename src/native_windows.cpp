@@ -1,4 +1,6 @@
 #include "alert_engine.hpp"
+#include "auto_reauth.hpp"
+#include "browser_cookies.hpp"
 #include "model.hpp"
 #include "provider_parsing.hpp"
 #include "token_sync.hpp"
@@ -19,8 +21,10 @@
 #include <processthreadsapi.h>
 #include <windowsx.h>
 #include <commctrl.h>
+#include <objbase.h>
 #include <dwmapi.h>
 #include <shellapi.h>
+#include <shlobj.h>
 #include <winhttp.h>
 #include <wincred.h>
 #include <mmsystem.h>
@@ -70,6 +74,7 @@ constexpr wchar_t kRegistryKey[] = L"Software\\HypeLimits";
 constexpr UINT kTrayMessage = WM_APP + 1;
 constexpr UINT kRefreshCompleteMessage = WM_APP + 2;
 constexpr UINT kNetworkChangedMessage = WM_APP + 3;
+constexpr UINT kAutoReauthMessage = WM_APP + 4;
 constexpr UINT_PTR kPollTimer = 1;
 constexpr int kMonitorLogicalMinWidth = 196;
 constexpr int kMonitorMinWindowWidth = 140;
@@ -78,6 +83,10 @@ constexpr int kMonitorResizeEdge = 8;
 constexpr int kMonitorCorner = 14;
 constexpr int kMonitorFontPx = 16;
 constexpr int kMonitorDefaultWidth = 230;
+constexpr int kMonitorClickSlop = 4;
+constexpr COLORREF kAuthRowBackground = RGB(118, 58, 14);
+constexpr COLORREF kAuthRowText = RGB(255, 196, 96);
+constexpr COLORREF kAuthRowTrack = RGB(160, 88, 28);
 
 enum ControlId {
     IdTab = 100,
@@ -902,6 +911,8 @@ struct HttpResponse {
     DWORD status{};
     std::string body;
     std::string error;
+    std::wstring url;
+    std::wstring location;
 };
 
 struct HttpRequest {
@@ -911,6 +922,7 @@ struct HttpRequest {
     std::string token;
     std::wstring extraHeaders;
     std::string body;
+    bool followRedirects{true};
 };
 
 HttpResponse httpsRequest(const HttpRequest& spec) {
@@ -922,6 +934,10 @@ HttpResponse httpsRequest(const HttpRequest& spec) {
     HINTERNET connection = WinHttpConnect(session, spec.host.c_str(), INTERNET_DEFAULT_HTTPS_PORT, 0);
     HINTERNET request = connection ? WinHttpOpenRequest(connection, spec.method.c_str(), spec.path.c_str(), nullptr,
         WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE) : nullptr;
+    if (request && !spec.followRedirects) {
+        DWORD disable = WINHTTP_DISABLE_REDIRECTS;
+        WinHttpSetOption(request, WINHTTP_OPTION_DISABLE_FEATURE, &disable, sizeof(disable));
+    }
     std::wstring headers;
     if (!spec.token.empty()) headers += L"Authorization: Bearer " + wide(spec.token) + L"\r\n";
     headers += spec.extraHeaders;
@@ -938,6 +954,20 @@ HttpResponse httpsRequest(const HttpRequest& spec) {
         DWORD statusSize = sizeof(result.status);
         WinHttpQueryHeaders(request, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
                             WINHTTP_HEADER_NAME_BY_INDEX, &result.status, &statusSize, WINHTTP_NO_HEADER_INDEX);
+        wchar_t location[2048]{};
+        DWORD locationSize = sizeof(location);
+        if (WinHttpQueryHeaders(request, WINHTTP_QUERY_LOCATION, WINHTTP_HEADER_NAME_BY_INDEX, location, &locationSize,
+                                WINHTTP_NO_HEADER_INDEX)) {
+            result.location = location;
+        }
+        DWORD urlSize = 0;
+        WinHttpQueryOption(request, WINHTTP_OPTION_URL, nullptr, &urlSize);
+        if (urlSize > sizeof(wchar_t)) {
+            result.url.assign(urlSize / sizeof(wchar_t), L'\0');
+            if (WinHttpQueryOption(request, WINHTTP_OPTION_URL, result.url.data(), &urlSize)) {
+                if (!result.url.empty() && result.url.back() == L'\0') result.url.pop_back();
+            }
+        }
         while (result.body.size() < 1024 * 1024) {
             DWORD available{};
             if (!WinHttpQueryDataAvailable(request, &available) || available == 0) break;
@@ -1036,6 +1066,28 @@ void applyTokenResponse(AuthMaterial& auth, const std::string& json) {
     }
 }
 
+std::wstring kimiIdentityHeaders() {
+    wchar_t computer[MAX_COMPUTERNAME_LENGTH + 1]{};
+    DWORD computerSize = static_cast<DWORD>(std::size(computer));
+    GetComputerNameW(computer, &computerSize);
+    return std::format(
+        L"Content-Type: application/x-www-form-urlencoded\r\nAccept: application/json\r\n"
+        L"X-Msh-Platform: kimi_cli\r\nX-Msh-Version: hypelimits\r\nX-Msh-Device-Name: {}\r\n"
+        L"X-Msh-Device-Model: Windows\r\nX-Msh-Os-Version: Windows\r\nX-Msh-Device-Id: hypelimits-{}\r\n",
+        computer, computer);
+}
+
+std::wstring kimiUsageHeaders() {
+    wchar_t computer[MAX_COMPUTERNAME_LENGTH + 1]{};
+    DWORD computerSize = static_cast<DWORD>(std::size(computer));
+    GetComputerNameW(computer, &computerSize);
+    return std::format(
+        L"Accept: application/json\r\n"
+        L"X-Msh-Platform: kimi_cli\r\nX-Msh-Version: hypelimits\r\nX-Msh-Device-Name: {}\r\n"
+        L"X-Msh-Device-Model: Windows\r\nX-Msh-Os-Version: Windows\r\nX-Msh-Device-Id: hypelimits-{}\r\n",
+        computer, computer);
+}
+
 bool refreshOAuth(std::wstring_view id, AuthMaterial& auth) {
     if (auth.refreshToken.empty()) return false;
     HttpResponse response;
@@ -1063,15 +1115,7 @@ bool refreshOAuth(std::wstring_view id, AuthMaterial& auth) {
     } else if (id == L"moonshot") {
         const std::string body = "grant_type=refresh_token&refresh_token=" + urlEncode(auth.refreshToken) +
                                  "&client_id=" + urlEncode("17e5f671-d194-4dfb-9706-5516cb48c098");
-        wchar_t computer[MAX_COMPUTERNAME_LENGTH + 1]{};
-        DWORD computerSize = static_cast<DWORD>(std::size(computer));
-        GetComputerNameW(computer, &computerSize);
-        const std::wstring headers = std::format(
-            L"Content-Type: application/x-www-form-urlencoded\r\nAccept: application/json\r\n"
-            L"X-Msh-Platform: kimi_cli\r\nX-Msh-Version: hypelimits\r\nX-Msh-Device-Name: {}\r\n"
-            L"X-Msh-Device-Model: Windows\r\nX-Msh-Device-Id: hypelimits-{}\r\n",
-            computer, computer);
-        response = httpsPost(L"auth.kimi.com", L"/api/oauth/token", body, headers);
+        response = httpsPost(L"auth.kimi.com", L"/api/oauth/token", body, kimiIdentityHeaders());
     } else {
         return false;
     }
@@ -1083,7 +1127,60 @@ bool refreshOAuth(std::wstring_view id, AuthMaterial& auth) {
 }
 
 bool providerHasSubscriptionOAuth(std::wstring_view id) {
-    return id == L"anthropic" || id == L"openai" || id == L"xai" || id == L"antigravity";
+    return id == L"anthropic" || id == L"openai" || id == L"xai" || id == L"antigravity" || id == L"moonshot";
+}
+
+bool providerHasOfficialReauth(std::wstring_view id) {
+    return providerHasSubscriptionOAuth(id);
+}
+
+void markOfficialLogin(std::wstring_view id, bool official) {
+    writeDword((L"Provider." + std::wstring(id) + L".OfficialLogin").c_str(), official ? 1 : 0);
+}
+
+bool accountUsedOfficialSignIn(std::wstring_view id) {
+    if (readDword((L"Provider." + std::wstring(id) + L".OfficialLogin").c_str(), 0) != 0) return true;
+    auto auth = loadAuth(id);
+    const bool official = !auth.refreshToken.empty();
+    SecureZeroMemory(auth.token.data(), auth.token.size());
+    SecureZeroMemory(auth.refreshToken.data(), auth.refreshToken.size());
+    return official;
+}
+
+std::vector<std::string> cookieHostSuffixes(std::wstring_view id) {
+    if (id == L"anthropic") return {"claude.ai", "anthropic.com"};
+    if (id == L"openai") return {"chatgpt.com", "openai.com", "auth.openai.com"};
+    if (id == L"xai") return {"x.ai", "grok.com", "auth.x.ai"};
+    if (id == L"antigravity") return {"google.com", "googleapis.com", "googleusercontent.com"};
+    if (id == L"moonshot") return {"kimi.ai", "kimi.com", "moonshot.ai", "auth.kimi.com"};
+    return {};
+}
+
+std::wstring webViewUserDataFolder() {
+    PWSTR local{};
+    if (FAILED(SHGetKnownFolderPath(FOLDERID_LocalAppData, 0, nullptr, &local)) || !local) return {};
+    const std::wstring root = std::wstring(local) + L"\\HypeLimits";
+    CoTaskMemFree(local);
+    CreateDirectoryW(root.c_str(), nullptr);
+    const std::wstring path = root + L"\\WebView2";
+    CreateDirectoryW(path.c_str(), nullptr);
+    return path;
+}
+
+std::optional<std::string> codeFromHttp(const HttpResponse& response) {
+    std::string haystack = utf8(response.url) + "\n" + utf8(response.location) + "\n" + response.body;
+    return extractAuthorizationCode(haystack);
+}
+
+bool exchangeClaudeCode(AuthMaterial& auth, std::string_view code, std::string_view verifier, std::string_view state) {
+    const std::string body = std::format(
+        "{{\"grant_type\":\"authorization_code\",\"code\":\"{}\",\"redirect_uri\":\"https://console.anthropic.com/oauth/code/callback\","
+        "\"client_id\":\"9d1c250a-e61b-44d9-88ed-5944d1962f5e\",\"code_verifier\":\"{}\",\"state\":\"{}\"}}",
+        jsonEscape(std::string{code}), jsonEscape(std::string{verifier}), jsonEscape(std::string{state}));
+    const auto response = httpsPost(L"platform.claude.com", L"/v1/oauth/token", body, L"Content-Type: application/json\r\n");
+    if (response.status != 200) return false;
+    applyTokenResponse(auth, response.body);
+    return !auth.token.empty();
 }
 
 struct DevicePoll {
@@ -1144,6 +1241,37 @@ bool waitForDeviceApproval(HWND parent, const std::wstring& userCode, const std:
     };
     TaskDialogIndirect(&cfg, nullptr, nullptr, nullptr);
     return state.ok && !auth.token.empty();
+}
+
+bool waitForDeviceApprovalSilent(HWND parent, const std::wstring& verifyUrl, DevicePoll poll, AuthMaterial& auth,
+                                 const std::vector<BrowserCookie>& cookies) {
+    poll.timeoutMs = std::min<DWORD>(poll.timeoutMs, 25000);
+    std::atomic_bool done{false};
+    std::jthread poller([&] {
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_IDLE);
+        DWORD last = 0;
+        const DWORD started = GetTickCount();
+        while (!done.load() && GetTickCount() - started < poll.timeoutMs) {
+            if (GetTickCount() - last >= static_cast<DWORD>(poll.intervalMs)) {
+                last = GetTickCount();
+                const auto response = httpsPost(poll.host, poll.path, poll.body, poll.headers);
+                if (poll.complete(response, auth)) {
+                    done = true;
+                    return;
+                }
+                if (response.body.find("expired") != std::string::npos || response.body.find("access_denied") != std::string::npos) {
+                    done = true;
+                    return;
+                }
+                if (response.body.find("slow_down") != std::string::npos) poll.intervalMs += 5000;
+            }
+            Sleep(200);
+        }
+    });
+    runWebViewOAuth(parent, verifyUrl, webViewUserDataFolder(), cookies, poll.timeoutMs);
+    done = true;
+    if (poller.joinable()) poller.join();
+    return !auth.token.empty();
 }
 
 bool runClaudeOAuth(HWND parent, AuthMaterial& auth) {
@@ -1273,11 +1401,196 @@ bool runGoogleOAuth(HWND parent, AuthMaterial& auth) {
     return waitForDeviceApproval(parent, wide(*userCode), wide(verify.value_or("https://www.google.com/device")), poll, auth);
 }
 
+bool startKimiDevice(DevicePoll& poll, std::wstring& userCode, std::wstring& verifyUrl) {
+    constexpr char kClient[] = "17e5f671-d194-4dfb-9706-5516cb48c098";
+    const std::string startBody = "client_id=" + urlEncode(kClient);
+    const auto started = httpsPost(L"auth.kimi.com", L"/api/oauth/device_authorization", startBody, kimiIdentityHeaders());
+    const auto device = jsonString(started.body, "device_code");
+    const auto code = jsonString(started.body, "user_code");
+    auto verify = jsonString(started.body, "verification_uri_complete");
+    if (!verify) verify = jsonString(started.body, "verification_uri");
+    if (started.status != 200 || !device || !code) return false;
+    userCode = wide(*code);
+    verifyUrl = wide(verify.value_or("https://www.kimi.com/code/authorize_device"));
+    poll.host = L"auth.kimi.com";
+    poll.path = L"/api/oauth/token";
+    poll.body = "grant_type=" + urlEncode("urn:ietf:params:oauth:grant-type:device_code") +
+                "&device_code=" + urlEncode(*device) + "&client_id=" + urlEncode(kClient);
+    poll.headers = kimiIdentityHeaders();
+    if (const auto interval = jsonNumber(started.body, "interval")) poll.intervalMs = std::max(1000, static_cast<int>(*interval * 1000.0));
+    poll.complete = [](const HttpResponse& response, AuthMaterial& out) {
+        if (response.status != 200 || !jsonString(response.body, "access_token")) return false;
+        applyTokenResponse(out, response.body);
+        return true;
+    };
+    return true;
+}
+
+bool runKimiOAuth(HWND parent, AuthMaterial& auth) {
+    DevicePoll poll;
+    std::wstring userCode;
+    std::wstring verifyUrl;
+    if (!startKimiDevice(poll, userCode, verifyUrl)) return false;
+    return waitForDeviceApproval(parent, userCode, verifyUrl, poll, auth);
+}
+
 bool runSubscriptionOAuth(HWND parent, std::wstring_view id, AuthMaterial& auth) {
     if (id == L"anthropic") return runClaudeOAuth(parent, auth);
     if (id == L"openai") return runCodexOAuth(parent, auth);
     if (id == L"xai") return runGrokOAuth(parent, auth);
     if (id == L"antigravity") return runGoogleOAuth(parent, auth);
+    if (id == L"moonshot") return runKimiOAuth(parent, auth);
+    return false;
+}
+
+bool tryClaudeAuthorizeHttp(AuthMaterial& auth, const std::vector<BrowserCookie>& cookies, std::string_view verifier,
+                            std::string_view state, std::string_view challenge) {
+    const std::wstring path = wide(std::format(
+        "/oauth/authorize?code=true&client_id=9d1c250a-e61b-44d9-88ed-5944d1962f5e&response_type=code"
+        "&redirect_uri=https%3A%2F%2Fconsole.anthropic.com%2Foauth%2Fcode%2Fcallback"
+        "&scope=user%3Aprofile%20user%3Ainference%20user%3Asessions%3Aclaude_code%20user%3Amcp_servers"
+        "&code_challenge={}&code_challenge_method=S256&state={}",
+        challenge, state));
+    std::wstring cookie = wide(cookieHeaderForHost(cookies, "claude.ai"));
+    const auto extra = wide(cookieHeaderForHost(cookies, "anthropic.com"));
+    if (!extra.empty()) {
+        if (!cookie.empty()) cookie += L"; ";
+        cookie += extra;
+    }
+    HttpRequest spec;
+    spec.host = L"claude.ai";
+    spec.path = path;
+    spec.followRedirects = false;
+    if (!cookie.empty()) spec.extraHeaders = L"Cookie: " + cookie + L"\r\nAccept: text/html,application/json\r\n";
+    auto response = httpsRequest(spec);
+    SecureZeroMemory(cookie.data(), cookie.size() * sizeof(wchar_t));
+    if (auto code = codeFromHttp(response)) return exchangeClaudeCode(auth, *code, verifier, state);
+    for (int hop = 0; hop < 6 && !response.location.empty(); ++hop) {
+        std::wstring loc = response.location;
+        std::wstring host = spec.host;
+        std::wstring nextPath = loc;
+        if (loc.starts_with(L"https://")) {
+            loc.erase(0, 8);
+            const auto slash = loc.find(L'/');
+            host = slash == std::wstring::npos ? loc : loc.substr(0, slash);
+            nextPath = slash == std::wstring::npos ? L"/" : loc.substr(slash);
+        }
+        spec.host = host;
+        spec.path = nextPath;
+        spec.extraHeaders = L"Cookie: " + wide(cookieHeaderForHost(cookies, utf8(host))) + L"\r\nAccept: text/html\r\n";
+        response = httpsRequest(spec);
+        if (auto code = codeFromHttp(response)) return exchangeClaudeCode(auth, *code, verifier, state);
+    }
+    return false;
+}
+
+bool autoRunOfficialSignIn(HWND parent, std::wstring_view id, AuthMaterial& auth, const std::vector<BrowserCookie>& cookies) {
+    if (id == L"anthropic") {
+        const std::string verifier = randomUrlToken(32);
+        const std::string state = randomUrlToken(16);
+        const std::string challenge = sha256Url(verifier);
+        if (tryClaudeAuthorizeHttp(auth, cookies, verifier, state, challenge)) return true;
+        const std::wstring url = wide(std::format(
+            "https://claude.ai/oauth/authorize?code=true&client_id=9d1c250a-e61b-44d9-88ed-5944d1962f5e&response_type=code"
+            "&redirect_uri=https%3A%2F%2Fconsole.anthropic.com%2Foauth%2Fcode%2Fcallback"
+            "&scope=user%3Aprofile%20user%3Ainference%20user%3Asessions%3Aclaude_code%20user%3Amcp_servers"
+            "&code_challenge={}&code_challenge_method=S256&state={}",
+            challenge, state));
+        const auto captured = runWebViewOAuth(parent, url, webViewUserDataFolder(), cookies, 25000);
+        const std::string haystack = utf8(captured.url) + "\n" + utf8(captured.pageText);
+        if (const auto code = extractAuthorizationCode(haystack)) return exchangeClaudeCode(auth, *code, verifier, state);
+        return false;
+    }
+    if (id == L"openai") {
+        const auto started = httpsPost(L"auth.openai.com", L"/api/accounts/deviceauth/usercode",
+                                       R"({"client_id":"app_EMoamEEZ73f0CkXaXp7hrann"})", L"Content-Type: application/json\r\n");
+        const auto deviceId = jsonString(started.body, "device_auth_id");
+        const auto userCode = jsonString(started.body, "user_code");
+        if (started.status != 200 || !deviceId || !userCode) return false;
+        DevicePoll poll;
+        poll.host = L"auth.openai.com";
+        poll.path = L"/api/accounts/deviceauth/token";
+        poll.body = std::format("{{\"device_auth_id\":\"{}\",\"user_code\":\"{}\"}}", jsonEscape(*deviceId), jsonEscape(*userCode));
+        poll.headers = L"Content-Type: application/json\r\nAccept: application/json\r\n";
+        poll.complete = [](const HttpResponse& response, AuthMaterial& out) {
+            if (response.status != 200) return false;
+            const auto code = jsonString(response.body, "authorization_code");
+            const auto verifier = jsonString(response.body, "code_verifier");
+            if (!code || !verifier) return false;
+            const std::string body = "grant_type=authorization_code&code=" + urlEncode(*code) +
+                                     "&code_verifier=" + urlEncode(*verifier) +
+                                     "&client_id=" + urlEncode("app_EMoamEEZ73f0CkXaXp7hrann") +
+                                     "&redirect_uri=" + urlEncode("https://auth.openai.com/deviceauth/callback");
+            const auto tokens = httpsPost(L"auth.openai.com", L"/oauth/token", body, L"Content-Type: application/x-www-form-urlencoded\r\n");
+            if (tokens.status != 200) return false;
+            applyTokenResponse(out, tokens.body);
+            return !out.token.empty();
+        };
+        return waitForDeviceApprovalSilent(parent, L"https://auth.openai.com/codex/device", poll, auth, cookies);
+    }
+    if (id == L"xai") {
+        const std::string startBody = "client_id=" + urlEncode("b1a00492-073a-47ea-816f-4c329264a828") +
+                                      "&scope=" + urlEncode("openid profile email offline_access grok-cli:access api:access");
+        const auto started = httpsPost(L"auth.x.ai", L"/oauth2/device/code", startBody,
+                                       L"Content-Type: application/x-www-form-urlencoded\r\nAccept: application/json\r\n");
+        const auto device = jsonString(started.body, "device_code");
+        const auto userCode = jsonString(started.body, "user_code");
+        auto verify = jsonString(started.body, "verification_uri_complete");
+        if (!verify) verify = jsonString(started.body, "verification_uri");
+        if (started.status != 200 || !device || !userCode) return false;
+        DevicePoll poll;
+        poll.host = L"auth.x.ai";
+        poll.path = L"/oauth2/token";
+        poll.body = "grant_type=" + urlEncode("urn:ietf:params:oauth:grant-type:device_code") +
+                    "&device_code=" + urlEncode(*device) +
+                    "&client_id=" + urlEncode("b1a00492-073a-47ea-816f-4c329264a828");
+        if (const auto interval = jsonNumber(started.body, "interval")) poll.intervalMs = std::max(1000, static_cast<int>(*interval * 1000.0));
+        poll.complete = [](const HttpResponse& response, AuthMaterial& out) {
+            if (response.status != 200 || !jsonString(response.body, "access_token")) return false;
+            applyTokenResponse(out, response.body);
+            return true;
+        };
+        return waitForDeviceApprovalSilent(parent, wide(verify.value_or("https://auth.x.ai/oauth2/device")), poll, auth, cookies);
+    }
+    if (id == L"antigravity") {
+        auto secret = loadGoogleClientSecret();
+        if (secret.empty()) return false;
+        const std::string startBody = "client_id=" + urlEncode("681255809395-oo8ft2oprdrnp9e3aqf6av3hmdib135j.apps.googleusercontent.com") +
+                                      "&scope=" + urlEncode("https://www.googleapis.com/auth/cloud-platform https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/userinfo.profile");
+        const auto started = httpsPost(L"oauth2.googleapis.com", L"/device/code", startBody,
+                                       L"Content-Type: application/x-www-form-urlencoded\r\n");
+        const auto device = jsonString(started.body, "device_code");
+        const auto userCode = jsonString(started.body, "user_code");
+        auto verify = jsonString(started.body, "verification_url");
+        if (!verify) verify = jsonString(started.body, "verification_uri");
+        if (started.status != 200 || !device || !userCode) {
+            SecureZeroMemory(secret.data(), secret.size());
+            return false;
+        }
+        DevicePoll poll;
+        poll.host = L"oauth2.googleapis.com";
+        poll.path = L"/token";
+        poll.body = "grant_type=" + urlEncode("urn:ietf:params:oauth:grant-type:device_code") +
+                    "&device_code=" + urlEncode(*device) +
+                    "&client_id=" + urlEncode("681255809395-oo8ft2oprdrnp9e3aqf6av3hmdib135j.apps.googleusercontent.com") +
+                    "&client_secret=" + urlEncode(secret);
+        SecureZeroMemory(secret.data(), secret.size());
+        if (const auto interval = jsonNumber(started.body, "interval")) poll.intervalMs = std::max(1000, static_cast<int>(*interval * 1000.0));
+        poll.complete = [](const HttpResponse& response, AuthMaterial& out) {
+            if (response.status != 200 || !jsonString(response.body, "access_token")) return false;
+            applyTokenResponse(out, response.body);
+            return true;
+        };
+        return waitForDeviceApprovalSilent(parent, wide(verify.value_or("https://www.google.com/device")), poll, auth, cookies);
+    }
+    if (id == L"moonshot") {
+        if (!auth.refreshToken.empty() && refreshOAuth(id, auth)) return true;
+        DevicePoll poll;
+        std::wstring userCode;
+        std::wstring verifyUrl;
+        if (!startKimiDevice(poll, userCode, verifyUrl)) return false;
+        return waitForDeviceApprovalSilent(parent, verifyUrl, poll, auth, cookies);
+    }
     return false;
 }
 
@@ -1390,7 +1703,7 @@ void fetchProviderUsage(std::wstring_view id, AuthMaterial& auth, ProviderSnapsh
         auto response = httpsGet(L"chatgpt.com", L"/backend-api/wham/usage", auth.token, extra);
         gotData = mergeHttpUsage(snapshot, response, parseCodexUsage(response.body), now, threshold, barFull, lastStatus, lastError);
     } else if (id == L"moonshot") {
-        auto coding = httpsGet(L"api.kimi.com", L"/coding/v1/usages", auth.token, L"Accept: application/json\r\n");
+        auto coding = httpsGet(L"api.kimi.com", L"/coding/v1/usages", auth.token, kimiUsageHeaders());
         gotData = mergeHttpUsage(snapshot, coding, parseKimiCodingUsage(coding.body), now, threshold, barFull, lastStatus, lastError);
         auto balance = httpsGet(L"api.moonshot.ai", L"/v1/users/me/balance", auth.token);
         if (mergeHttpUsage(snapshot, balance, parseMoonshotBalance(balance.body) ? ProviderUsage{std::nullopt, std::nullopt, parseMoonshotBalance(balance.body)} : std::optional<ProviderUsage>{},
@@ -1466,6 +1779,7 @@ std::wstring tooltipText(const Provider& provider, const Metric& metric) {
     if (provider.snapshot.lastSuccessfulRefresh) text += L"Last refreshed: " + formatTime(provider.snapshot.lastSuccessfulRefresh) + L"\r\n";
     text += L"Status: " + stateName(metric.state);
     if (!metric.diagnostic.empty()) text += L"\r\n" + wide(metric.diagnostic);
+    if (metric.state == MetricState::AuthenticationRequired) text += L"\r\nClick to reconnect.";
     return text;
 }
 
@@ -1505,6 +1819,9 @@ private:
     void scheduleNextPoll(bool failed);
     void connectProvider();
     void reloadCliConnections();
+    bool attemptAutoReauth(std::size_t index);
+    void queueAutoReauth();
+    void processAutoReauth();
     void showOptions(std::optional<std::size_t> provider = std::nullopt);
     void toggleMonitor();
     void showTrayMenu();
@@ -1517,6 +1834,10 @@ private:
     void playTone(bool reset);
     void persistGoogleClientSecretField();
     void syncGoogleSecretControls();
+    [[nodiscard]] HWND dialogParent() const;
+    [[nodiscard]] const MetricHit* hitAt(POINT client) const;
+    [[nodiscard]] bool authenticationFailedAt(POINT client) const;
+    void handleMonitorClick(POINT client);
 
     HINSTANCE instance_{};
     HWND trayWindow_{};
@@ -1577,6 +1898,10 @@ private:
     std::jthread refreshThread_;
     std::atomic_bool refreshing_{false};
     unsigned int failureStreak_{0};
+    std::vector<char> autoReauthTried_;
+    std::vector<std::size_t> autoReauthQueue_;
+    bool autoReauthBusy_{false};
+    bool signInInProgress_{false};
 };
 
 VOID CALLBACK networkChangedCallback(PVOID context, PMIB_IPINTERFACE_ROW, MIB_NOTIFICATION_TYPE) {
@@ -1626,8 +1951,8 @@ void App::createProviders() {
         {L"openai", L"OpenAI Codex", L"https://chatgpt.com/codex",
          L"Connect with the Codex CLI login or a ChatGPT access token. HypeLimits uses Codex's /backend-api/wham/usage endpoint.",
          {MetricKind::Session, MetricKind::Weekly, MetricKind::ApiCredit}},
-        {L"moonshot", L"Moonshot Kimi", L"https://platform.moonshot.ai/console",
-         L"A Kimi Code key fetches 5-hour and weekly usage from /coding/v1/usages. A Moonshot platform key fetches prepaid API credit.",
+        {L"moonshot", L"Moonshot Kimi", L"https://www.kimi.com/code",
+         L"Connect with Kimi Code's subscription login (the same device-code flow as the official CLI, at kimi.ai / kimi.com) or paste a Kimi Code / Moonshot API key. Session and weekly usage come from /coding/v1/usages; a platform key fetches prepaid API credit.",
          {MetricKind::Session, MetricKind::Weekly, MetricKind::ApiCredit}},
         {L"deepseek", L"DeepSeek", L"https://platform.deepseek.com/",
          L"A DeepSeek API key fetches prepaid balance from /user/balance. DeepSeek does not publish session or weekly allowances.",
@@ -1691,10 +2016,12 @@ void App::createProviders() {
         }
         providers_.push_back(std::move(provider));
     }
+    autoReauthTried_.assign(providers_.size(), 0);
 }
 
 bool App::initialize(HINSTANCE instance) {
     instance_ = instance;
+    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     applyLowSystemPriorities();
     INITCOMMONCONTROLSEX controls{sizeof(controls), ICC_STANDARD_CLASSES | ICC_TAB_CLASSES | ICC_BAR_CLASSES};
     InitCommonControlsEx(&controls);
@@ -2126,8 +2453,8 @@ void App::layoutMonitor() {
                 hits_.push_back({RECT{8, y - 5, logicalWidth_ - 8, y + 11}, providerIndex, metricIndex});
                 y += 13;
             }
-            if (firstMetric) hits_.push_back({RECT{8, nameTop, logicalWidth_ - 8, nameTop + 20}, providerIndex, *firstMetric});
             y += 6;
+            if (firstMetric) hits_.push_back({RECT{0, nameTop, logicalWidth_, y}, providerIndex, *firstMetric});
         }
         logicalHeight_ = std::max(48, y + 3);
     }
@@ -2197,10 +2524,24 @@ void App::renderMonitorBitmap() {
     for (const auto& provider : providers_) {
         if (!monitorIncludesProvider(provider.snapshot)) continue;
         any = true;
+        const bool authFailed = providerAuthenticationFailed(provider.snapshot);
         const bool drawingDown = std::ranges::any_of(provider.snapshot.metrics, [](const Metric& metric) {
             return metric.visibleOnMonitor() && metric.drawingDown;
         });
-        SetTextColor(mem, drawingDown ? RGB(248, 250, 252) : RGB(148, 152, 160));
+        int rowBottom = y + 20;
+        for (const auto& metric : provider.snapshot.metrics) {
+            if (metric.visibleOnMonitor()) rowBottom += 13;
+        }
+        rowBottom += 6;
+        if (authFailed) {
+            RECT row = scaled({0, y - 1, logicalWidth_, rowBottom - 1});
+            HBRUSH tint = CreateSolidBrush(kAuthRowBackground);
+            FillRect(mem, &row, tint);
+            DeleteObject(tint);
+            SetTextColor(mem, kAuthRowText);
+        } else {
+            SetTextColor(mem, drawingDown ? RGB(248, 250, 252) : RGB(148, 152, 160));
+        }
         RECT nameRect = scaled({10, y, logicalWidth_ - 10, y + 20});
         DrawTextW(mem, provider.definition.name.c_str(), -1, &nameRect, DT_SINGLELINE | DT_NOPREFIX | DT_NOCLIP);
         y += 20;
@@ -2210,13 +2551,13 @@ void App::renderMonitorBitmap() {
             RECT labelRect = scaled({12, y - 3, 28, y + 12});
             DrawTextW(mem, label, -1, &labelRect, DT_SINGLELINE | DT_NOPREFIX | DT_NOCLIP);
             RECT bar = scaled({30, y, logicalWidth_ - 12, y + 6});
-            HBRUSH track = CreateSolidBrush(drawingDown ? RGB(78, 82, 94) : RGB(46, 48, 56));
+            HBRUSH track = CreateSolidBrush(authFailed ? kAuthRowTrack : (drawingDown ? RGB(78, 82, 94) : RGB(46, 48, 56)));
             FillRect(mem, &bar, track);
             DeleteObject(track);
             if (const auto fraction = metric.remainingFraction()) {
                 RECT fill = bar;
                 fill.right = fill.left + static_cast<LONG>((fill.right - fill.left) * *fraction);
-                HBRUSH color = CreateSolidBrush(remainingColor(*fraction, drawingDown));
+                HBRUSH color = CreateSolidBrush(authFailed ? kAuthRowText : remainingColor(*fraction, drawingDown));
                 FillRect(mem, &fill, color);
                 DeleteObject(color);
             }
@@ -2257,9 +2598,8 @@ void App::paintFloating() {
 }
 
 void App::activateTooltip(POINT clientPoint) {
-    const POINT logical = toLogical(clientPoint);
-    const auto found = std::find_if(hits_.begin(), hits_.end(), [&](const MetricHit& hit) { return PtInRect(&hit.rect, logical); });
-    if (found == hits_.end()) {
+    const auto* found = hitAt(clientPoint);
+    if (!found) {
         SendMessageW(tooltip_, TTM_TRACKACTIVATE, FALSE, 0);
         return;
     }
@@ -2334,11 +2674,113 @@ void App::reloadCliConnections() {
     refresh();
 }
 
+bool App::attemptAutoReauth(std::size_t index) {
+    if (signInInProgress_) return false;
+    if (index >= providers_.size()) return false;
+    auto& provider = providers_[index];
+    const auto id = provider.definition.id;
+    if (!shouldAutoReauthenticate(providerHasOfficialReauth(id), accountUsedOfficialSignIn(id), false)) return false;
+
+    if (allowOfficialCli(id)) {
+        syncProviderTokens(id);
+        AuthMaterial cli = loadAuth(id);
+        if (!cli.refreshToken.empty() && refreshOAuth(id, cli) && !cli.token.empty()) {
+            provider.connected = true;
+            SecureZeroMemory(cli.token.data(), cli.token.size());
+            SecureZeroMemory(cli.refreshToken.data(), cli.refreshToken.size());
+            return true;
+        }
+        SecureZeroMemory(cli.token.data(), cli.token.size());
+        SecureZeroMemory(cli.refreshToken.data(), cli.refreshToken.size());
+    }
+
+    auto cookies = loadInstalledBrowserCookies(cookieHostSuffixes(id));
+    AuthMaterial auth = loadAuth(id);
+    const bool ok = autoRunOfficialSignIn(dialogParent(), id, auth, cookies);
+    secureClearCookies(cookies);
+    if (ok && !auth.token.empty() && saveAuth(id, auth)) {
+        markOfficialLogin(id, true);
+        provider.connected = true;
+        syncProviderTokens(id);
+        SecureZeroMemory(auth.token.data(), auth.token.size());
+        SecureZeroMemory(auth.refreshToken.data(), auth.refreshToken.size());
+        return true;
+    }
+    SecureZeroMemory(auth.token.data(), auth.token.size());
+    SecureZeroMemory(auth.refreshToken.data(), auth.refreshToken.size());
+    return false;
+}
+
+void App::queueAutoReauth() {
+    if (signInInProgress_ || autoReauthBusy_) return;
+    if (autoReauthTried_.size() < providers_.size()) autoReauthTried_.resize(providers_.size(), 0);
+    for (std::size_t index = 0; index < providers_.size(); ++index) {
+        const auto& provider = providers_[index];
+        if (!provider.snapshot.enabled || !provider.connected) continue;
+        if (!providerAuthenticationFailed(provider.snapshot)) continue;
+        if (!shouldAutoReauthenticate(providerHasOfficialReauth(provider.definition.id),
+                                      accountUsedOfficialSignIn(provider.definition.id),
+                                      autoReauthTried_[index] != 0)) {
+            continue;
+        }
+        autoReauthTried_[index] = 1;
+        autoReauthQueue_.push_back(index);
+    }
+    if (!autoReauthBusy_ && !autoReauthQueue_.empty()) PostMessageW(trayWindow_, kAutoReauthMessage, 0, 0);
+}
+
+void App::processAutoReauth() {
+    if (autoReauthBusy_ || signInInProgress_ || autoReauthQueue_.empty()) return;
+    autoReauthBusy_ = true;
+    const std::size_t index = autoReauthQueue_.front();
+    autoReauthQueue_.erase(autoReauthQueue_.begin());
+    const bool ok = attemptAutoReauth(index);
+    autoReauthBusy_ = false;
+    if (ok) {
+        if (index < autoReauthTried_.size()) autoReauthTried_[index] = 0;
+        refresh();
+        return;
+    }
+    if (!autoReauthQueue_.empty()) PostMessageW(trayWindow_, kAutoReauthMessage, 0, 0);
+}
+
+HWND App::dialogParent() const {
+    if (ownStyleVisible(optionsWindow_)) return optionsWindow_;
+    if (ownStyleVisible(floatingWindow_)) return floatingWindow_;
+    return trayWindow_;
+}
+
+const MetricHit* App::hitAt(POINT client) const {
+    const POINT logical = toLogical(client);
+    const auto found = std::find_if(hits_.begin(), hits_.end(), [&](const MetricHit& hit) { return PtInRect(&hit.rect, logical); });
+    return found == hits_.end() ? nullptr : &*found;
+}
+
+bool App::authenticationFailedAt(POINT client) const {
+    const auto* hit = hitAt(client);
+    return hit && providerAuthenticationFailed(providers_[hit->provider].snapshot);
+}
+
+void App::handleMonitorClick(POINT client) {
+    if (autoReauthBusy_ || signInInProgress_) return;
+    const auto* hit = hitAt(client);
+    if (!hit || !providerAuthenticationFailed(providers_[hit->provider].snapshot)) return;
+    selectedProvider_ = hit->provider;
+    connectProvider();
+}
+
 void App::connectProvider() {
+    if (signInInProgress_ || autoReauthBusy_) return;
+    struct SignInGuard {
+        bool& flag;
+        explicit SignInGuard(bool& value) : flag(value) { flag = true; }
+        ~SignInGuard() { flag = false; }
+    } guard{signInInProgress_};
     persistGoogleClientSecretField();
     auto& provider = providers_[selectedProvider_];
     const bool cliReady = !loadCliAuth(provider.definition.id).token.empty();
     const bool canOAuth = providerHasSubscriptionOAuth(provider.definition.id);
+    HWND parent = dialogParent();
 
     TASKDIALOG_BUTTON buttons[3]{};
     int buttonCount = 0;
@@ -2364,7 +2806,7 @@ void App::connectProvider() {
     const std::wstring heading = L"Connect " + provider.definition.name;
     TASKDIALOGCONFIG cfg{};
     cfg.cbSize = sizeof(cfg);
-    cfg.hwndParent = optionsWindow_;
+    cfg.hwndParent = parent;
     cfg.dwFlags = TDF_USE_COMMAND_LINKS | TDF_ALLOW_DIALOG_CANCELLATION | TDF_SIZE_TO_CONTENT;
     cfg.dwCommonButtons = TDCBF_CANCEL_BUTTON;
     cfg.pszWindowTitle = kAppName;
@@ -2378,6 +2820,8 @@ void App::connectProvider() {
 
     if (chosen == kUseCli) {
         writeDword((L"Provider." + provider.definition.id + L".UseOfficialCli").c_str(), 1);
+        markOfficialLogin(provider.definition.id, true);
+        if (selectedProvider_ < autoReauthTried_.size()) autoReauthTried_[selectedProvider_] = 0;
         provider.connected = true;
         syncProviderTokens(provider.definition.id);
         refresh();
@@ -2385,21 +2829,24 @@ void App::connectProvider() {
     }
     if (chosen == kSignIn) {
         if (provider.definition.id == L"antigravity" && !googleClientSecretConfigured()) {
+            showOptions(selectedProvider_);
             MessageBoxW(optionsWindow_,
                 L"Paste the Google OAuth client secret on this tab first. It is stored in Windows Credential Manager and is required for in-app Google sign-in and token refresh.",
                 kAppName, MB_ICONWARNING);
             return;
         }
         AuthMaterial auth;
-        if (!runSubscriptionOAuth(optionsWindow_, provider.definition.id, auth) || auth.token.empty()) {
-            MessageBoxW(optionsWindow_, L"Subscription sign-in did not complete. You can try again or paste a token.", kAppName, MB_ICONWARNING);
+        if (!runSubscriptionOAuth(parent, provider.definition.id, auth) || auth.token.empty()) {
+            MessageBoxW(parent, L"Subscription sign-in did not complete. You can try again or paste a token.", kAppName, MB_ICONWARNING);
             return;
         }
         if (!saveAuth(provider.definition.id, auth)) {
-            MessageBoxW(optionsWindow_, L"Windows Credential Manager rejected the credential.", kAppName, MB_ICONERROR);
+            MessageBoxW(parent, L"Windows Credential Manager rejected the credential.", kAppName, MB_ICONERROR);
             return;
         }
         writeDword((L"Provider." + provider.definition.id + L".UseOfficialCli").c_str(), 1);
+        markOfficialLogin(provider.definition.id, true);
+        if (selectedProvider_ < autoReauthTried_.size()) autoReauthTried_[selectedProvider_] = 0;
         provider.connected = true;
         syncProviderTokens(provider.definition.id);
         refresh();
@@ -2407,8 +2854,8 @@ void App::connectProvider() {
     }
     if (chosen != kPaste) return;
 
-    ShellExecuteW(optionsWindow_, L"open", provider.definition.accountUrl.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
-    CREDUI_INFOW info{sizeof(info), optionsWindow_, L"Connect provider", L"Paste the provider access token or API key into the password field. It will be stored in Windows Credential Manager.", nullptr};
+    ShellExecuteW(parent, L"open", provider.definition.accountUrl.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+    CREDUI_INFOW info{sizeof(info), parent, L"Connect provider", L"Paste the provider access token or API key into the password field. It will be stored in Windows Credential Manager.", nullptr};
     wchar_t user[2] = L"-";
     wchar_t secret[1024]{};
     BOOL save = FALSE;
@@ -2417,9 +2864,12 @@ void App::connectProvider() {
         CREDUI_FLAGS_GENERIC_CREDENTIALS | CREDUI_FLAGS_ALWAYS_SHOW_UI | CREDUI_FLAGS_DO_NOT_PERSIST | CREDUI_FLAGS_EXCLUDE_CERTIFICATES);
     if (result == NO_ERROR && secret[0] != L'\0') {
         if (!CredentialStore::save(provider.definition.id, secret)) {
-            MessageBoxW(optionsWindow_, L"Windows Credential Manager rejected the credential.", kAppName, MB_ICONERROR);
+            MessageBoxW(parent, L"Windows Credential Manager rejected the credential.", kAppName, MB_ICONERROR);
         } else {
             writeDword((L"Provider." + provider.definition.id + L".UseOfficialCli").c_str(), 1);
+            const auto pasted = parseAuthJson(utf8(secret));
+            markOfficialLogin(provider.definition.id, !pasted.refreshToken.empty());
+            if (selectedProvider_ < autoReauthTried_.size()) autoReauthTried_[selectedProvider_] = 0;
             provider.connected = true;
             syncProviderTokens(provider.definition.id);
         }
@@ -2623,6 +3073,10 @@ LRESULT App::onFloating(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
                 SetCursor(LoadCursorW(nullptr, IDC_SIZEWE));
                 return TRUE;
             }
+            if (authenticationFailedAt(cursor)) {
+                SetCursor(LoadCursorW(nullptr, IDC_HAND));
+                return TRUE;
+            }
         }
         break;
     case WM_LBUTTONDOWN: {
@@ -2643,9 +3097,12 @@ LRESULT App::onFloating(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
     }
     case WM_MOUSEMOVE: {
         POINT point{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
-        if (resizing_ && (wParam & MK_LBUTTON)) {
-            POINT cursor{};
-            GetCursorPos(&cursor);
+        POINT cursor{};
+        GetCursorPos(&cursor);
+        const int dragDx = std::abs(static_cast<int>(cursor.x - dragStart_.x));
+        const int dragDy = std::abs(static_cast<int>(cursor.y - dragStart_.y));
+        const bool pastSlop = dragDx > kMonitorClickSlop || dragDy > kMonitorClickSlop;
+        if (resizing_ && (wParam & MK_LBUTTON) && pastSlop) {
             const int width = std::clamp(resizeStartWidth_ + static_cast<int>(cursor.x - resizeCursorStart_.x),
                                          kMonitorMinWindowWidth, kMonitorMaxWindowWidth);
             const int height = std::max(1, static_cast<int>(std::lround(
@@ -2653,12 +3110,10 @@ LRESULT App::onFloating(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
             SetWindowPos(hwnd, nullptr, 0, 0, width, height, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
             const int corner = std::max(4, static_cast<int>(std::lround(kMonitorCorner * monitorScale())));
             SetWindowRgn(hwnd, CreateRoundRectRgn(0, 0, width, height, corner, corner), TRUE);
-        } else if (dragging_ && (wParam & MK_LBUTTON)) {
-            POINT cursor{};
-            GetCursorPos(&cursor);
+        } else if (dragging_ && (wParam & MK_LBUTTON) && pastSlop) {
             SetWindowPos(hwnd, nullptr, windowStart_.x + cursor.x - dragStart_.x, windowStart_.y + cursor.y - dragStart_.y,
                          0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
-        } else {
+        } else if (!(wParam & MK_LBUTTON)) {
             activateTooltip(point);
             TRACKMOUSEEVENT track{sizeof(track), TME_LEAVE, hwnd, 0};
             TrackMouseEvent(&track);
@@ -2667,7 +3122,12 @@ LRESULT App::onFloating(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
     }
     case WM_MOUSELEAVE: SendMessageW(tooltip_, TTM_TRACKACTIVATE, FALSE, 0); return 0;
     case WM_LBUTTONUP: {
+        POINT cursor{};
+        GetCursorPos(&cursor);
+        const bool moved = std::abs(static_cast<int>(cursor.x - dragStart_.x)) > kMonitorClickSlop
+            || std::abs(static_cast<int>(cursor.y - dragStart_.y)) > kMonitorClickSlop;
         const bool wasResizing = resizing_;
+        const bool click = !moved;
         dragging_ = false;
         resizing_ = false;
         ReleaseCapture();
@@ -2676,10 +3136,14 @@ LRESULT App::onFloating(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
         writeDword(L"MonitorX", rect.left);
         writeDword(L"MonitorY", rect.top);
         writeDword(L"MonitorWidth", static_cast<DWORD>(rect.right - rect.left));
-        if (wasResizing) {
+        if (wasResizing && moved) {
             destroyMonitorBitmap();
             syncFloatingWindowSize();
             InvalidateRect(hwnd, nullptr, FALSE);
+        }
+        if (click && !wasResizing) {
+            POINT point{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+            handleMonitorClick(point);
         }
         return 0;
     }
@@ -2689,9 +3153,9 @@ LRESULT App::onFloating(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
         return 0;
     case WM_LBUTTONDBLCLK: {
         POINT point{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
-        const POINT logical = toLogical(point);
-        const auto found = std::find_if(hits_.begin(), hits_.end(), [&](const MetricHit& hit) { return PtInRect(&hit.rect, logical); });
-        if (found != hits_.end()) showOptions(found->provider);
+        if (authenticationFailedAt(point)) return 0;
+        const auto* found = hitAt(point);
+        if (found) showOptions(found->provider);
         else showOptions();
         return 0;
     }
@@ -2730,6 +3194,8 @@ LRESULT App::onOptions(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
         case IdDisconnect:
             CredentialStore::remove(providers_[selectedProvider_].definition.id);
             writeDword((L"Provider." + providers_[selectedProvider_].definition.id + L".UseOfficialCli").c_str(), 0);
+            markOfficialLogin(providers_[selectedProvider_].definition.id, false);
+            if (selectedProvider_ < autoReauthTried_.size()) autoReauthTried_[selectedProvider_] = 0;
             providers_[selectedProvider_].connected = false;
             {
                 const std::wstring prefix = L"Provider." + providers_[selectedProvider_].definition.id;
@@ -2892,6 +3358,14 @@ LRESULT App::onTray(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
             }
         }
         refreshing_ = false;
+        for (std::size_t index = 0; index < providers_.size(); ++index) {
+            if (index < autoReauthTried_.size()
+                && !providerAuthenticationFailed(providers_[index].snapshot)
+                && std::ranges::any_of(providers_[index].snapshot.metrics,
+                                       [](const Metric& metric) { return metric.state == MetricState::Current; })) {
+                autoReauthTried_[index] = 0;
+            }
+        }
         updateAll();
         const bool failed = std::ranges::any_of(providers_, [](const Provider& provider) {
             if (!provider.snapshot.enabled || !provider.connected) return false;
@@ -2901,8 +3375,12 @@ LRESULT App::onTray(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
             });
         });
         scheduleNextPoll(failed);
+        queueAutoReauth();
         return 0;
     }
+    case kAutoReauthMessage:
+        processAutoReauth();
+        return 0;
     case kTrayMessage:
         switch (LOWORD(lParam)) {
         case WM_CONTEXTMENU: case WM_RBUTTONUP: showTrayMenu(); break;
@@ -2924,7 +3402,11 @@ LRESULT App::onTray(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
         }
         return 0;
     case WM_TIMER:
-        if (wParam == kPollTimer) { KillTimer(hwnd, kPollTimer); refresh(); }
+        if (wParam == kPollTimer) {
+            KillTimer(hwnd, kPollTimer);
+            if (!autoReauthBusy_) refresh();
+            else scheduleNextPoll(true);
+        }
         return 0;
     case WM_DESTROY: {
         NOTIFYICONDATAW data{sizeof(data)}; data.hWnd = hwnd; data.uID = 1;

@@ -3,6 +3,7 @@
 #include <chrono>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace hypelimits {
@@ -55,6 +56,10 @@ struct RgbColor {
 
 [[nodiscard]] AggregateStatus aggregateStatus(const std::vector<ProviderSnapshot>& providers);
 [[nodiscard]] bool monitorIncludesProvider(const ProviderSnapshot& provider);
+[[nodiscard]] bool providerAuthenticationFailed(const ProviderSnapshot& provider);
+[[nodiscard]] bool shouldAutoReauthenticate(bool providerSupportsOfficialSignIn, bool accountUsedOfficialSignIn,
+                                            bool alreadyTried);
+[[nodiscard]] std::optional<std::string> extractAuthorizationCode(std::string_view text);
 [[nodiscard]] RgbColor statusColor(double remainingFraction);
 [[nodiscard]] RgbColor applyUsageActivity(RgbColor color, bool drawingDown);
 [[nodiscard]] bool usageDrewDownSince(const Metric& previous, const Metric& current);

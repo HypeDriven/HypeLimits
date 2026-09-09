@@ -139,6 +139,21 @@ int main() {
           "authentication failure still reports the last remaining fraction");
     ProviderSnapshot authFailed{"af", "AF", true, {authWithLast}};
     check(monitorIncludesProvider(authFailed), "accounts with last known usage stay on the monitor after auth failure");
+    check(providerAuthenticationFailed(authFailed), "visible authentication-required metrics mark the provider as failed");
+    check(!providerAuthenticationFailed(a), "current usage is not an authentication failure");
+    ProviderSnapshot mixedAuth{"ma", "MA", true, {percentage(MetricKind::Session, 20, 100), authWithLast}};
+    check(providerAuthenticationFailed(mixedAuth), "any visible authentication-required metric marks the provider row");
+    ProviderSnapshot authHidden{"ah", "AH", true, {authRequired}};
+    check(!providerAuthenticationFailed(authHidden), "authentication-required metrics without a value do not mark the row");
+    check(shouldAutoReauthenticate(true, true, false), "official sign-in accounts auto-reauthenticate once");
+    check(!shouldAutoReauthenticate(true, true, true), "auto-reauth runs only once per failure");
+    check(!shouldAutoReauthenticate(true, false, false), "paste-only API keys are not auto-reauthenticated");
+    check(!shouldAutoReauthenticate(false, true, false), "providers without official sign-in are not auto-reauthenticated");
+    check(extractAuthorizationCode("https://example/cb?code=ABCDEFGH1234&state=s").value_or("") == "ABCDEFGH1234",
+          "OAuth redirect codes are extracted");
+    check(extractAuthorizationCode("ABCDEFGH1234#state-value").value_or("") == "ABCDEFGH1234",
+          "Claude code#state paste form is extracted");
+    check(!extractAuthorizationCode("no-code-here"), "text without an authorization code is rejected");
     Metric unavailable;
     unavailable.state = MetricState::Unavailable;
     check(!unavailable.visibleOnMonitor(), "unavailable metrics stay off the monitor");

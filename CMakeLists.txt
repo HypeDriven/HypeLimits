@@ -24,8 +24,12 @@ endif()
 
 option(HYPELIMITS_BUILD_APP "Build the native desktop application" ON)
 if(HYPELIMITS_BUILD_APP AND WIN32)
-    add_executable(hypelimits WIN32 src/native_windows.cpp)
-    target_link_libraries(hypelimits PRIVATE hypelimits_core user32 gdi32 comctl32 shell32 advapi32 dwmapi winmm winhttp credui uxtheme iphlpapi ws2_32 bcrypt)
+    add_executable(hypelimits WIN32
+        src/native_windows.cpp
+        src/browser_cookies.cpp
+        src/auto_reauth.cpp
+    )
+    target_link_libraries(hypelimits PRIVATE hypelimits_core user32 gdi32 comctl32 shell32 advapi32 dwmapi winmm winhttp credui uxtheme iphlpapi ws2_32 bcrypt ole32 oleaut32 crypt32)
     target_include_directories(hypelimits PRIVATE src)
     target_compile_definitions(hypelimits PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
     if(MSVC)
