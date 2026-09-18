@@ -7,6 +7,21 @@
 
 namespace hypelimits {
 
+std::optional<TimePoint> exhaustedUntil(const ProviderSnapshot& provider, TimePoint now) {
+    std::optional<TimePoint> until;
+    for (const auto& metric : provider.metrics) {
+        if (metric.state != MetricState::Current || !metric.observedAt || *metric.observedAt > now ||
+            now - *metric.observedAt > std::chrono::minutes(15)) continue;
+        const bool empty = (metric.remaining && *metric.remaining <= 0) ||
+            (metric.used && metric.capacity && *metric.capacity > 0 && *metric.used >= *metric.capacity);
+        if (!empty) continue;
+        const auto reset = metric.resetAt && *metric.resetAt > now ? *metric.resetAt : TimePoint::max();
+        if (!until || reset > *until) until = reset;
+    }
+    return until;
+}
+
+
 std::optional<double> Metric::remainingFraction() const {
     if (state != MetricState::Current && state != MetricState::Stale && state != MetricState::Refreshing
         && state != MetricState::Error && state != MetricState::AuthenticationRequired) {

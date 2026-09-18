@@ -54,6 +54,9 @@ struct RgbColor {
     int blue;
 };
 
+// Only fresh, confirmed exhaustion triggers rotation. Unknown resets require manual retry.
+[[nodiscard]] std::optional<TimePoint> exhaustedUntil(const ProviderSnapshot& provider, TimePoint now);
+
 [[nodiscard]] AggregateStatus aggregateStatus(const std::vector<ProviderSnapshot>& providers);
 [[nodiscard]] bool monitorIncludesProvider(const ProviderSnapshot& provider);
 [[nodiscard]] bool providerAuthenticationFailed(const ProviderSnapshot& provider);

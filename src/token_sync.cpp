@@ -135,10 +135,6 @@ std::string setStringField(std::string json, std::size_t open, std::string_view 
     return setObjectField(std::move(json), open, key, "\"" + escapeJson(value) + "\"");
 }
 
-std::string setNumberField(std::string json, std::size_t open, std::string_view key, std::int64_t value) {
-    return setObjectField(std::move(json), open, key, std::to_string(value));
-}
-
 std::optional<std::pair<std::size_t, std::size_t>> nestedObject(std::string_view json, std::size_t parentOpen, std::string_view key) {
     const auto parentClose = matchingBrace(json, parentOpen);
     if (!parentClose) return std::nullopt;
@@ -172,6 +168,7 @@ std::optional<std::int64_t> parseExpiryMs(std::string_view json, std::size_t sta
 
 TokenRecord parseFromObject(std::string_view json, std::size_t start) {
     TokenRecord record;
+    record.idToken = jsonString(json, "id_token", start).value_or("");
     record.accessToken = jsonString(json, "accessToken", start).value_or(jsonString(json, "access_token", start).value_or(jsonString(json, "token", start).value_or(jsonString(json, "api_key", start).value_or(std::string{}))));
     record.refreshToken = jsonString(json, "refreshToken", start).value_or(jsonString(json, "refresh_token", start).value_or(std::string{}));
     record.accountId = jsonString(json, "account_id", start).value_or(jsonString(json, "chatgpt_account_id", start).value_or(std::string{}));
@@ -201,6 +198,16 @@ std::string emptySkeleton(CliCredentialFormat format) {
 }
 
 } // namespace
+
+bool shouldBackgroundSyncProvider(bool enabled, bool allowOfficialCliImport) {
+    return enabled && allowOfficialCliImport;
+}
+
+bool sameCredentialAccount(const TokenRecord& left, const TokenRecord& right) {
+    if (!left.accountId.empty() && !right.accountId.empty()) return left.accountId == right.accountId;
+    return (!left.refreshToken.empty() && left.refreshToken == right.refreshToken) ||
+        (!left.accessToken.empty() && left.accessToken == right.accessToken);
+}
 
 bool tokenRecordUsable(const TokenRecord& record, std::int64_t nowMs) {
     if (record.accessToken.empty() && record.refreshToken.empty()) return false;
@@ -272,6 +279,11 @@ TokenRecord parseCliTokenRecord(CliCredentialFormat format, std::string_view jso
         }
     }
     if (format == CliCredentialFormat::CodexTokens) {
+        if (auto apiKey = jsonString(json, "OPENAI_API_KEY", root); apiKey && !apiKey->empty()) {
+            TokenRecord key;
+            key.accessToken = *apiKey;
+            return key;
+        }
         TokenRecord record;
         if (const auto nested = nestedObject(json, root, "tokens")) {
             record = parseFromObject(json, nested->first);
@@ -304,31 +316,42 @@ std::string mergeCliCredentialJson(CliCredentialFormat format, std::string_view 
         if (!nested) return json;
         json = setStringField(std::move(json), nested->first, "accessToken", winner.accessToken);
         json = setStringField(std::move(json), nested->first, "refreshToken", winner.refreshToken);
-        if (winner.expiresAtMs) json = setNumberField(std::move(json), nested->first, "expiresAt", *winner.expiresAtMs);
+        json = setObjectField(std::move(json), nested->first, "expiresAt", winner.expiresAtMs ? std::to_string(*winner.expiresAtMs) : "null");
         return json;
     }
 
     if (format == CliCredentialFormat::CodexTokens) {
+        if (winner.refreshToken.empty() && winner.accessToken.starts_with("sk-")) {
+            json = setStringField(std::move(json), root, "auth_mode", "apikey");
+            json = setStringField(std::move(json), root, "OPENAI_API_KEY", winner.accessToken);
+            json = setObjectField(std::move(json), root, "tokens", "null");
+            json = setObjectField(std::move(json), root, "account_id", "null");
+            return json;
+        }
+        json = setStringField(std::move(json), root, "auth_mode", "chatgpt");
+        json = setObjectField(std::move(json), root, "OPENAI_API_KEY", "null");
         json = ensureNestedObject(std::move(json), root, "tokens");
         root = skipWs(json, 0);
         const auto nested = nestedObject(json, root, "tokens");
         if (!nested) return json;
+        json = setStringField(std::move(json), nested->first, "id_token", winner.idToken);
+        json = setStringField(std::move(json), nested->first, "account_id", winner.accountId);
         json = setStringField(std::move(json), nested->first, "access_token", winner.accessToken);
         json = setStringField(std::move(json), nested->first, "refresh_token", winner.refreshToken);
-        if (!winner.accountId.empty()) json = setStringField(std::move(json), root, "account_id", winner.accountId);
+        json = setStringField(std::move(json), root, "account_id", winner.accountId);
         return json;
     }
 
     json = setStringField(std::move(json), root, "access_token", winner.accessToken);
     json = setStringField(std::move(json), root, "refresh_token", winner.refreshToken);
-    if (format == CliCredentialFormat::GeminiOauth && winner.expiresAtMs) {
-        json = setNumberField(std::move(json), root, "expiry_date", *winner.expiresAtMs);
+    if (format == CliCredentialFormat::GeminiOauth) {
+        json = setObjectField(std::move(json), root, "expiry_date", winner.expiresAtMs ? std::to_string(*winner.expiresAtMs) : "null");
     }
-    if ((format == CliCredentialFormat::GrokAuth || format == CliCredentialFormat::KimiCredentials) && winner.expiresAtMs) {
-        json = setNumberField(std::move(json), root, "expires_at", *winner.expiresAtMs);
+    if (format == CliCredentialFormat::GrokAuth || format == CliCredentialFormat::KimiCredentials) {
+        json = setObjectField(std::move(json), root, "expires_at", winner.expiresAtMs ? std::to_string(*winner.expiresAtMs) : "null");
     }
-    if (!winner.accountId.empty()) json = setStringField(std::move(json), root, "account_id", winner.accountId);
-    if (!winner.teamId.empty()) json = setStringField(std::move(json), root, "team_id", winner.teamId);
+    json = setStringField(std::move(json), root, "account_id", winner.accountId);
+    json = setStringField(std::move(json), root, "team_id", winner.teamId);
     return json;
 }
 

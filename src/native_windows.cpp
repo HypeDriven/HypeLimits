@@ -78,7 +78,6 @@ constexpr UINT kAutoReauthMessage = WM_APP + 4;
 constexpr UINT_PTR kPollTimer = 1;
 constexpr int kMonitorLogicalMinWidth = 196;
 constexpr int kMonitorMinWindowWidth = 140;
-constexpr int kMonitorMaxWindowWidth = 720;
 constexpr int kMonitorResizeEdge = 8;
 constexpr int kMonitorCorner = 14;
 constexpr int kMonitorFontPx = 16;
@@ -108,6 +107,9 @@ enum ControlId {
     IdDisconnect,
     IdGoogleClientSecret,
     IdClose,
+    IdAddAccount,
+    IdAccounts,
+    IdRotateAccounts,
     IdTrayShow = 300,
     IdTrayRefresh,
     IdTrayOptions,
@@ -189,15 +191,54 @@ void deleteSetting(const wchar_t* name) {
     }
 }
 
+std::wstring currentExecutablePath() {
+    std::wstring path(32768, L'\0');
+    const DWORD length = GetModuleFileNameW(nullptr, path.data(), static_cast<DWORD>(path.size()));
+    if (length == 0 || length >= path.size()) return {};
+    path.resize(length);
+    return path;
+}
+
+std::wstring unquoteLaunchCommand(std::wstring_view command) {
+    if (command.size() >= 2 && command.front() == L'"' && command.back() == L'"') {
+        return std::wstring{command.substr(1, command.size() - 2)};
+    }
+    return std::wstring{command};
+}
+
+std::wstring readLaunchAtLoginCommand() {
+    DWORD size = 0;
+    if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Run",
+                     kAppName, RRF_RT_REG_SZ, nullptr, nullptr, &size) != ERROR_SUCCESS) {
+        return {};
+    }
+    if (size < sizeof(wchar_t)) return {};
+    std::wstring value(size / sizeof(wchar_t), L'\0');
+    if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Run",
+                     kAppName, RRF_RT_REG_SZ, nullptr, value.data(), &size) != ERROR_SUCCESS) {
+        return {};
+    }
+    if (const auto n = value.find(L'\0'); n != std::wstring::npos) value.resize(n);
+    return value;
+}
+
+bool sameExecutablePath(std::wstring_view left, std::wstring_view right) {
+    if (left.empty() || right.empty()) return false;
+    return CompareStringOrdinal(left.data(), static_cast<int>(left.size()),
+                                right.data(), static_cast<int>(right.size()), TRUE) == CSTR_EQUAL;
+}
+
 bool setLaunchAtLogin(bool enabled) {
     HKEY key{};
     if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Run",
                       0, KEY_SET_VALUE, &key) != ERROR_SUCCESS) return false;
     LONG result;
     if (enabled) {
-        std::wstring path(32768, L'\0');
-        const DWORD length = GetModuleFileNameW(nullptr, path.data(), static_cast<DWORD>(path.size()));
-        path.resize(length);
+        const std::wstring path = currentExecutablePath();
+        if (path.empty()) {
+            RegCloseKey(key);
+            return false;
+        }
         const std::wstring quoted = L"\"" + path + L"\"";
         result = RegSetValueExW(key, kAppName, 0, REG_SZ, reinterpret_cast<const BYTE*>(quoted.c_str()),
                                 static_cast<DWORD>((quoted.size() + 1) * sizeof(wchar_t)));
@@ -210,13 +251,47 @@ bool setLaunchAtLogin(bool enabled) {
     return result == ERROR_SUCCESS;
 }
 
+void syncLaunchAtLoginPath() {
+    if (!readDword(L"LaunchAtLogin", 0)) return;
+    const std::wstring exe = currentExecutablePath();
+    if (exe.empty()) return;
+    const std::wstring registered = unquoteLaunchCommand(readLaunchAtLoginCommand());
+    if (sameExecutablePath(registered, exe)) return;
+    setLaunchAtLogin(true);
+}
+
+// Slot zero retains the original Credential Manager target for seamless migration.
+DWORD activeAccount(std::wstring_view id) {
+    return readDword((L"Provider." + std::wstring(id) + L".ActiveAccount").c_str(), 0);
+}
+std::wstring accountKey(std::wstring_view id, DWORD slot) {
+    return std::wstring(id) + L"/account-" + std::to_wstring(slot);
+}
+std::wstring accountSetting(std::wstring_view id) {
+    const DWORD slot = activeAccount(id);
+    return L"Provider." + std::wstring(id) + (slot ? L".Account." + std::to_wstring(slot) : L"");
+}
+bool managedAccounts(std::wstring_view id) {
+    return readDword((L"Provider." + std::wstring(id) + L".ManagedAccounts").c_str(), 0) != 0;
+}
+
 class CredentialStore {
     static constexpr int kMaxChunks = 32;
     static constexpr std::string_view kChunkPrefix{"HLCHUNKS:"};
 
     static std::wstring targetName(std::wstring_view provider, std::wstring_view suffix = {}) {
         std::wstring target = L"HypeLimits/";
-        target.append(provider.begin(), provider.end());
+        // Explicit account keys bypass the active-slot lookup.
+        const auto marker = provider.find(L"/account-");
+        if (marker != std::wstring_view::npos) {
+            target.append(provider.substr(0, marker));
+            const auto slot = provider.substr(marker + 9);
+            if (slot != L"0") target += L"/accounts/" + std::wstring(slot);
+        } else {
+            target.append(provider.begin(), provider.end());
+            const auto slot = activeAccount(provider);
+            if (slot) target += L"/accounts/" + std::to_wstring(slot);
+        }
         if (!suffix.empty()) {
             target.push_back(L'/');
             target.append(suffix.begin(), suffix.end());
@@ -635,6 +710,7 @@ struct AuthMaterial {
     std::string teamId;
     std::optional<std::int64_t> expiresAtMs;
     std::optional<std::int64_t> observedAtMs;
+    std::string idToken;
 };
 
 std::string jsonEscape(std::string_view value) {
@@ -653,12 +729,13 @@ std::string packAuthJson(const AuthMaterial& auth) {
                                    jsonEscape(auth.token), jsonEscape(auth.refreshToken), jsonEscape(auth.accountId), jsonEscape(auth.teamId));
     if (auth.expiresAtMs) json += std::format(",\"expires_at\":{}", *auth.expiresAtMs);
     if (auth.observedAtMs) json += std::format(",\"observed_at\":{}", *auth.observedAtMs);
-    json += "}";
+    json += ",\"id_token\":\"" + jsonEscape(auth.idToken) + "\"}";
     return json;
 }
 
 AuthMaterial parseAuthJson(const std::string& json) {
     AuthMaterial auth;
+    auth.idToken = jsonString(json, "id_token").value_or("");
     auth.token = jsonString(json, "accessToken").value_or(jsonString(json, "access_token").value_or(jsonString(json, "token").value_or(jsonString(json, "api_key").value_or(std::string{}))));
     auth.refreshToken = jsonString(json, "refreshToken").value_or(jsonString(json, "refresh_token").value_or({}));
     auth.accountId = jsonString(json, "account_id").value_or(jsonString(json, "chatgpt_account_id").value_or({}));
@@ -764,7 +841,7 @@ AuthMaterial loadStoredAuth(std::wstring_view id) {
 }
 
 TokenRecord recordFromAuth(const AuthMaterial& auth) {
-    return TokenRecord{auth.token, auth.refreshToken, auth.accountId, auth.teamId, auth.expiresAtMs, auth.observedAtMs};
+    return TokenRecord{auth.token, auth.refreshToken, auth.accountId, auth.teamId, auth.expiresAtMs, auth.observedAtMs, auth.idToken};
 }
 
 AuthMaterial authFromRecord(const TokenRecord& record) {
@@ -775,12 +852,13 @@ AuthMaterial authFromRecord(const TokenRecord& record) {
     auth.teamId = record.teamId;
     auth.expiresAtMs = record.expiresAtMs;
     auth.observedAtMs = record.observedAtMs;
+    auth.idToken = record.idToken;
     return auth;
 }
 
 bool writeUtf8FileAtomic(const std::wstring& path, std::string_view body) {
     const auto slash = path.find_last_of(L"\\/");
-    if (slash != std::wstring::npos) CreateDirectoryW(path.substr(0, slash).c_str(), nullptr);
+    if (slash != std::wstring::npos) SHCreateDirectoryExW(nullptr, path.substr(0, slash).c_str(), nullptr);
     const std::wstring temp = path + L".tmp";
     HANDLE file = CreateFileW(temp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (file == INVALID_HANDLE_VALUE) return false;
@@ -796,7 +874,19 @@ bool writeUtf8FileAtomic(const std::wstring& path, std::string_view body) {
     return false;
 }
 
+bool applyAccountToCli(std::wstring_view id, const AuthMaterial& auth);
+bool backgroundSyncAllowed(std::wstring_view id);
+
 void syncProviderTokens(std::wstring_view id) {
+    if (!backgroundSyncAllowed(id)) return;
+    if (managedAccounts(id)) {
+        // Explicit selection authorizes ongoing write-back for that account.
+        if (readDword((accountSetting(id) + L".SelectionSync").c_str(), 0)) {
+            const bool ok = applyAccountToCli(id, loadStoredAuth(id));
+            writeDword((accountSetting(id) + L".SyncFailed").c_str(), ok ? 0 : 1);
+        }
+        return;
+    }
     if (!cliTokenSyncEnabled()) return;
     const auto format = cliFormatForProvider(utf8(id));
     if (!format) return;
@@ -857,10 +947,30 @@ AuthMaterial loadCliAuth(std::wstring_view id) {
 }
 
 bool allowOfficialCli(std::wstring_view id) {
-    return readDword((L"Provider." + std::wstring(id) + L".UseOfficialCli").c_str(), 1) != 0;
+    return readDword((accountSetting(id) + L".UseOfficialCli").c_str(), 1) != 0;
+}
+
+bool providerEnabledSetting(std::wstring_view id) {
+    return readDword((L"Provider." + std::wstring(id) + L".Enabled").c_str(), 1) != 0;
+}
+
+bool backgroundSyncAllowed(std::wstring_view id) {
+    return shouldBackgroundSyncProvider(providerEnabledSetting(id), allowOfficialCli(id));
 }
 
 AuthMaterial loadAuth(std::wstring_view id) {
+    if (!backgroundSyncAllowed(id)) return loadStoredAuth(id);
+    if (managedAccounts(id)) {
+        auto stored = loadStoredAuth(id);
+        if (!cliTokenSyncEnabled()) return stored;
+        const auto cli = loadCliAuth(id);
+        const bool same = sameCredentialAccount(recordFromAuth(stored), recordFromAuth(cli));
+        const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+        if (same && pickLatestValidToken(recordFromAuth(stored), recordFromAuth(cli), now) == TokenPick::Right) {
+            if (saveAuth(id, cli)) return cli;
+        }
+        return stored;
+    }
     AuthMaterial cli;
     if (allowOfficialCli(id)) cli = loadCliAuth(id);
     AuthMaterial stored = loadStoredAuth(id);
@@ -1050,6 +1160,7 @@ std::string sha256Url(std::string_view input) {
 }
 
 void applyTokenResponse(AuthMaterial& auth, const std::string& json) {
+    if (auto identity = jsonString(json, "id_token")) auth.idToken = *identity;
     if (auto access = jsonString(json, "access_token")) auth.token = *access;
     if (auto refresh = jsonString(json, "refresh_token")) auth.refreshToken = *refresh;
     if (auto account = jsonString(json, "account_id")) auth.accountId = *account;
@@ -1135,11 +1246,11 @@ bool providerHasOfficialReauth(std::wstring_view id) {
 }
 
 void markOfficialLogin(std::wstring_view id, bool official) {
-    writeDword((L"Provider." + std::wstring(id) + L".OfficialLogin").c_str(), official ? 1 : 0);
+    writeDword((accountSetting(id) + L".OfficialLogin").c_str(), official ? 1 : 0);
 }
 
 bool accountUsedOfficialSignIn(std::wstring_view id) {
-    if (readDword((L"Provider." + std::wstring(id) + L".OfficialLogin").c_str(), 0) != 0) return true;
+    if (readDword((accountSetting(id) + L".OfficialLogin").c_str(), 0) != 0) return true;
     auto auth = loadAuth(id);
     const bool official = !auth.refreshToken.empty();
     SecureZeroMemory(auth.token.data(), auth.token.size());
@@ -1148,7 +1259,7 @@ bool accountUsedOfficialSignIn(std::wstring_view id) {
 }
 
 std::vector<std::string> cookieHostSuffixes(std::wstring_view id) {
-    if (id == L"anthropic") return {"claude.ai", "anthropic.com"};
+    if (id == L"anthropic") return {"claude.ai", "claude.com", "anthropic.com"};
     if (id == L"openai") return {"chatgpt.com", "openai.com", "auth.openai.com"};
     if (id == L"xai") return {"x.ai", "grok.com", "auth.x.ai"};
     if (id == L"antigravity") return {"google.com", "googleapis.com", "googleusercontent.com"};
@@ -1174,7 +1285,7 @@ std::optional<std::string> codeFromHttp(const HttpResponse& response) {
 
 bool exchangeClaudeCode(AuthMaterial& auth, std::string_view code, std::string_view verifier, std::string_view state) {
     const std::string body = std::format(
-        "{{\"grant_type\":\"authorization_code\",\"code\":\"{}\",\"redirect_uri\":\"https://console.anthropic.com/oauth/code/callback\","
+        "{{\"grant_type\":\"authorization_code\",\"code\":\"{}\",\"redirect_uri\":\"https://platform.claude.com/oauth/code/callback\","
         "\"client_id\":\"9d1c250a-e61b-44d9-88ed-5944d1962f5e\",\"code_verifier\":\"{}\",\"state\":\"{}\"}}",
         jsonEscape(std::string{code}), jsonEscape(std::string{verifier}), jsonEscape(std::string{state}));
     const auto response = httpsPost(L"platform.claude.com", L"/v1/oauth/token", body, L"Content-Type: application/json\r\n");
@@ -1279,9 +1390,9 @@ bool runClaudeOAuth(HWND parent, AuthMaterial& auth) {
     const std::string state = randomUrlToken(16);
     const std::string challenge = sha256Url(verifier);
     const std::wstring url = wide(std::format(
-        "https://claude.ai/oauth/authorize?code=true&client_id=9d1c250a-e61b-44d9-88ed-5944d1962f5e&response_type=code"
-        "&redirect_uri=https%3A%2F%2Fconsole.anthropic.com%2Foauth%2Fcode%2Fcallback"
-        "&scope=user%3Aprofile%20user%3Ainference%20user%3Asessions%3Aclaude_code%20user%3Amcp_servers"
+        "https://claude.com/cai/oauth/authorize?code=true&client_id=9d1c250a-e61b-44d9-88ed-5944d1962f5e&response_type=code"
+        "&redirect_uri=https%3A%2F%2Fplatform.claude.com%2Foauth%2Fcode%2Fcallback"
+        "&scope=user%3Aprofile%20user%3Ainference%20user%3Asessions%3Aclaude_code%20user%3Amcp_servers%20user%3Afile_upload"
         "&code_challenge={}&code_challenge_method=S256&state={}",
         challenge, state));
     ShellExecuteW(parent, L"open", url.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
@@ -1307,7 +1418,7 @@ bool runClaudeOAuth(HWND parent, AuthMaterial& auth) {
         code = pasted.substr(0, hash);
     }
     const std::string body = std::format(
-        "{{\"grant_type\":\"authorization_code\",\"code\":\"{}\",\"redirect_uri\":\"https://console.anthropic.com/oauth/code/callback\","
+        "{{\"grant_type\":\"authorization_code\",\"code\":\"{}\",\"redirect_uri\":\"https://platform.claude.com/oauth/code/callback\","
         "\"client_id\":\"9d1c250a-e61b-44d9-88ed-5944d1962f5e\",\"code_verifier\":\"{}\",\"state\":\"{}\"}}",
         jsonEscape(code), jsonEscape(verifier), jsonEscape(state));
     const auto response = httpsPost(L"platform.claude.com", L"/v1/oauth/token", body, L"Content-Type: application/json\r\n");
@@ -1446,19 +1557,20 @@ bool runSubscriptionOAuth(HWND parent, std::wstring_view id, AuthMaterial& auth)
 bool tryClaudeAuthorizeHttp(AuthMaterial& auth, const std::vector<BrowserCookie>& cookies, std::string_view verifier,
                             std::string_view state, std::string_view challenge) {
     const std::wstring path = wide(std::format(
-        "/oauth/authorize?code=true&client_id=9d1c250a-e61b-44d9-88ed-5944d1962f5e&response_type=code"
-        "&redirect_uri=https%3A%2F%2Fconsole.anthropic.com%2Foauth%2Fcode%2Fcallback"
-        "&scope=user%3Aprofile%20user%3Ainference%20user%3Asessions%3Aclaude_code%20user%3Amcp_servers"
+        "/cai/oauth/authorize?code=true&client_id=9d1c250a-e61b-44d9-88ed-5944d1962f5e&response_type=code"
+        "&redirect_uri=https%3A%2F%2Fplatform.claude.com%2Foauth%2Fcode%2Fcallback"
+        "&scope=user%3Aprofile%20user%3Ainference%20user%3Asessions%3Aclaude_code%20user%3Amcp_servers%20user%3Afile_upload"
         "&code_challenge={}&code_challenge_method=S256&state={}",
         challenge, state));
-    std::wstring cookie = wide(cookieHeaderForHost(cookies, "claude.ai"));
-    const auto extra = wide(cookieHeaderForHost(cookies, "anthropic.com"));
-    if (!extra.empty()) {
+    std::wstring cookie;
+    for (const char* host : {"claude.com", "claude.ai", "anthropic.com"}) {
+        const auto part = wide(cookieHeaderForHost(cookies, host));
+        if (part.empty()) continue;
         if (!cookie.empty()) cookie += L"; ";
-        cookie += extra;
+        cookie += part;
     }
     HttpRequest spec;
-    spec.host = L"claude.ai";
+    spec.host = L"claude.com";
     spec.path = path;
     spec.followRedirects = false;
     if (!cookie.empty()) spec.extraHeaders = L"Cookie: " + cookie + L"\r\nAccept: text/html,application/json\r\n";
@@ -1491,9 +1603,9 @@ bool autoRunOfficialSignIn(HWND parent, std::wstring_view id, AuthMaterial& auth
         const std::string challenge = sha256Url(verifier);
         if (tryClaudeAuthorizeHttp(auth, cookies, verifier, state, challenge)) return true;
         const std::wstring url = wide(std::format(
-            "https://claude.ai/oauth/authorize?code=true&client_id=9d1c250a-e61b-44d9-88ed-5944d1962f5e&response_type=code"
-            "&redirect_uri=https%3A%2F%2Fconsole.anthropic.com%2Foauth%2Fcode%2Fcallback"
-            "&scope=user%3Aprofile%20user%3Ainference%20user%3Asessions%3Aclaude_code%20user%3Amcp_servers"
+            "https://claude.com/cai/oauth/authorize?code=true&client_id=9d1c250a-e61b-44d9-88ed-5944d1962f5e&response_type=code"
+            "&redirect_uri=https%3A%2F%2Fplatform.claude.com%2Foauth%2Fcode%2Fcallback"
+            "&scope=user%3Aprofile%20user%3Ainference%20user%3Asessions%3Aclaude_code%20user%3Amcp_servers%20user%3Afile_upload"
             "&code_challenge={}&code_challenge_method=S256&state={}",
             challenge, state));
         const auto captured = runWebViewOAuth(parent, url, webViewUserDataFolder(), cookies, 25000);
@@ -1766,7 +1878,7 @@ COLORREF remainingColor(double remaining, bool drawingDown = false) {
 }
 
 std::wstring tooltipText(const Provider& provider, const Metric& metric) {
-    std::wstring text = provider.definition.name + L" — " + kindName(metric.kind) + L"\r\n";
+    std::wstring text = provider.definition.name + L" — Account " + std::to_wstring(activeAccount(provider.definition.id) + 1) + L" — " + kindName(metric.kind) + L"\r\n";
     if (metric.used && metric.capacity) {
         text += std::format(L"{:.0f} / {:.0f} {} used\r\n", *metric.used, *metric.capacity, wide(metric.unit));
     }
@@ -1814,10 +1926,15 @@ private:
     static void applyWorkerPriorities();
     [[nodiscard]] double monitorScale() const;
     [[nodiscard]] POINT toLogical(POINT client) const;
-    [[nodiscard]] bool nearResizeEdge(POINT client) const;
+    enum class ResizeEdge { None, Right, Bottom, Corner };
+    [[nodiscard]] ResizeEdge resizeEdgeAt(POINT client) const;
     void refresh();
     void scheduleNextPoll(bool failed);
     void connectProvider();
+    void addAccount();
+    void showAccountMenu(std::size_t index, POINT screen);
+    bool selectAccount(std::size_t index, DWORD slot, bool interactive = true);
+    bool rotateAccounts();
     void reloadCliConnections();
     bool attemptAutoReauth(std::size_t index);
     void queueAutoReauth();
@@ -1847,6 +1964,9 @@ private:
     HWND tab_{};
     HWND status_{};
     HWND login_{};
+    HWND addAccount_{};
+    HWND accounts_{};
+    HWND rotateAccounts_{};
     HWND enabled_{};
     HWND refresh_{};
     HWND interval_{};
@@ -1887,6 +2007,7 @@ private:
     POINT windowStart_{};
     POINT resizeCursorStart_{};
     int resizeStartWidth_{};
+    ResizeEdge resizeEdge_{ResizeEdge::None};
     HBITMAP monitorBitmap_{};
     void* monitorBits_{};
     int monitorBmpW_{};
@@ -1967,7 +2088,7 @@ void App::createProviders() {
     for (auto& definition : definitions) {
         Provider provider;
         provider.definition = std::move(definition);
-        provider.snapshot.id = utf8(provider.definition.id);
+        provider.snapshot.id = utf8(activeAccount(provider.definition.id) ? accountKey(provider.definition.id, activeAccount(provider.definition.id)) : provider.definition.id);
         provider.snapshot.displayName = utf8(provider.definition.name);
         provider.snapshot.enabled = readDword((L"Provider." + provider.definition.id + L".Enabled").c_str(), 1) != 0;
         provider.connected = hasAuth(provider.definition.id);
@@ -1980,7 +2101,7 @@ void App::createProviders() {
         if (provider.connected) {
             bool restored = false;
             for (auto& metric : provider.snapshot.metrics) {
-                const std::wstring prefix = L"Provider." + provider.definition.id + L"." + std::to_wstring(static_cast<int>(metric.kind));
+                const std::wstring prefix = accountSetting(provider.definition.id) + L"." + std::to_wstring(static_cast<int>(metric.kind));
                 const auto used = readQword((prefix + L".UsedMicros").c_str());
                 const auto capacity = readQword((prefix + L".CapacityMicros").c_str());
                 const auto remaining = readQword((prefix + L".RemainingMicros").c_str());
@@ -2011,7 +2132,7 @@ void App::createProviders() {
             }
         }
         for (const auto& metric : provider.snapshot.metrics) {
-            const std::wstring warningName = L"Alert." + provider.definition.id + L"." + std::to_wstring(static_cast<int>(metric.kind)) + L".Warned";
+            const std::wstring warningName = L"Alert." + wide(provider.snapshot.id) + L"." + std::to_wstring(static_cast<int>(metric.kind)) + L".Warned";
             if (readDword(warningName.c_str(), 0)) alerts_.restoreWarning(provider.snapshot.id, metric.kind, metric.resetAt.value_or(TimePoint{}));
         }
         providers_.push_back(std::move(provider));
@@ -2043,8 +2164,7 @@ bool App::initialize(HINSTANCE instance) {
     NotifyIpInterfaceChange(AF_UNSPEC, networkChangedCallback, this, FALSE, &networkNotification_);
     const int x = static_cast<int>(readDword(L"MonitorX", 30));
     const int y = static_cast<int>(readDword(L"MonitorY", 30));
-    const int width = std::clamp(static_cast<int>(readDword(L"MonitorWidth", kMonitorDefaultWidth)),
-                                 kMonitorMinWindowWidth, kMonitorMaxWindowWidth);
+    const int width = std::max(static_cast<int>(readDword(L"MonitorWidth", kMonitorDefaultWidth)), kMonitorMinWindowWidth);
     floatingWindow_ = CreateWindowExW(WS_EX_TOOLWINDOW | (readDword(L"AlwaysOnTop", 1) ? WS_EX_TOPMOST : 0),
         floatingClass.lpszClassName, kAppName, WS_POPUP, x, y, width, 80, nullptr, nullptr, instance_, this);
     optionsWindow_ = CreateWindowExW(WS_EX_APPWINDOW, optionsClass.lpszClassName, L"HypeLimits Options",
@@ -2067,6 +2187,7 @@ bool App::initialize(HINSTANCE instance) {
         }
         writeDword(L"FirstRunComplete", 1);
     }
+    syncLaunchAtLoginPath();
     if (!readDword(L"TokenSyncAsked", 0)) {
         const int answer = MessageBoxW(optionsWindow_,
             L"Keep the tokens in your terminal synced with HypeLimits?\n\n"
@@ -2131,7 +2252,10 @@ void App::createOptionsControls() {
     SendMessageW(tab_, TCM_SETMINTABWIDTH, 0, widestTab);
     status_ = make(L"EDIT", L"", WS_BORDER | ES_LEFT | ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY | WS_VSCROLL, IdStatus);
     login_ = make(L"BUTTON", L"Log in / Connect", BS_PUSHBUTTON | WS_TABSTOP, IdLogin);
-    enabled_ = make(L"BUTTON", L"Enable this provider", BS_AUTOCHECKBOX | WS_TABSTOP, IdEnabled);
+    addAccount_ = make(L"BUTTON", L"Add account", BS_PUSHBUTTON | WS_TABSTOP, IdAddAccount);
+    accounts_ = make(L"BUTTON", L"Choose account", BS_PUSHBUTTON | WS_TABSTOP, IdAccounts);
+    rotateAccounts_ = make(L"BUTTON", L"Automatically rotate accounts when allowance runs out", BS_AUTOCHECKBOX | WS_TABSTOP, IdRotateAccounts);
+    enabled_ = make(L"BUTTON", L"Show on the floating monitor and refresh this provider", BS_AUTOCHECKBOX | WS_TABSTOP, IdEnabled);
     refresh_ = make(L"BUTTON", L"Refresh provider status", BS_PUSHBUTTON | WS_TABSTOP, IdRefresh);
     disconnect_ = make(L"BUTTON", L"Disconnect", BS_PUSHBUTTON | WS_TABSTOP, IdDisconnect);
     intervalLabel_ = make(L"STATIC", L"Refresh interval (minutes)", SS_LEFT, 0);
@@ -2243,7 +2367,7 @@ void App::layoutOptions(int width, int height) {
     extraBottom += 24 * static_cast<int>(std::count_if(wslUserChecks_.begin(), wslUserChecks_.end(), ownStyleVisible));
     if (ownStyleVisible(creditBarFull_)) extraBottom += 34;
     if (ownStyleVisible(googleSecret_)) extraBottom += 56;
-    const int statusH = std::max(90, height - y - 298 - extraBottom);
+    const int statusH = std::max(90, height - y - 374 - extraBottom);
     MoveWindow(status_, innerLeft, y, innerWidth, statusH, TRUE);
     y += statusH + 10;
 
@@ -2262,6 +2386,12 @@ void App::layoutOptions(int width, int height) {
     placeButton(disconnect_, 105, 32);
     y += 40;
 
+    x = innerLeft;
+    placeButton(addAccount_, 130, 32);
+    placeButton(accounts_, 150, 32);
+    y += 40;
+    MoveWindow(rotateAccounts_, innerLeft, y, innerWidth, 28, TRUE);
+    y += 32;
     MoveWindow(enabled_, innerLeft, y, innerWidth, 28, TRUE);
     y += 32;
     if (ownStyleVisible(googleSecret_)) {
@@ -2321,7 +2451,10 @@ void App::layoutOptions(int width, int height) {
 void App::updateOptions() {
     if (selectedProvider_ >= providers_.size()) return;
     const auto& provider = providers_[selectedProvider_];
-    std::wstring text;
+    const bool canEdit = !refreshing_ && !signInInProgress_ && !autoReauthBusy_;
+    for (HWND control : {login_, addAccount_, accounts_, disconnect_}) EnableWindow(control, canEdit);
+    Button_SetCheck(rotateAccounts_, readDword((L"Provider." + provider.definition.id + L".RotateAccounts").c_str(), 0) ? BST_CHECKED : BST_UNCHECKED);
+    std::wstring text = L"Selected credential: Account " + std::to_wstring(activeAccount(provider.definition.id) + 1) + L"\r\n";
     for (const auto& metric : provider.snapshot.metrics) {
         text += kindName(metric.kind) + L": " + stateName(metric.state) + L"\r\n";
         if (metric.used) text += std::format(L"  Used: {:.0f} {}\r\n", *metric.used, wide(metric.unit));
@@ -2331,6 +2464,10 @@ void App::updateOptions() {
         if (!metric.diagnostic.empty()) text += L"  " + wide(metric.diagnostic) + L"\r\n";
     }
     text += L"\r\n" + provider.definition.guidance + L"\r\nLast successful refresh: " + formatTime(provider.snapshot.lastSuccessfulRefresh);
+    if (readDword((accountSetting(provider.definition.id) + L".SyncFailed").c_str(), 0))
+        text += L"\r\nCredential sync failed. Select the account again to retry Windows/WSL sync.";
+    if (!cliFormatForProvider(utf8(provider.definition.id)))
+        text += L"\r\nThis provider has no supported local CLI credential file; account selection applies to HypeLimits.";
     SetWindowTextW(status_, text.c_str());
     Button_SetCheck(enabled_, provider.snapshot.enabled ? BST_CHECKED : BST_UNCHECKED);
     const std::wstring thresholdName = L"Provider." + provider.definition.id + L".ThresholdCents";
@@ -2392,10 +2529,15 @@ POINT App::toLogical(POINT client) const {
     return {static_cast<int>(std::lround(client.x / scale)), static_cast<int>(std::lround(client.y / scale))};
 }
 
-bool App::nearResizeEdge(POINT client) const {
+App::ResizeEdge App::resizeEdgeAt(POINT client) const {
     RECT bounds{};
     GetClientRect(floatingWindow_, &bounds);
-    return client.x >= bounds.right - kMonitorResizeEdge;
+    const bool right = client.x >= bounds.right - kMonitorResizeEdge;
+    const bool bottom = client.y >= bounds.bottom - kMonitorResizeEdge;
+    if (right && bottom) return ResizeEdge::Corner;
+    if (right) return ResizeEdge::Right;
+    if (bottom) return ResizeEdge::Bottom;
+    return ResizeEdge::None;
 }
 
 void App::destroyMonitorBitmap() {
@@ -2470,7 +2612,7 @@ void App::syncFloatingWindowSize() {
     GetClientRect(floatingWindow_, &client);
     int width = client.right - client.left;
     if (width <= 0) width = window.right - window.left;
-    width = std::clamp(width, kMonitorMinWindowWidth, kMonitorMaxWindowWidth);
+    width = std::max(width, kMonitorMinWindowWidth);
     const int height = std::max(1, static_cast<int>(std::lround(
         static_cast<double>(logicalHeight_) * static_cast<double>(width) / static_cast<double>(logicalWidth_))));
     if (window.right - window.left != width || window.bottom - window.top != height) {
@@ -2616,6 +2758,7 @@ void App::activateTooltip(POINT clientPoint) {
 }
 
 void App::refresh() {
+    if (signInInProgress_) return;
     if (refreshing_.exchange(true)) return;
     for (auto& provider : providers_) {
         if (!provider.snapshot.enabled || !provider.connected) continue;
@@ -2668,6 +2811,7 @@ void App::scheduleNextPoll(bool failed) {
 }
 
 void App::reloadCliConnections() {
+    if (refreshing_ || signInInProgress_ || autoReauthBusy_) return;
     if (cliTokenSyncEnabled()) syncAllProviderTokens();
     for (auto& provider : providers_) provider.connected = hasAuth(provider.definition.id);
     updateAll();
@@ -2675,8 +2819,8 @@ void App::reloadCliConnections() {
 }
 
 bool App::attemptAutoReauth(std::size_t index) {
-    if (signInInProgress_) return false;
     if (index >= providers_.size()) return false;
+    if (signInInProgress_ || managedAccounts(providers_[index].definition.id)) return false;
     auto& provider = providers_[index];
     const auto id = provider.definition.id;
     if (!shouldAutoReauthenticate(providerHasOfficialReauth(id), accountUsedOfficialSignIn(id), false)) return false;
@@ -2712,7 +2856,7 @@ bool App::attemptAutoReauth(std::size_t index) {
 }
 
 void App::queueAutoReauth() {
-    if (signInInProgress_ || autoReauthBusy_) return;
+    if (signInInProgress_ || autoReauthBusy_ || refreshing_) return;
     if (autoReauthTried_.size() < providers_.size()) autoReauthTried_.resize(providers_.size(), 0);
     for (std::size_t index = 0; index < providers_.size(); ++index) {
         const auto& provider = providers_[index];
@@ -2730,7 +2874,7 @@ void App::queueAutoReauth() {
 }
 
 void App::processAutoReauth() {
-    if (autoReauthBusy_ || signInInProgress_ || autoReauthQueue_.empty()) return;
+    if (autoReauthBusy_ || signInInProgress_ || refreshing_ || autoReauthQueue_.empty()) return;
     autoReauthBusy_ = true;
     const std::size_t index = autoReauthQueue_.front();
     autoReauthQueue_.erase(autoReauthQueue_.begin());
@@ -2769,8 +2913,170 @@ void App::handleMonitorClick(POINT client) {
     connectProvider();
 }
 
+// An explicit selection overrides newest-token arbitration. Roll back files on failure.
+bool applyAccountToCli(std::wstring_view id, const AuthMaterial& auth) {
+    const auto format = cliFormatForProvider(utf8(id));
+    if (!format) return true; // No official CLI credential file is known for this provider.
+    std::vector<std::wstring> paths;
+    auto includeHome = [&](const std::wstring& home) {
+        auto candidates = cliCredentialPathsForHome(home, id);
+        bool found = false;
+        for (const auto& path : candidates) {
+            if (GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES) continue;
+            paths.push_back(path);
+            found = true;
+        }
+        if (!found && !candidates.empty()) paths.push_back(candidates.front());
+    };
+    includeHome(userProfile());
+    for (const auto& home : discoverWslHomes()) {
+        if (wslHomeSyncEnabled(home)) includeHome(home.home);
+    }
+    std::vector<std::optional<std::string>> backups;
+    for (const auto& path : paths) {
+        auto body = readUtf8File(path);
+        if (!body && GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES) return false;
+        backups.push_back(std::move(body));
+    }
+    bool ok = true;
+    for (std::size_t i = 0; i < paths.size(); ++i) {
+        const auto merged = mergeCliCredentialJson(*format, backups[i].value_or(""), recordFromAuth(auth));
+        if (writeUtf8FileAtomic(paths[i], merged)) continue;
+        ok = false;
+        for (std::size_t j = 0; j < i; ++j) {
+            if (backups[j]) writeUtf8FileAtomic(paths[j], *backups[j]);
+            else DeleteFileW(paths[j].c_str());
+        }
+        break;
+    }
+    for (auto& body : backups) if (body) SecureZeroMemory(body->data(), body->size());
+    return ok;
+}
+
+bool App::selectAccount(std::size_t index, DWORD slot, bool interactive) {
+    if (refreshing_ || signInInProgress_ || autoReauthBusy_) return false;
+    auto& provider = providers_[index];
+    const auto& id = provider.definition.id;
+    auto auth = loadStoredAuth(accountKey(id, slot));
+    if (auth.token.empty() && auth.refreshToken.empty()) return false;
+    const bool synced = applyAccountToCli(id, auth);
+    SecureZeroMemory(auth.token.data(), auth.token.size());
+    SecureZeroMemory(auth.refreshToken.data(), auth.refreshToken.size());
+    if (!synced) {
+        writeDword((accountSetting(id) + L".SyncFailed").c_str(), 1);
+        if (interactive) MessageBoxW(dialogParent(), L"Could not sync the credential to every Windows and selected WSL CLI file. Check file access and WSL availability. The selected account was not changed; earlier writes were rolled back where possible.", kAppName, MB_ICONERROR);
+        return false;
+    }
+    writeDword((L"Provider." + id + L".ManagedAccounts").c_str(), 1);
+    writeDword((L"Provider." + id + L".ActiveAccount").c_str(), slot);
+    writeDword((accountSetting(id) + L".SelectionSync").c_str(), 1);
+    writeDword((accountSetting(id) + L".SyncFailed").c_str(), 0);
+    provider.connected = true;
+    provider.snapshot.lastSuccessfulRefresh.reset();
+    for (auto& metric : provider.snapshot.metrics) metric = initialMetric(id, metric.kind);
+    provider.snapshot.id = utf8(slot ? accountKey(id, slot) : id);
+    if (index < autoReauthTried_.size()) autoReauthTried_[index] = 0;
+    updateAll();
+    return true;
+}
+
+void App::showAccountMenu(std::size_t index, POINT screen) {
+    const auto& id = providers_[index].definition.id;
+    HMENU menu = CreatePopupMenu();
+    const DWORD count = std::min<DWORD>(readDword((L"Provider." + id + L".AccountCount").c_str(), 1), 100);
+    const bool busy = refreshing_ || signInInProgress_ || autoReauthBusy_;
+    for (DWORD slot = 0; slot < count; ++slot) {
+        auto auth = loadStoredAuth(accountKey(id, slot));
+        const bool exists = !auth.token.empty() || !auth.refreshToken.empty();
+        SecureZeroMemory(auth.token.data(), auth.token.size());
+        SecureZeroMemory(auth.refreshToken.data(), auth.refreshToken.size());
+        if (!exists) continue;
+        auto label = L"Account " + std::to_wstring(slot + 1);
+        AppendMenuW(menu, MF_STRING | (slot == activeAccount(id) ? MF_CHECKED : 0) | (busy ? MF_GRAYED : 0), 1000 + slot, label.c_str());
+    }
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(menu, MF_STRING | (busy ? MF_GRAYED : 0), 2000, L"Add account...");
+    const UINT chosen = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, screen.x, screen.y, 0, dialogParent(), nullptr);
+    DestroyMenu(menu);
+    if (chosen == 2000) { selectedProvider_ = index; addAccount(); }
+    else if (chosen >= 1000 && chosen < 1100 && selectAccount(index, chosen - 1000)) refresh();
+}
+
+void App::addAccount() {
+    if (refreshing_ || signInInProgress_ || autoReauthBusy_) return;
+    const auto index = selectedProvider_;
+    const auto id = providers_[index].definition.id;
+    const DWORD previous = activeAccount(id);
+    const bool wasManaged = managedAccounts(id);
+    // Preserve a legacy CLI-only login before entering managed-account mode.
+    auto old = loadAuth(id);
+    if (!old.token.empty() && !saveAuth(id, old)) return;
+    SecureZeroMemory(old.token.data(), old.token.size());
+    SecureZeroMemory(old.refreshToken.data(), old.refreshToken.size());
+    const DWORD slot = readDword((L"Provider." + id + L".AccountCount").c_str(), 1);
+    if (slot >= 100) { MessageBoxW(dialogParent(), L"Up to 100 account slots are supported per provider.", kAppName, MB_ICONINFORMATION); return; }
+    writeDword((L"Provider." + id + L".ManagedAccounts").c_str(), 1);
+    writeDword((L"Provider." + id + L".ActiveAccount").c_str(), slot);
+    connectProvider();
+    writeDword((L"Provider." + id + L".ActiveAccount").c_str(), previous);
+    auto added = loadStoredAuth(accountKey(id, slot));
+    const bool saved = !added.token.empty();
+    SecureZeroMemory(added.token.data(), added.token.size());
+    SecureZeroMemory(added.refreshToken.data(), added.refreshToken.size());
+    if (saved) {
+        writeDword((L"Provider." + id + L".AccountCount").c_str(), slot + 1);
+        selectAccount(index, slot);
+    } else {
+        writeDword((L"Provider." + id + L".ManagedAccounts").c_str(), wasManaged ? 1 : 0);
+    }
+    providers_[index].connected = hasAuth(id);
+    updateAll();
+    refresh();
+}
+
+bool App::rotateAccounts() {
+    const auto now = std::chrono::system_clock::now();
+    bool changed = false;
+    for (std::size_t index = 0; index < providers_.size(); ++index) {
+        auto& provider = providers_[index];
+        const auto& id = provider.definition.id;
+        if (!provider.snapshot.enabled || !provider.connected ||
+            !readDword((L"Provider." + id + L".RotateAccounts").c_str(), 0)) continue;
+        const auto blockedUntil = exhaustedUntil(provider.snapshot, now);
+        if (!blockedUntil) {
+            const bool recovered = std::ranges::any_of(provider.snapshot.metrics, [](const Metric& metric) {
+                return metric.state == MetricState::Current && metric.observedAt.has_value();
+            }) && std::ranges::all_of(provider.snapshot.metrics, [](const Metric& metric) {
+                return metric.state == MetricState::Unsupported ||
+                    (metric.state == MetricState::Current && ((metric.remaining && *metric.remaining > 0) ||
+                    (metric.capacity && metric.used && *metric.capacity > *metric.used)));
+            });
+            if (recovered) deleteSetting((accountSetting(id) + L".ExhaustedUntil").c_str());
+            continue;
+        }
+        const DWORD active = activeAccount(id);
+        writeQword((accountSetting(id) + L".ExhaustedUntil").c_str(),
+            static_cast<ULONGLONG>(std::chrono::duration_cast<std::chrono::seconds>(blockedUntil->time_since_epoch()).count()));
+        const DWORD count = std::min<DWORD>(readDword((L"Provider." + id + L".AccountCount").c_str(), 1), 100);
+        for (DWORD step = 1; step < count; ++step) {
+            const DWORD candidate = (active + step) % count;
+            const auto prefix = L"Provider." + id + (candidate ? L".Account." + std::to_wstring(candidate) : L"");
+            const auto until = readQword((prefix + L".ExhaustedUntil").c_str()).value_or(0);
+            if (until > static_cast<ULONGLONG>(std::chrono::duration_cast<std::chrono::seconds>(now.time_since_epoch()).count())) continue;
+            auto auth = loadStoredAuth(accountKey(id, candidate));
+            const bool exists = !auth.token.empty() || !auth.refreshToken.empty();
+            SecureZeroMemory(auth.token.data(), auth.token.size());
+            SecureZeroMemory(auth.refreshToken.data(), auth.refreshToken.size());
+            if (!exists) continue;
+            if (selectAccount(index, candidate, false)) changed = true;
+            break;
+        }
+    }
+    return changed;
+}
+
 void App::connectProvider() {
-    if (signInInProgress_ || autoReauthBusy_) return;
+    if (signInInProgress_ || autoReauthBusy_ || refreshing_) return;
     struct SignInGuard {
         bool& flag;
         explicit SignInGuard(bool& value) : flag(value) { flag = true; }
@@ -2811,7 +3117,7 @@ void App::connectProvider() {
     cfg.dwCommonButtons = TDCBF_CANCEL_BUTTON;
     cfg.pszWindowTitle = kAppName;
     cfg.pszMainInstruction = heading.c_str();
-    cfg.pszContent = L"Subscription sign-in fetches plan session/weekly allowances. A platform API key fetches prepaid credit only.";
+    cfg.pszContent = L"Subscription sign-in fetches plan session/weekly allowances. A platform API key fetches prepaid credit only. When adding an account, choose the intended account on the provider's sign-in page.";
     cfg.cButtons = static_cast<UINT>(buttonCount);
     cfg.pButtons = buttons;
     cfg.nDefaultButton = buttons[0].nButtonID;
@@ -2819,12 +3125,15 @@ void App::connectProvider() {
     TaskDialogIndirect(&cfg, &chosen, nullptr, nullptr);
 
     if (chosen == kUseCli) {
-        writeDword((L"Provider." + provider.definition.id + L".UseOfficialCli").c_str(), 1);
+        if (!saveAuth(provider.definition.id, loadCliAuth(provider.definition.id))) return;
+        writeDword((accountSetting(provider.definition.id) + L".UseOfficialCli").c_str(), 1);
+        provider.snapshot.enabled = true;
+        writeDword((L"Provider." + provider.definition.id + L".Enabled").c_str(), 1);
         markOfficialLogin(provider.definition.id, true);
         if (selectedProvider_ < autoReauthTried_.size()) autoReauthTried_[selectedProvider_] = 0;
         provider.connected = true;
         syncProviderTokens(provider.definition.id);
-        refresh();
+        PostMessageW(trayWindow_, WM_COMMAND, IdTrayRefresh, 0);
         return;
     }
     if (chosen == kSignIn) {
@@ -2844,12 +3153,14 @@ void App::connectProvider() {
             MessageBoxW(parent, L"Windows Credential Manager rejected the credential.", kAppName, MB_ICONERROR);
             return;
         }
-        writeDword((L"Provider." + provider.definition.id + L".UseOfficialCli").c_str(), 1);
+        writeDword((accountSetting(provider.definition.id) + L".UseOfficialCli").c_str(), 1);
+        provider.snapshot.enabled = true;
+        writeDword((L"Provider." + provider.definition.id + L".Enabled").c_str(), 1);
         markOfficialLogin(provider.definition.id, true);
         if (selectedProvider_ < autoReauthTried_.size()) autoReauthTried_[selectedProvider_] = 0;
         provider.connected = true;
         syncProviderTokens(provider.definition.id);
-        refresh();
+        PostMessageW(trayWindow_, WM_COMMAND, IdTrayRefresh, 0);
         return;
     }
     if (chosen != kPaste) return;
@@ -2866,7 +3177,9 @@ void App::connectProvider() {
         if (!CredentialStore::save(provider.definition.id, secret)) {
             MessageBoxW(parent, L"Windows Credential Manager rejected the credential.", kAppName, MB_ICONERROR);
         } else {
-            writeDword((L"Provider." + provider.definition.id + L".UseOfficialCli").c_str(), 1);
+            writeDword((accountSetting(provider.definition.id) + L".UseOfficialCli").c_str(), 1);
+            provider.snapshot.enabled = true;
+            writeDword((L"Provider." + provider.definition.id + L".Enabled").c_str(), 1);
             const auto pasted = parseAuthJson(utf8(secret));
             markOfficialLogin(provider.definition.id, !pasted.refreshToken.empty());
             if (selectedProvider_ < autoReauthTried_.size()) autoReauthTried_[selectedProvider_] = 0;
@@ -2874,7 +3187,7 @@ void App::connectProvider() {
             syncProviderTokens(provider.definition.id);
         }
         SecureZeroMemory(secret, sizeof(secret));
-        refresh();
+        PostMessageW(trayWindow_, WM_COMMAND, IdTrayRefresh, 0);
     } else {
         SecureZeroMemory(secret, sizeof(secret));
     }
@@ -3069,9 +3382,11 @@ LRESULT App::onFloating(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
             POINT cursor{};
             GetCursorPos(&cursor);
             ScreenToClient(hwnd, &cursor);
-            if (nearResizeEdge(cursor)) {
-                SetCursor(LoadCursorW(nullptr, IDC_SIZEWE));
-                return TRUE;
+            switch (resizeEdgeAt(cursor)) {
+            case ResizeEdge::Right: SetCursor(LoadCursorW(nullptr, IDC_SIZEWE)); return TRUE;
+            case ResizeEdge::Bottom: SetCursor(LoadCursorW(nullptr, IDC_SIZENS)); return TRUE;
+            case ResizeEdge::Corner: SetCursor(LoadCursorW(nullptr, IDC_SIZENWSE)); return TRUE;
+            case ResizeEdge::None: break;
             }
             if (authenticationFailedAt(cursor)) {
                 SetCursor(LoadCursorW(nullptr, IDC_HAND));
@@ -3084,8 +3399,9 @@ LRESULT App::onFloating(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
         GetCursorPos(&dragStart_);
         RECT rect{};
         GetWindowRect(hwnd, &rect);
-        if (nearResizeEdge(point)) {
+        if (const auto edge = resizeEdgeAt(point); edge != ResizeEdge::None) {
             resizing_ = true;
+            resizeEdge_ = edge;
             resizeCursorStart_ = dragStart_;
             resizeStartWidth_ = rect.right - rect.left;
         } else {
@@ -3103,8 +3419,14 @@ LRESULT App::onFloating(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
         const int dragDy = std::abs(static_cast<int>(cursor.y - dragStart_.y));
         const bool pastSlop = dragDx > kMonitorClickSlop || dragDy > kMonitorClickSlop;
         if (resizing_ && (wParam & MK_LBUTTON) && pastSlop) {
-            const int width = std::clamp(resizeStartWidth_ + static_cast<int>(cursor.x - resizeCursorStart_.x),
-                                         kMonitorMinWindowWidth, kMonitorMaxWindowWidth);
+            // The widget keeps its aspect ratio, so vertical drags are mapped back onto width.
+            const double aspect = static_cast<double>(logicalWidth_) / static_cast<double>(logicalHeight_);
+            const int dx = static_cast<int>(cursor.x - resizeCursorStart_.x);
+            const int dy = static_cast<int>(std::lround((cursor.y - resizeCursorStart_.y) * aspect));
+            int delta = dx;
+            if (resizeEdge_ == ResizeEdge::Bottom) delta = dy;
+            else if (resizeEdge_ == ResizeEdge::Corner) delta = std::abs(dx) >= std::abs(dy) ? dx : dy;
+            const int width = std::max(resizeStartWidth_ + delta, kMonitorMinWindowWidth);
             const int height = std::max(1, static_cast<int>(std::lround(
                 static_cast<double>(logicalHeight_) * width / static_cast<double>(logicalWidth_))));
             SetWindowPos(hwnd, nullptr, 0, 0, width, height, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
@@ -3159,7 +3481,15 @@ LRESULT App::onFloating(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
         else showOptions();
         return 0;
     }
-    case WM_RBUTTONUP: showTrayMenu(); return 0;
+    case WM_RBUTTONUP: {
+        POINT point{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+        const auto* found = hitAt(point);
+        if (!found) { showTrayMenu(); return 0; }
+        const auto index = found->provider;
+        ClientToScreen(hwnd, &point);
+        showAccountMenu(index, point);
+        return 0;
+    }
     }
     return DefWindowProcW(hwnd, message, wParam, lParam);
 }
@@ -3181,24 +3511,42 @@ LRESULT App::onOptions(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
         return 0;
     case WM_COMMAND:
         switch (LOWORD(wParam)) {
+        case IdAddAccount: addAccount(); return 0;
+        case IdAccounts: {
+            POINT point{}; GetCursorPos(&point);
+            showAccountMenu(selectedProvider_, point); return 0;
+        }
+        case IdRotateAccounts:
+            writeDword((L"Provider." + providers_[selectedProvider_].definition.id + L".RotateAccounts").c_str(), Button_GetCheck(rotateAccounts_) == BST_CHECKED);
+            return 0;
         case IdLogin:
             connectProvider(); return 0;
         case IdEnabled: {
             auto& provider = providers_[selectedProvider_];
             provider.snapshot.enabled = Button_GetCheck(enabled_) == BST_CHECKED;
             writeDword((L"Provider." + provider.definition.id + L".Enabled").c_str(), provider.snapshot.enabled);
+            if (provider.snapshot.enabled && provider.connected) refresh();
             updateAll();
             return 0;
         }
         case IdRefresh: refresh(); return 0;
         case IdDisconnect:
+            if (refreshing_ || signInInProgress_ || autoReauthBusy_) return 0;
             CredentialStore::remove(providers_[selectedProvider_].definition.id);
-            writeDword((L"Provider." + providers_[selectedProvider_].definition.id + L".UseOfficialCli").c_str(), 0);
+            writeDword((accountSetting(providers_[selectedProvider_].definition.id) + L".UseOfficialCli").c_str(), 0);
+            providers_[selectedProvider_].snapshot.enabled = false;
+            writeDword((L"Provider." + providers_[selectedProvider_].definition.id + L".Enabled").c_str(), 0);
             markOfficialLogin(providers_[selectedProvider_].definition.id, false);
             if (selectedProvider_ < autoReauthTried_.size()) autoReauthTried_[selectedProvider_] = 0;
             providers_[selectedProvider_].connected = false;
             {
-                const std::wstring prefix = L"Provider." + providers_[selectedProvider_].definition.id;
+                const std::wstring prefix = accountSetting(providers_[selectedProvider_].definition.id);
+                deleteSetting((prefix + L".SelectionSync").c_str());
+                deleteSetting((prefix + L".ExhaustedUntil").c_str());
+                for (const auto& metric : providers_[selectedProvider_].snapshot.metrics) {
+                    for (const auto* field : {L"UsedMicros", L"CapacityMicros", L"RemainingMicros", L"ObservedUnix", L"ResetUnix", L"Currency"})
+                        deleteSetting((prefix + L"." + std::to_wstring(static_cast<int>(metric.kind)) + L"." + field).c_str());
+                }
                 deleteSetting((prefix + L".BalanceMicros").c_str());
                 deleteSetting((prefix + L".ObservedUnix").c_str());
                 deleteSetting((prefix + L".Currency").c_str());
@@ -3346,7 +3694,7 @@ LRESULT App::onTray(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
             providers_[index].snapshot.enabled = enabled;
             for (const auto& metric : providers_[index].snapshot.metrics) {
                 if ((metric.state != MetricState::Current && metric.state != MetricState::Stale) || !metric.observedAt) continue;
-                const std::wstring prefix = L"Provider." + providers_[index].definition.id + L"." + std::to_wstring(static_cast<int>(metric.kind));
+                const std::wstring prefix = accountSetting(providers_[index].definition.id) + L"." + std::to_wstring(static_cast<int>(metric.kind));
                 if (metric.used) writeQword((prefix + L".UsedMicros").c_str(), static_cast<ULONGLONG>(std::llround(*metric.used * 1000000.0)));
                 if (metric.capacity) writeQword((prefix + L".CapacityMicros").c_str(), static_cast<ULONGLONG>(std::llround(*metric.capacity * 1000000.0)));
                 if (metric.remaining) writeQword((prefix + L".RemainingMicros").c_str(), static_cast<ULONGLONG>(std::llround(*metric.remaining * 1000000.0)));
@@ -3358,6 +3706,7 @@ LRESULT App::onTray(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
             }
         }
         refreshing_ = false;
+        if (rotateAccounts()) { refresh(); return 0; }
         for (std::size_t index = 0; index < providers_.size(); ++index) {
             if (index < autoReauthTried_.size()
                 && !providerAuthenticationFailed(providers_[index].snapshot)

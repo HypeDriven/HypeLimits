@@ -320,8 +320,8 @@ int main() {
     const auto codexParsed = parseCliTokenRecord(CliCredentialFormat::CodexTokens, codexMerged);
     check(codexParsed.accessToken == "codex-new" && codexParsed.refreshToken == "codex-new-r" && codexParsed.accountId == "acct-2",
           "Codex write-back updates tokens.access_token and refresh_token");
-    check(codexMerged.find("\"id_token\":\"keep-id\"") != std::string::npos && codexMerged.find("\"last_refresh\":\"keep-meta\"") != std::string::npos,
-          "Codex write-back leaves extra keys intact");
+    check(codexMerged.find("\"id_token\":\"\"") != std::string::npos && codexMerged.find("\"last_refresh\":\"keep-meta\"") != std::string::npos,
+          "Codex account switch clears old identity while preserving unrelated metadata");
 
     const char* geminiExisting = R"({"access_token":"old","refresh_token":"old-r","token_type":"Bearer","scope":"keep-scope","expiry_date":1})";
     TokenRecord geminiWinner;
@@ -347,6 +347,73 @@ int main() {
     const auto fromMalformedParsed = parseCliTokenRecord(CliCredentialFormat::ClaudeOauth, fromMalformed);
     check(fromMalformedParsed.accessToken == "created" && fromMalformed.find("NOT-JSON") == std::string::npos,
           "malformed CLI body is not a destructive overlay of leftover text");
+
+
+    TokenRecord firstAccount;
+    firstAccount.accessToken = "first-token";
+    firstAccount.refreshToken = "first-refresh";
+    firstAccount.accountId = "first-account";
+    TokenRecord secondAccount = firstAccount;
+    secondAccount.accountId = "second-account";
+    check(!sameCredentialAccount(firstAccount, secondAccount), "different account IDs cannot overwrite each other");
+    secondAccount = firstAccount;
+    secondAccount.accessToken = "renewed-token";
+    check(sameCredentialAccount(firstAccount, secondAccount), "renewed token remains in its account");
+    secondAccount.accountId.clear();
+    check(sameCredentialAccount(firstAccount, secondAccount), "matching refresh token proves identity without account ID");
+    secondAccount.refreshToken = "other-refresh";
+    check(!sameCredentialAccount(firstAccount, secondAccount), "unidentified newer CLI login cannot replace selected account");
+    check(!sameCredentialAccount(TokenRecord{}, TokenRecord{}), "empty credentials do not prove identity");
+    codexWinner.idToken = "new-account-identity";
+    const auto identityMerged = mergeCliCredentialJson(CliCredentialFormat::CodexTokens, codexExisting, codexWinner);
+    check(parseCliTokenRecord(CliCredentialFormat::CodexTokens, identityMerged).idToken == "new-account-identity",
+          "Codex ID token follows selected account");
+    codexWinner.accountId.clear();
+    const auto clearedIdentity = mergeCliCredentialJson(CliCredentialFormat::CodexTokens, identityMerged, codexWinner);
+    check(parseCliTokenRecord(CliCredentialFormat::CodexTokens, clearedIdentity).accountId.empty(),
+          "missing new account ID never retains previous account ID");
+
+    TokenRecord apiAccount;
+    apiAccount.accessToken = "sk-test-account";
+    const auto apiMerged = mergeCliCredentialJson(CliCredentialFormat::CodexTokens, identityMerged, apiAccount);
+    check(parseCliTokenRecord(CliCredentialFormat::CodexTokens, apiMerged).accessToken == apiAccount.accessToken,
+          "Codex API key selection replaces OAuth credentials");
+    const auto oauthAgain = mergeCliCredentialJson(CliCredentialFormat::CodexTokens, apiMerged, codexWinner);
+    check(parseCliTokenRecord(CliCredentialFormat::CodexTokens, oauthAgain).accessToken == codexWinner.accessToken,
+          "Codex OAuth selection removes overriding API key");
+    const auto unknownExpiry = mergeCliCredentialJson(CliCredentialFormat::GeminiOauth, geminiExisting, firstAccount);
+    check(!parseCliTokenRecord(CliCredentialFormat::GeminiOauth, unknownExpiry).expiresAtMs,
+          "new account does not inherit another account's expiry");
+
+    ProviderSnapshot rotating;
+    Metric limit;
+    const auto rotationNow = std::chrono::system_clock::now();
+    limit.state = MetricState::Current;
+    limit.observedAt = rotationNow;
+    limit.remaining = 0;
+    limit.resetAt = rotationNow + std::chrono::hours(2);
+    rotating.metrics = {limit};
+    check(exhaustedUntil(rotating, rotationNow) == limit.resetAt, "confirmed exhaustion waits for reset");
+    rotating.metrics[0].state = MetricState::Stale;
+    check(!exhaustedUntil(rotating, rotationNow), "stale exhaustion cannot rotate accounts");
+    rotating.metrics[0].state = MetricState::AuthenticationRequired;
+    check(!exhaustedUntil(rotating, rotationNow), "authentication failure is not quota exhaustion");
+    rotating.metrics[0] = limit;
+    rotating.metrics[0].remaining = 1;
+    check(!exhaustedUntil(rotating, rotationNow), "low positive allowance does not rotate");
+    rotating.metrics[0] = limit;
+    rotating.metrics[0].resetAt.reset();
+    check(exhaustedUntil(rotating, rotationNow) == TimePoint::max(), "unknown reset does not cause rotation loops");
+    rotating.metrics.push_back(limit);
+    check(exhaustedUntil(rotating, rotationNow) == TimePoint::max(), "all blocking limits must recover");
+    rotating.metrics = {limit};
+    rotating.metrics[0].observedAt = rotationNow - std::chrono::hours(1);
+    check(!exhaustedUntil(rotating, rotationNow), "old observations cannot rotate");
+
+    check(shouldBackgroundSyncProvider(true, true), "enabled connected providers keep CLI sync");
+    check(!shouldBackgroundSyncProvider(false, true), "disabled providers do not background-sync");
+    check(!shouldBackgroundSyncProvider(true, false), "disconnected providers do not background-sync until Connect");
+    check(!shouldBackgroundSyncProvider(false, false), "disabled disconnected providers stay unsynced");
 
     if (failures == 0) {
         std::cout << "All core tests passed\n";
