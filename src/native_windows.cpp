@@ -76,6 +76,12 @@ constexpr UINT kRefreshCompleteMessage = WM_APP + 2;
 constexpr UINT kNetworkChangedMessage = WM_APP + 3;
 constexpr UINT kAutoReauthMessage = WM_APP + 4;
 constexpr UINT_PTR kPollTimer = 1;
+constexpr UINT_PTR kFlashTimer = 2;
+constexpr ULONGLONG kResetFlashMs = 2000;
+constexpr COLORREF kResetRowBackground = RGB(36, 214, 78);
+constexpr COLORREF kResetRowText = RGB(255, 255, 255);
+constexpr COLORREF kResetRowTrack = RGB(18, 118, 42);
+constexpr COLORREF kResetRowFill = RGB(196, 255, 168);
 constexpr int kMonitorLogicalMinWidth = 196;
 constexpr int kMonitorMinWindowWidth = 140;
 constexpr int kMonitorResizeEdge = 8;
@@ -1283,6 +1289,16 @@ std::optional<std::string> codeFromHttp(const HttpResponse& response) {
     return extractAuthorizationCode(haystack);
 }
 
+std::string claudeAuthorizeQuery(std::string_view challenge, std::string_view state) {
+    // Claude.ai rejects states shorter than 32 random bytes with "Invalid request format".
+    return std::format(
+        "/cai/oauth/authorize?code=true&client_id=9d1c250a-e61b-44d9-88ed-5944d1962f5e&response_type=code"
+        "&redirect_uri=https%3A%2F%2Fplatform.claude.com%2Foauth%2Fcode%2Fcallback"
+        "&scope=org%3Acreate_api_key%20user%3Aprofile%20user%3Ainference%20user%3Asessions%3Aclaude_code%20user%3Amcp_servers%20user%3Afile_upload"
+        "&code_challenge={}&code_challenge_method=S256&state={}",
+        challenge, state);
+}
+
 bool exchangeClaudeCode(AuthMaterial& auth, std::string_view code, std::string_view verifier, std::string_view state) {
     const std::string body = std::format(
         "{{\"grant_type\":\"authorization_code\",\"code\":\"{}\",\"redirect_uri\":\"https://platform.claude.com/oauth/code/callback\","
@@ -1387,14 +1403,9 @@ bool waitForDeviceApprovalSilent(HWND parent, const std::wstring& verifyUrl, Dev
 
 bool runClaudeOAuth(HWND parent, AuthMaterial& auth) {
     const std::string verifier = randomUrlToken(32);
-    const std::string state = randomUrlToken(16);
+    const std::string state = randomUrlToken(32);
     const std::string challenge = sha256Url(verifier);
-    const std::wstring url = wide(std::format(
-        "https://claude.com/cai/oauth/authorize?code=true&client_id=9d1c250a-e61b-44d9-88ed-5944d1962f5e&response_type=code"
-        "&redirect_uri=https%3A%2F%2Fplatform.claude.com%2Foauth%2Fcode%2Fcallback"
-        "&scope=user%3Aprofile%20user%3Ainference%20user%3Asessions%3Aclaude_code%20user%3Amcp_servers%20user%3Afile_upload"
-        "&code_challenge={}&code_challenge_method=S256&state={}",
-        challenge, state));
+    const std::wstring url = wide("https://claude.com" + claudeAuthorizeQuery(challenge, state));
     ShellExecuteW(parent, L"open", url.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
     CREDUI_INFOW info{sizeof(info), parent, L"Claude subscription sign-in",
                       L"Finish sign-in in the browser, then paste the authorization code (code#state) into the password field.", nullptr};
@@ -1556,12 +1567,7 @@ bool runSubscriptionOAuth(HWND parent, std::wstring_view id, AuthMaterial& auth)
 
 bool tryClaudeAuthorizeHttp(AuthMaterial& auth, const std::vector<BrowserCookie>& cookies, std::string_view verifier,
                             std::string_view state, std::string_view challenge) {
-    const std::wstring path = wide(std::format(
-        "/cai/oauth/authorize?code=true&client_id=9d1c250a-e61b-44d9-88ed-5944d1962f5e&response_type=code"
-        "&redirect_uri=https%3A%2F%2Fplatform.claude.com%2Foauth%2Fcode%2Fcallback"
-        "&scope=user%3Aprofile%20user%3Ainference%20user%3Asessions%3Aclaude_code%20user%3Amcp_servers%20user%3Afile_upload"
-        "&code_challenge={}&code_challenge_method=S256&state={}",
-        challenge, state));
+    const std::wstring path = wide(claudeAuthorizeQuery(challenge, state));
     std::wstring cookie;
     for (const char* host : {"claude.com", "claude.ai", "anthropic.com"}) {
         const auto part = wide(cookieHeaderForHost(cookies, host));
@@ -1599,15 +1605,10 @@ bool tryClaudeAuthorizeHttp(AuthMaterial& auth, const std::vector<BrowserCookie>
 bool autoRunOfficialSignIn(HWND parent, std::wstring_view id, AuthMaterial& auth, const std::vector<BrowserCookie>& cookies) {
     if (id == L"anthropic") {
         const std::string verifier = randomUrlToken(32);
-        const std::string state = randomUrlToken(16);
+        const std::string state = randomUrlToken(32);
         const std::string challenge = sha256Url(verifier);
         if (tryClaudeAuthorizeHttp(auth, cookies, verifier, state, challenge)) return true;
-        const std::wstring url = wide(std::format(
-            "https://claude.com/cai/oauth/authorize?code=true&client_id=9d1c250a-e61b-44d9-88ed-5944d1962f5e&response_type=code"
-            "&redirect_uri=https%3A%2F%2Fplatform.claude.com%2Foauth%2Fcode%2Fcallback"
-            "&scope=user%3Aprofile%20user%3Ainference%20user%3Asessions%3Aclaude_code%20user%3Amcp_servers%20user%3Afile_upload"
-            "&code_challenge={}&code_challenge_method=S256&state={}",
-            challenge, state));
+        const std::wstring url = wide("https://claude.com" + claudeAuthorizeQuery(challenge, state));
         const auto captured = runWebViewOAuth(parent, url, webViewUserDataFolder(), cookies, 25000);
         const std::string haystack = utf8(captured.url) + "\n" + utf8(captured.pageText);
         if (const auto code = extractAuthorizationCode(haystack)) return exchangeClaudeCode(auth, *code, verifier, state);
@@ -1949,6 +1950,8 @@ private:
     void playWarning();
     void playReset();
     void playTone(bool reset);
+    void startRowFlash(const std::string& providerId);
+    void tickRowFlashes();
     void persistGoogleClientSecretField();
     void syncGoogleSecretControls();
     [[nodiscard]] HWND dialogParent() const;
@@ -2015,6 +2018,7 @@ private:
     int logicalWidth_{kMonitorDefaultWidth};
     int logicalHeight_{48};
     AlertEngine alerts_;
+    std::vector<ULONGLONG> rowFlashUntil_;
     std::vector<unsigned char> soundBuffer_;
     std::jthread refreshThread_;
     std::atomic_bool refreshing_{false};
@@ -2663,10 +2667,13 @@ void App::renderMonitorBitmap() {
 
     int y = 8;
     bool any = false;
-    for (const auto& provider : providers_) {
+    const ULONGLONG nowTick = GetTickCount64();
+    for (std::size_t providerIndex = 0; providerIndex < providers_.size(); ++providerIndex) {
+        const auto& provider = providers_[providerIndex];
         if (!monitorIncludesProvider(provider.snapshot)) continue;
         any = true;
-        const bool authFailed = providerAuthenticationFailed(provider.snapshot);
+        const bool flashing = providerIndex < rowFlashUntil_.size() && rowFlashUntil_[providerIndex] > nowTick;
+        const bool authFailed = !flashing && providerAuthenticationFailed(provider.snapshot);
         const bool drawingDown = std::ranges::any_of(provider.snapshot.metrics, [](const Metric& metric) {
             return metric.visibleOnMonitor() && metric.drawingDown;
         });
@@ -2675,7 +2682,13 @@ void App::renderMonitorBitmap() {
             if (metric.visibleOnMonitor()) rowBottom += 13;
         }
         rowBottom += 6;
-        if (authFailed) {
+        if (flashing) {
+            RECT row = scaled({0, y - 1, logicalWidth_, rowBottom - 1});
+            HBRUSH tint = CreateSolidBrush(kResetRowBackground);
+            FillRect(mem, &row, tint);
+            DeleteObject(tint);
+            SetTextColor(mem, kResetRowText);
+        } else if (authFailed) {
             RECT row = scaled({0, y - 1, logicalWidth_, rowBottom - 1});
             HBRUSH tint = CreateSolidBrush(kAuthRowBackground);
             FillRect(mem, &row, tint);
@@ -2693,13 +2706,13 @@ void App::renderMonitorBitmap() {
             RECT labelRect = scaled({12, y - 3, 28, y + 12});
             DrawTextW(mem, label, -1, &labelRect, DT_SINGLELINE | DT_NOPREFIX | DT_NOCLIP);
             RECT bar = scaled({30, y, logicalWidth_ - 12, y + 6});
-            HBRUSH track = CreateSolidBrush(authFailed ? kAuthRowTrack : (drawingDown ? RGB(78, 82, 94) : RGB(46, 48, 56)));
+            HBRUSH track = CreateSolidBrush(flashing ? kResetRowTrack : (authFailed ? kAuthRowTrack : (drawingDown ? RGB(78, 82, 94) : RGB(46, 48, 56))));
             FillRect(mem, &bar, track);
             DeleteObject(track);
             if (const auto fraction = metric.remainingFraction()) {
                 RECT fill = bar;
                 fill.right = fill.left + static_cast<LONG>((fill.right - fill.left) * *fraction);
-                HBRUSH color = CreateSolidBrush(authFailed ? kAuthRowText : remainingColor(*fraction, drawingDown));
+                HBRUSH color = CreateSolidBrush(flashing ? kResetRowFill : (authFailed ? kAuthRowText : remainingColor(*fraction, drawingDown)));
                 FillRect(mem, &fill, color);
                 DeleteObject(color);
             }
@@ -3208,6 +3221,7 @@ void App::updateAll() {
             } else {
                 deleteSetting(warningName.c_str());
                 playReset();
+                startRowFlash(event.providerId);
             }
         }
     }
@@ -3356,6 +3370,44 @@ void App::playWarning() {
 
 void App::playReset() {
     playTone(true);
+}
+
+void App::startRowFlash(const std::string& providerId) {
+    if (rowFlashUntil_.size() < providers_.size()) rowFlashUntil_.resize(providers_.size());
+    for (std::size_t index = 0; index < providers_.size(); ++index) {
+        if (providers_[index].snapshot.id != providerId) continue;
+        rowFlashUntil_[index] = GetTickCount64() + kResetFlashMs;
+        destroyMonitorBitmap();
+        InvalidateRect(floatingWindow_, nullptr, FALSE);
+        tickRowFlashes();
+        return;
+    }
+}
+
+void App::tickRowFlashes() {
+    const ULONGLONG now = GetTickCount64();
+    bool any = false;
+    bool expired = false;
+    ULONGLONG next = 0;
+    for (auto& until : rowFlashUntil_) {
+        if (until == 0) continue;
+        if (until <= now) {
+            until = 0;
+            expired = true;
+            continue;
+        }
+        any = true;
+        if (next == 0 || until < next) next = until;
+    }
+    if (expired) {
+        destroyMonitorBitmap();
+        InvalidateRect(floatingWindow_, nullptr, FALSE);
+    }
+    if (any) {
+        SetTimer(trayWindow_, kFlashTimer, static_cast<UINT>(std::max<ULONGLONG>(next - now, 16)), nullptr);
+    } else {
+        KillTimer(trayWindow_, kFlashTimer);
+    }
 }
 
 LRESULT App::onFloating(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
@@ -3755,6 +3807,9 @@ LRESULT App::onTray(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
             KillTimer(hwnd, kPollTimer);
             if (!autoReauthBusy_) refresh();
             else scheduleNextPoll(true);
+        } else if (wParam == kFlashTimer) {
+            KillTimer(hwnd, kFlashTimer);
+            tickRowFlashes();
         }
         return 0;
     case WM_DESTROY: {
