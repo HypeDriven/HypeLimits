@@ -4,6 +4,7 @@
 
 #include <chrono>
 #include <cctype>
+#include <ctime>
 #include <format>
 #include <string>
 #include <utility>
@@ -174,6 +175,13 @@ TokenRecord parseFromObject(std::string_view json, std::size_t start) {
     record.accountId = jsonString(json, "account_id", start).value_or(jsonString(json, "chatgpt_account_id", start).value_or(std::string{}));
     record.teamId = jsonString(json, "team_id", start).value_or(jsonString(json, "teamId", start).value_or(std::string{}));
     record.expiresAtMs = parseExpiryMs(json, start);
+    if (!record.expiresAtMs) {
+        if (const auto expiry = jsonString(json, "expiry", start)) {
+            if (const auto at = parseTimestamp(*expiry)) {
+                record.expiresAtMs = std::chrono::duration_cast<std::chrono::milliseconds>(at->time_since_epoch()).count();
+            }
+        }
+    }
     if (const auto last = jsonString(json, "last_refresh", start)) {
         if (const auto at = parseTimestamp(*last)) {
             record.observedAtMs = std::chrono::duration_cast<std::chrono::milliseconds>(at->time_since_epoch()).count();
@@ -249,7 +257,9 @@ std::vector<std::string> cliHomeRelativePaths(std::string_view providerId) {
     if (providerId == "openai") return {".codex/auth.json"};
     if (providerId == "xai") return {".grok/auth.json"};
     if (providerId == "antigravity") {
-        return {".gemini/oauth_creds.json", ".antigravity/oauth.json", ".antigravity/oauth_creds.json"};
+        // agy stores the live login separately from the Gemini CLI oauth_creds.json file.
+        return {".gemini/antigravity-cli/antigravity-oauth-token", ".gemini/oauth_creds.json",
+                ".antigravity/oauth.json", ".antigravity/oauth_creds.json"};
     }
     if (providerId == "moonshot") {
         return {".kimi-code/credentials/kimi-code.json", ".kimi/credentials/kimi-code.json", ".kimi/credentials.json"};
@@ -277,6 +287,9 @@ TokenRecord parseCliTokenRecord(CliCredentialFormat format, std::string_view jso
         if (const auto nested = nestedObject(json, root, "claudeAiOauth")) {
             return parseFromObject(json, nested->first);
         }
+    }
+    if (format == CliCredentialFormat::GeminiOauth) {
+        if (const auto nested = nestedObject(json, root, "token")) return parseFromObject(json, nested->first);
     }
     if (format == CliCredentialFormat::CodexTokens) {
         if (auto apiKey = jsonString(json, "OPENAI_API_KEY", root); apiKey && !apiKey->empty()) {
@@ -342,6 +355,25 @@ std::string mergeCliCredentialJson(CliCredentialFormat format, std::string_view 
         return json;
     }
 
+    if (format == CliCredentialFormat::GeminiOauth) {
+        if (const auto nested = nestedObject(json, root, "token")) {
+            json = setStringField(std::move(json), nested->first, "access_token", winner.accessToken);
+            json = setStringField(std::move(json), nested->first, "refresh_token", winner.refreshToken);
+            if (winner.expiresAtMs) {
+                const std::time_t seconds = static_cast<std::time_t>(*winner.expiresAtMs / 1000);
+                std::tm utc{};
+#if defined(_WIN32)
+                gmtime_s(&utc, &seconds);
+#else
+                gmtime_r(&seconds, &utc);
+#endif
+                char rendered[32]{};
+                std::strftime(rendered, sizeof(rendered), "%Y-%m-%dT%H:%M:%SZ", &utc);
+                json = setStringField(std::move(json), nested->first, "expiry", rendered);
+            }
+            return json;
+        }
+    }
     json = setStringField(std::move(json), root, "access_token", winner.accessToken);
     json = setStringField(std::move(json), root, "refresh_token", winner.refreshToken);
     if (format == CliCredentialFormat::GeminiOauth) {

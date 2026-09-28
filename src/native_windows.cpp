@@ -131,9 +131,15 @@ struct ProviderDefinition {
     std::vector<MetricKind> capabilities;
 };
 
+struct MonitorAccount {
+    DWORD slot{};
+    ProviderSnapshot snapshot;
+};
+
 struct Provider {
     ProviderDefinition definition;
     ProviderSnapshot snapshot;
+    std::vector<MonitorAccount> monitorAccounts;
     bool connected{false};
 };
 
@@ -533,8 +539,7 @@ std::vector<std::wstring> listWslDistros() {
     if (const auto wslExe = systemWslExecutable()) {
         std::wstring command;
         appendWindowsCommandLineArgument(command, *wslExe);
-        appendWindowsCommandLineArgument(command, L"-l");
-        appendWindowsCommandLineArgument(command, L"-q");
+        command += L" --list --quiet";
         if (CreateProcessW(wslExe->c_str(), command.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
             CloseHandle(writer);
             writer = nullptr;
@@ -717,6 +722,7 @@ struct AuthMaterial {
     std::optional<std::int64_t> expiresAtMs;
     std::optional<std::int64_t> observedAtMs;
     std::string idToken;
+    bool antigravityCli{false};
 };
 
 std::string jsonEscape(std::string_view value) {
@@ -882,6 +888,7 @@ bool writeUtf8FileAtomic(const std::wstring& path, std::string_view body) {
 
 bool applyAccountToCli(std::wstring_view id, const AuthMaterial& auth);
 bool backgroundSyncAllowed(std::wstring_view id);
+bool antigravityCliTokenPath(const std::wstring& path);
 
 void syncProviderTokens(std::wstring_view id) {
     if (!backgroundSyncAllowed(id)) return;
@@ -908,7 +915,14 @@ void syncProviderTokens(std::wstring_view id) {
         records.push_back(parseCliTokenRecord(*format, bodies[i]));
     }
     const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
-    const TokenRecord winner = records[pickLatestValidTokenIndex(records, nowMs)];
+    std::optional<TokenRecord> agyWinner;
+    if (id == L"antigravity") {
+        for (std::size_t i = 0; i < paths.size(); ++i) {
+            if (!antigravityCliTokenPath(paths[i]) || !tokenRecordUsable(records[i + 1], nowMs)) continue;
+            if (!agyWinner || pickLatestValidToken(*agyWinner, records[i + 1], nowMs) == TokenPick::Right) agyWinner = records[i + 1];
+        }
+    }
+    const TokenRecord winner = agyWinner ? *agyWinner : records[pickLatestValidTokenIndex(records, nowMs)];
     bool writeCli = false;
     for (std::size_t i = 0; i < paths.size(); ++i) {
         if (pickLatestValidToken(records[i + 1], winner, nowMs) != TokenPick::Tie
@@ -936,19 +950,33 @@ void syncAllProviderTokens() {
     for (const wchar_t* id : {L"anthropic", L"openai", L"xai", L"antigravity", L"moonshot"}) syncProviderTokens(id);
 }
 
+bool antigravityCliTokenPath(const std::wstring& path) {
+    return path.ends_with(L"antigravity-oauth-token");
+}
+
 AuthMaterial loadCliAuth(std::wstring_view id) {
     const auto format = cliFormatForProvider(utf8(id));
     std::vector<TokenRecord> records;
+    std::vector<TokenRecord> agyRecords;
+    const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
     for (const auto& path : allCliReadPaths(id)) {
         auto json = readUtf8File(path);
         if (!json) continue;
         TokenRecord record = format ? parseCliTokenRecord(*format, *json) : recordFromAuth(parseAuthJson(*json));
         SecureZeroMemory(json->data(), json->size());
         if (record.accessToken.empty() && record.refreshToken.empty()) continue;
+        if (id == L"antigravity" && antigravityCliTokenPath(path) && tokenRecordUsable(record, nowMs)) {
+            agyRecords.push_back(record);
+        }
         records.push_back(std::move(record));
     }
+    // The Gemini CLI file can outlive its useful login. agy's own token file is the Antigravity session.
+    if (!agyRecords.empty()) {
+        AuthMaterial auth = authFromRecord(agyRecords[pickLatestValidTokenIndex(agyRecords, nowMs)]);
+        auth.antigravityCli = true;
+        return auth;
+    }
     if (records.empty()) return {};
-    const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
     return authFromRecord(records[pickLatestValidTokenIndex(records, nowMs)]);
 }
 
@@ -983,6 +1011,11 @@ AuthMaterial loadAuth(std::wstring_view id) {
     const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
     const TokenRecord cliRecord = recordFromAuth(cli);
     const TokenRecord storedRecord = recordFromAuth(stored);
+    // A Gemini CLI oauth_creds.json expiry can outrank agy even though that login cannot read Antigravity quota.
+    if (id == L"antigravity" && cli.antigravityCli && tokenRecordUsable(cliRecord, nowMs)) {
+        if (pickLatestValidToken(storedRecord, cliRecord, nowMs) != TokenPick::Tie) saveAuth(id, cli);
+        return cli;
+    }
     const auto pick = pickLatestValidToken(cliRecord, storedRecord, nowMs);
     if (pick == TokenPick::Right) return stored;
     if (pick == TokenPick::Left) return cli;
@@ -1205,8 +1238,111 @@ std::wstring kimiUsageHeaders() {
         computer, computer);
 }
 
-bool refreshOAuth(std::wstring_view id, AuthMaterial& auth) {
+struct AntigravityOAuthClient {
+    std::string id;
+    std::string secret;
+};
+
+bool googleOauthChar(unsigned char ch) {
+    return (ch >= '0' && ch <= '9') || (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') || ch == '-' || ch == '_';
+}
+
+// The desktop client id and secret ship inside the agy binary. Keep them out of the repo.
+std::vector<AntigravityOAuthClient> clientsFromAgyBinary(const std::wstring& path) {
+    HANDLE file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                              nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) return {};
+    constexpr std::string_view kSecretMarker = "generateContentGOCSPX-";
+    constexpr std::string_view kClientSuffix = ".apps.googleusercontent.com";
+    const auto markerAt = [&](std::size_t i, std::string_view marker) {
+        return i + marker.size() <= window.size() && std::string_view(window).substr(i, marker.size()) == marker;
+    };
+    std::string window;
+    std::string secret;
+    std::vector<std::string> ids;
+    char buffer[64 * 1024];
+    auto scan = [&](bool final) {
+        const std::size_t limit = final || window.size() <= 200 ? window.size() : window.size() - 200;
+        for (std::size_t i = 0; i < limit; ++i) {
+            if (secret.empty() && i + kSecretMarker.size() + 28 <= window.size() && markerAt(i, kSecretMarker)) {
+                const auto start = i + kSecretMarker.size();
+                const bool shaped = std::all_of(window.begin() + static_cast<std::ptrdiff_t>(start),
+                                                 window.begin() + static_cast<std::ptrdiff_t>(start + 28),
+                                                 [](char ch) { return googleOauthChar(static_cast<unsigned char>(ch)); });
+                const bool ended = start + 28 == window.size() || !googleOauthChar(static_cast<unsigned char>(window[start + 28]));
+                if (shaped && ended) secret = "GOCSPX-" + window.substr(start, 28);
+            }
+            if (markerAt(i, kClientSuffix)) {
+                std::size_t begin = i;
+                while (begin > 0 && googleOauthChar(static_cast<unsigned char>(window[begin - 1]))) --begin;
+                const auto body = std::string_view(window).substr(begin, i - begin);
+                const auto hyphen = body.rfind('-');
+                if (hyphen == std::string_view::npos || hyphen < 6) continue;
+                std::size_t project = hyphen;
+                while (project > 0 && window[begin + project - 1] >= '0' && window[begin + project - 1] <= '9') --project;
+                if (hyphen - project < 6 || body.size() < hyphen + 9) continue;
+                const auto id = std::string(body.substr(project)) + std::string(kClientSuffix);
+                if (std::ranges::find(ids, id) == ids.end()) ids.push_back(id);
+            }
+        }
+        if (limit > 0) window.erase(0, limit);
+    };
+    DWORD read = 0;
+    while (ReadFile(file, buffer, sizeof(buffer), &read, nullptr) && read > 0) {
+        window.append(buffer, read);
+        scan(false);
+    }
+    CloseHandle(file);
+    scan(true);
+    if (secret.empty()) return {};
+    std::vector<AntigravityOAuthClient> clients;
+    for (const auto& id : ids) clients.push_back({id, secret});
+    return clients;
+}
+
+std::vector<AntigravityOAuthClient> discoverAntigravityOAuthClients() {
+    std::vector<std::wstring> paths;
+    const auto homes = cachedWslHomes.empty() ? discoverWslHomes() : cachedWslHomes;
+    for (const auto& home : homes) paths.push_back(joinHomeRelative(home.home, ".local/bin/agy"));
+    for (const auto& distro : listWslDistros()) {
+        paths.push_back(L"\\\\wsl.localhost\\" + distro + L"\\usr\\local\\bin\\agy");
+        paths.push_back(L"\\\\wsl$\\" + distro + L"\\usr\\local\\bin\\agy");
+    }
+    wchar_t localAppData[MAX_PATH]{};
+    if (GetEnvironmentVariableW(L"LOCALAPPDATA", localAppData, MAX_PATH) > 0) {
+        paths.push_back(std::wstring(localAppData) + L"\\agy\\agy.exe");
+    }
+    std::vector<AntigravityOAuthClient> clients;
+    for (const auto& path : paths) {
+        auto found = clientsFromAgyBinary(path);
+        clients.insert(clients.end(), found.begin(), found.end());
+        if (!clients.empty()) break;
+    }
+    return clients;
+}
+
+HttpResponse refreshAntigravityToken(const std::string& refreshToken) {
+    static std::optional<AntigravityOAuthClient> chosen;
+    const auto clients = chosen ? std::vector<AntigravityOAuthClient>{*chosen} : discoverAntigravityOAuthClients();
+    for (const auto& client : clients) {
+        const std::string body = "grant_type=refresh_token&refresh_token=" + urlEncode(refreshToken) +
+                                 "&client_id=" + urlEncode(client.id) +
+                                 "&client_secret=" + urlEncode(client.secret);
+        HttpResponse response = httpsPost(L"oauth2.googleapis.com", L"/token", body, L"Content-Type: application/x-www-form-urlencoded\r\n");
+        if (response.status == 200 && jsonString(response.body, "access_token")) {
+            chosen = client;
+            return response;
+        }
+    }
+    return {};
+}
+
+bool refreshOAuth(std::wstring_view credentialId, AuthMaterial& auth) {
     if (auth.refreshToken.empty()) return false;
+    const auto slotMarker = credentialId.find(L"/account-");
+    const std::wstring providerStorage = slotMarker == std::wstring_view::npos
+        ? std::wstring(credentialId) : std::wstring(credentialId.substr(0, slotMarker));
+    const std::wstring_view id = providerStorage;
     HttpResponse response;
     if (id == L"anthropic") {
         const std::string body = std::format(
@@ -1222,13 +1358,9 @@ bool refreshOAuth(std::wstring_view id, AuthMaterial& auth) {
                                  "&client_id=" + urlEncode("b1a00492-073a-47ea-816f-4c329264a828");
         response = httpsPost(L"auth.x.ai", L"/oauth2/token", body, L"Content-Type: application/x-www-form-urlencoded\r\n");
     } else if (id == L"antigravity") {
-        auto secret = loadGoogleClientSecret();
-        if (secret.empty()) return false;
-        const std::string body = "grant_type=refresh_token&refresh_token=" + urlEncode(auth.refreshToken) +
-                                 "&client_id=" + urlEncode("681255809395-oo8ft2oprdrnp9e3aqf6av3hmdib135j.apps.googleusercontent.com") +
-                                 "&client_secret=" + urlEncode(secret);
-        SecureZeroMemory(secret.data(), secret.size());
-        response = httpsPost(L"oauth2.googleapis.com", L"/token", body, L"Content-Type: application/x-www-form-urlencoded\r\n");
+        // agy issues refresh tokens for its own desktop client, not the Gemini CLI client.
+        response = refreshAntigravityToken(auth.refreshToken);
+        if (response.status != 200) return false;
     } else if (id == L"moonshot") {
         const std::string body = "grant_type=refresh_token&refresh_token=" + urlEncode(auth.refreshToken) +
                                  "&client_id=" + urlEncode("17e5f671-d194-4dfb-9706-5516cb48c098");
@@ -1238,8 +1370,9 @@ bool refreshOAuth(std::wstring_view id, AuthMaterial& auth) {
     }
     if (response.status != 200 || !jsonString(response.body, "access_token")) return false;
     applyTokenResponse(auth, response.body);
-    saveAuth(id, auth);
-    syncProviderTokens(id);
+    saveAuth(credentialId, auth);
+    // Only the selected account is written back to the CLI. Other slots stay in Credential Manager.
+    if (slotMarker == std::wstring_view::npos) syncProviderTokens(id);
     return true;
 }
 
@@ -1719,6 +1852,7 @@ void applyWindow(ProviderSnapshot& snapshot, MetricKind kind, const UsageWindow&
     const Metric previous = *metric;
     metric->kind = kind;
     metric->state = MetricState::Current;
+    metric->announceAuthentication = false;
     metric->used = window.used;
     metric->capacity = window.capacity;
     metric->remaining = std::max(0.0, window.capacity - window.used);
@@ -1735,6 +1869,7 @@ void applyCredit(ProviderSnapshot& snapshot, const BalanceValue& credit, TimePoi
     const Metric previous = *metric;
     metric->kind = MetricKind::ApiCredit;
     metric->state = MetricState::Current;
+    metric->announceAuthentication = false;
     metric->remaining = credit.amount;
     metric->used = credit.used;
     metric->capacity = credit.capacity;
@@ -1765,6 +1900,7 @@ void markAuthenticationFailed(Metric& metric, std::string diagnostic) {
     } else {
         metric.state = MetricState::AuthenticationRequired;
     }
+    metric.announceAuthentication = true;
     if (!diagnostic.empty()) metric.diagnostic = std::move(diagnostic);
 }
 
@@ -1777,11 +1913,14 @@ void failMetric(Metric& metric, DWORD status, const std::string& error) {
     metric.diagnostic = error.empty() ? "The provider returned HTTP " + std::to_string(status) + "." : error;
 }
 
-void finishRefresh(ProviderSnapshot& snapshot, bool gotData, DWORD lastStatus, const std::string& lastError) {
+void finishRefresh(ProviderSnapshot& snapshot, bool gotData, bool authenticationRejected, DWORD lastStatus, const std::string& lastError) {
     for (auto& metric : snapshot.metrics) {
         if (metric.state != MetricState::Refreshing) continue;
-        if (gotData) {
+        if (authenticationRejected) {
+            markAuthenticationFailed(metric, "The saved credential was rejected. Connect again from Options.");
+        } else if (gotData) {
             metric.state = MetricState::Unsupported;
+            metric.announceAuthentication = false;
             metric.diagnostic = "This provider did not return this allowance for the connected account.";
         } else {
             failMetric(metric, lastStatus, lastError);
@@ -1790,9 +1929,11 @@ void finishRefresh(ProviderSnapshot& snapshot, bool gotData, DWORD lastStatus, c
 }
 
 bool mergeHttpUsage(ProviderSnapshot& snapshot, const HttpResponse& response, const std::optional<ProviderUsage>& parsed,
-                    TimePoint now, std::optional<double> threshold, double barFull, DWORD& lastStatus, std::string& lastError) {
+                    TimePoint now, std::optional<double> threshold, double barFull, DWORD& lastStatus, std::string& lastError,
+                    bool& authenticationRejected) {
     lastStatus = response.status;
     lastError = response.error;
+    if (response.status == 401 || response.status == 403) authenticationRejected = true;
     if (response.status == 200 && parsed) {
         applyUsage(snapshot, *parsed, now, threshold, barFull);
         return true;
@@ -1800,59 +1941,96 @@ bool mergeHttpUsage(ProviderSnapshot& snapshot, const HttpResponse& response, co
     return false;
 }
 
-void fetchProviderUsage(std::wstring_view id, AuthMaterial& auth, ProviderSnapshot& snapshot,
-                        TimePoint now, std::optional<double> threshold, double barFull) {
-    if (!auth.refreshToken.empty()) refreshOAuth(id, auth);
-    DWORD lastStatus = 0;
-    std::string lastError;
-    bool gotData = false;
+bool accessTokenNeedsRefresh(const AuthMaterial& auth) {
+    if (auth.refreshToken.empty()) return false;
+    if (!auth.expiresAtMs) return true;
+    const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+    return *auth.expiresAtMs <= now + 120000;
+}
+
+void queryProviderUsage(std::wstring_view id, const AuthMaterial& auth, ProviderSnapshot& snapshot,
+                       TimePoint now, std::optional<double> threshold, double barFull,
+                       DWORD& lastStatus, std::string& lastError, bool& gotData, bool& authenticationRejected) {
+    lastStatus = 0;
+    lastError.clear();
+    gotData = false;
+    authenticationRejected = false;
     if (id == L"anthropic") {
         auto response = httpsGet(L"api.anthropic.com", L"/api/oauth/usage", auth.token,
                                  L"anthropic-beta: oauth-2025-04-20\r\nanthropic-version: 2023-06-01\r\nx-app: cli\r\n");
-        gotData = mergeHttpUsage(snapshot, response, parseClaudeUsage(response.body), now, threshold, barFull, lastStatus, lastError);
+        gotData = mergeHttpUsage(snapshot, response, parseClaudeUsage(response.body), now, threshold, barFull, lastStatus, lastError, authenticationRejected);
     } else if (id == L"openai") {
         std::wstring extra = L"Accept: application/json\r\n";
         if (!auth.accountId.empty()) extra += L"ChatGPT-Account-Id: " + wide(auth.accountId) + L"\r\n";
         auto response = httpsGet(L"chatgpt.com", L"/backend-api/wham/usage", auth.token, extra);
-        gotData = mergeHttpUsage(snapshot, response, parseCodexUsage(response.body), now, threshold, barFull, lastStatus, lastError);
+        gotData = mergeHttpUsage(snapshot, response, parseCodexUsage(response.body), now, threshold, barFull, lastStatus, lastError, authenticationRejected);
     } else if (id == L"moonshot") {
         auto coding = httpsGet(L"api.kimi.com", L"/coding/v1/usages", auth.token, kimiUsageHeaders());
-        gotData = mergeHttpUsage(snapshot, coding, parseKimiCodingUsage(coding.body), now, threshold, barFull, lastStatus, lastError);
+        gotData = mergeHttpUsage(snapshot, coding, parseKimiCodingUsage(coding.body), now, threshold, barFull, lastStatus, lastError, authenticationRejected);
         auto balance = httpsGet(L"api.moonshot.ai", L"/v1/users/me/balance", auth.token);
         if (mergeHttpUsage(snapshot, balance, parseMoonshotBalance(balance.body) ? ProviderUsage{std::nullopt, std::nullopt, parseMoonshotBalance(balance.body)} : std::optional<ProviderUsage>{},
-                           now, threshold, barFull, lastStatus, lastError)) {
+                           now, threshold, barFull, lastStatus, lastError, authenticationRejected)) {
             gotData = true;
         } else if (!gotData) {
             lastStatus = balance.status ? balance.status : lastStatus;
             lastError = balance.error.empty() ? lastError : balance.error;
         }
     } else if (id == L"deepseek") {
+        // DeepSeek publishes an API key, not an OAuth refresh token.
         auto response = httpsGet(L"api.deepseek.com", L"/user/balance", auth.token);
         const auto parsed = parseDeepSeekBalance(response.body);
         gotData = mergeHttpUsage(snapshot, response, parsed ? ProviderUsage{std::nullopt, std::nullopt, parsed} : std::optional<ProviderUsage>{},
-                                 now, threshold, barFull, lastStatus, lastError);
+                                 now, threshold, barFull, lastStatus, lastError, authenticationRejected);
     } else if (id == L"xai") {
         auto billing = httpsGet(L"cli-chat-proxy.grok.com", L"/v1/billing?format=credits", auth.token,
                                 L"X-XAI-Token-Auth: xai-grok-cli\r\nAccept: application/json\r\n");
-        gotData = mergeHttpUsage(snapshot, billing, parseGrokBilling(billing.body), now, threshold, barFull, lastStatus, lastError);
+        gotData = mergeHttpUsage(snapshot, billing, parseGrokBilling(billing.body), now, threshold, barFull, lastStatus, lastError, authenticationRejected);
         const std::wstring team = wide(auth.teamId.empty() ? "default" : auth.teamId);
         auto prepaid = httpsGet(L"management-api.x.ai", L"/v1/billing/teams/" + team + L"/prepaid/balance", auth.token);
         if (mergeHttpUsage(snapshot, prepaid, parseXaiPrepaidBalance(prepaid.body) ? ProviderUsage{std::nullopt, std::nullopt, parseXaiPrepaidBalance(prepaid.body)} : std::optional<ProviderUsage>{},
-                           now, threshold, barFull, lastStatus, lastError)) {
+                           now, threshold, barFull, lastStatus, lastError, authenticationRejected)) {
             gotData = true;
         }
     } else if (id == L"antigravity") {
         const std::string body = R"({"metadata":{"ideType":"ANTIGRAVITY","platform":"PLATFORM_UNSPECIFIED","pluginType":"GEMINI"}})";
-        auto assist = httpsRequest({L"cloudcode-pa.googleapis.com", L"/v1internal:loadCodeAssist", L"POST", auth.token, {}, body});
-        gotData = mergeHttpUsage(snapshot, assist, parseAntigravityAssist(assist.body), now, threshold, barFull, lastStatus, lastError);
-        std::string project = jsonString(assist.body, "cloudaicompanionProject").value_or(jsonString(assist.body, "id").value_or({}));
+        const std::wstring headers = L"User-Agent: antigravity/1.107.0\r\nContent-Type: application/json\r\n";
+        std::wstring host = L"daily-cloudcode-pa.googleapis.com";
+        auto assist = httpsRequest({host, L"/v1internal:loadCodeAssist", L"POST", auth.token, headers, body});
+        if (assist.status != 200 || !jsonString(assist.body, "cloudaicompanionProject")) {
+            host = L"cloudcode-pa.googleapis.com";
+            auto prod = httpsRequest({host, L"/v1internal:loadCodeAssist", L"POST", auth.token, headers, body});
+            if (prod.status == 200) assist = std::move(prod);
+        }
+        gotData = mergeHttpUsage(snapshot, assist, parseAntigravityAssist(assist.body), now, threshold, barFull, lastStatus, lastError, authenticationRejected);
+        std::string project = jsonString(assist.body, "cloudaicompanionProject").value_or({});
         if (!project.empty()) {
-            const std::string modelsBody = std::format("{{\"project\":\"{}\"}}", project);
-            auto models = httpsRequest({L"cloudcode-pa.googleapis.com", L"/v1internal:fetchAvailableModels", L"POST", auth.token, {}, modelsBody});
-            if (mergeHttpUsage(snapshot, models, parseAntigravityModels(models.body), now, threshold, barFull, lastStatus, lastError)) gotData = true;
+            const std::string modelsBody = std::format("{{\"project\":\"{}\"}}", jsonEscape(project));
+            auto models = httpsRequest({host, L"/v1internal:fetchAvailableModels", L"POST", auth.token, headers, modelsBody});
+            if (mergeHttpUsage(snapshot, models, parseAntigravityModels(models.body), now, threshold, barFull, lastStatus, lastError, authenticationRejected)) gotData = true;
         }
     }
-    finishRefresh(snapshot, gotData, lastStatus, lastError);
+}
+
+void fetchProviderUsage(std::wstring_view credentialId, AuthMaterial& auth, ProviderSnapshot& snapshot,
+                        TimePoint now, std::optional<double> threshold, double barFull) {
+    const auto slotMarker = credentialId.find(L"/account-");
+    const std::wstring providerStorage = slotMarker == std::wstring_view::npos
+        ? std::wstring(credentialId) : std::wstring(credentialId.substr(0, slotMarker));
+    const std::wstring_view id = providerStorage;
+    bool refreshed = false;
+    if (accessTokenNeedsRefresh(auth)) refreshed = refreshOAuth(credentialId, auth);
+    DWORD lastStatus = 0;
+    std::string lastError;
+    bool gotData = false;
+    bool authenticationRejected = false;
+    queryProviderUsage(id, auth, snapshot, now, threshold, barFull, lastStatus, lastError, gotData, authenticationRejected);
+    if (authenticationRejected && !refreshed && refreshOAuth(credentialId, auth)) {
+        for (auto& metric : snapshot.metrics) {
+            if (metricFetchable(id, metric.kind) && metric.state != MetricState::Current) metric.state = MetricState::Refreshing;
+        }
+        queryProviderUsage(id, auth, snapshot, now, threshold, barFull, lastStatus, lastError, gotData, authenticationRejected);
+    }
+    finishRefresh(snapshot, gotData, authenticationRejected, lastStatus, lastError);
 }
 
 std::wstring kindName(MetricKind kind) {
@@ -1912,6 +2090,7 @@ private:
     LRESULT onTray(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam);
 
     void createProviders();
+    void seedMonitorAccounts(Provider& provider);
     void createOptionsControls();
     void discoverAndBuildWslControls(bool forceDiscover);
     void syncWslControlVisibility();
@@ -2068,6 +2247,89 @@ LRESULT CALLBACK App::trayProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lP
     return DefWindowProcW(hwnd, message, wParam, lParam);
 }
 
+std::wstring accountSettingFor(std::wstring_view id, DWORD slot) {
+    return L"Provider." + std::wstring(id) + (slot ? L".Account." + std::to_wstring(slot) : L"");
+}
+
+std::vector<DWORD> listAccountSlots(std::wstring_view id) {
+    std::vector<DWORD> slots;
+    if (managedAccounts(id)) {
+        const DWORD count = std::min<DWORD>(readDword((L"Provider." + std::wstring(id) + L".AccountCount").c_str(), 1), 100);
+        for (DWORD slot = 0; slot < count; ++slot) {
+            auto auth = loadStoredAuth(accountKey(id, slot));
+            const bool exists = !auth.token.empty() || !auth.refreshToken.empty();
+            SecureZeroMemory(auth.token.data(), auth.token.size());
+            SecureZeroMemory(auth.refreshToken.data(), auth.refreshToken.size());
+            if (exists) slots.push_back(slot);
+        }
+    }
+    if (slots.empty()) slots.push_back(activeAccount(id));
+    return slots;
+}
+
+void restoreAccountSnapshot(ProviderSnapshot& snapshot, std::wstring_view id, DWORD slot) {
+    const std::wstring base = accountSettingFor(id, slot);
+    bool restored = false;
+    for (auto& metric : snapshot.metrics) {
+        const std::wstring prefix = base + L"." + std::to_wstring(static_cast<int>(metric.kind));
+        const auto used = readQword((prefix + L".UsedMicros").c_str());
+        const auto capacity = readQword((prefix + L".CapacityMicros").c_str());
+        const auto remaining = readQword((prefix + L".RemainingMicros").c_str());
+        const auto observed = readQword((prefix + L".ObservedUnix").c_str());
+        const auto reset = readQword((prefix + L".ResetUnix").c_str());
+        if (!observed || (!used && !capacity && !remaining)) continue;
+        metric.state = MetricState::Stale;
+        if (used) metric.used = *used / 1000000.0;
+        if (capacity) metric.capacity = *capacity / 1000000.0;
+        if (remaining) metric.remaining = *remaining / 1000000.0;
+        metric.observedAt = TimePoint{std::chrono::seconds{*observed}};
+        if (reset) metric.resetAt = TimePoint{std::chrono::seconds{*reset}};
+        metric.currency = readDword((prefix + L".Currency").c_str(), 1) == 2 ? "CNY " : "$";
+        metric.unit = metric.kind == MetricKind::ApiCredit ? metric.currency : "%";
+        metric.diagnostic = "Showing the last successful value while a refresh is pending.";
+        restored = true;
+    }
+    if (restored) {
+        const auto first = std::ranges::find_if(snapshot.metrics, [](const Metric& metric) { return metric.observedAt.has_value(); });
+        if (first != snapshot.metrics.end()) snapshot.lastSuccessfulRefresh = first->observedAt;
+    }
+}
+
+void App::seedMonitorAccounts(Provider& provider) {
+    const auto slots = listAccountSlots(provider.definition.id);
+    const DWORD active = activeAccount(provider.definition.id);
+    std::vector<MonitorAccount> rows;
+    rows.reserve(slots.size());
+    for (const DWORD slot : slots) {
+        MonitorAccount row;
+        row.slot = slot;
+        if (slot == active) {
+            row.snapshot = provider.snapshot;
+        } else {
+            row.snapshot = provider.snapshot;
+            row.snapshot.id = utf8(accountKey(provider.definition.id, slot));
+            for (std::size_t i = 0; i < row.snapshot.metrics.size() && i < provider.definition.capabilities.size(); ++i) {
+                row.snapshot.metrics[i] = initialMetric(provider.definition.id, provider.definition.capabilities[i]);
+            }
+            restoreAccountSnapshot(row.snapshot, provider.definition.id, slot);
+        }
+        rows.push_back(std::move(row));
+    }
+    provider.monitorAccounts = std::move(rows);
+}
+
+std::vector<MonitorAccount> monitorRowsFor(const Provider& provider) {
+    if (!provider.monitorAccounts.empty()) return provider.monitorAccounts;
+    return {{activeAccount(provider.definition.id), provider.snapshot}};
+}
+
+std::wstring monitorRowLabel(const Provider& provider, const MonitorAccount& account, const ProviderSnapshot& snapshot) {
+    std::wstring label = provider.definition.name;
+    if (provider.monitorAccounts.size() > 1) label += L" " + std::to_wstring(account.slot + 1);
+    if (providerAuthenticationFailed(snapshot)) label += L"  ·  Sign in";
+    return label;
+}
+
 void App::createProviders() {
     std::vector<ProviderDefinition> definitions = {
         {L"anthropic", L"Anthropic Claude", L"https://claude.ai/settings/usage",
@@ -2139,6 +2401,7 @@ void App::createProviders() {
             const std::wstring warningName = L"Alert." + wide(provider.snapshot.id) + L"." + std::to_wstring(static_cast<int>(metric.kind)) + L".Warned";
             if (readDword(warningName.c_str(), 0)) alerts_.restoreWarning(provider.snapshot.id, metric.kind, metric.resetAt.value_or(TimePoint{}));
         }
+        seedMonitorAccounts(provider);
         providers_.push_back(std::move(provider));
     }
     autoReauthTried_.assign(providers_.size(), 0);
@@ -2566,12 +2829,15 @@ void App::layoutMonitor() {
     int maxText = 0;
     bool any = false;
     for (const auto& provider : providers_) {
-        if (!monitorIncludesProvider(provider.snapshot)) continue;
-        any = true;
-        SIZE size{};
-        GetTextExtentPoint32W(dc, provider.definition.name.c_str(),
-                              static_cast<int>(provider.definition.name.size()), &size);
-        maxText = std::max(maxText, static_cast<int>(size.cx));
+        const auto rows = monitorRowsFor(provider);
+        for (const auto& account : rows) {
+            if (!monitorIncludesProvider(account.snapshot)) continue;
+            any = true;
+            const std::wstring label = monitorRowLabel(provider, account, account.snapshot);
+            SIZE size{};
+            GetTextExtentPoint32W(dc, label.c_str(), static_cast<int>(label.size()), &size);
+            maxText = std::max(maxText, static_cast<int>(size.cx));
+        }
     }
 
     constexpr wchar_t kEmpty[] = L"Configure an account in Options";
@@ -2589,18 +2855,34 @@ void App::layoutMonitor() {
     } else {
         for (std::size_t providerIndex = 0; providerIndex < providers_.size(); ++providerIndex) {
             const auto& provider = providers_[providerIndex];
-            if (!monitorIncludesProvider(provider.snapshot)) continue;
+            const auto rows = monitorRowsFor(provider);
+            for (const auto& account : rows) {
+            if (!monitorIncludesProvider(account.snapshot)) continue;
             const int nameTop = y;
             std::optional<std::size_t> firstMetric;
             y += 20;
-            for (std::size_t metricIndex = 0; metricIndex < provider.snapshot.metrics.size(); ++metricIndex) {
-                if (!provider.snapshot.metrics[metricIndex].visibleOnMonitor()) continue;
+            const bool authFailed = providerAuthenticationFailed(account.snapshot);
+            bool drewBar = false;
+            for (std::size_t metricIndex = 0; metricIndex < account.snapshot.metrics.size(); ++metricIndex) {
+                const auto& metric = account.snapshot.metrics[metricIndex];
+                if (!metric.visibleOnMonitor() || !metric.remainingFraction()) continue;
                 if (!firstMetric) firstMetric = metricIndex;
                 hits_.push_back({RECT{8, y - 5, logicalWidth_ - 8, y + 11}, providerIndex, metricIndex});
                 y += 13;
+                drewBar = true;
+            }
+            if (authFailed && !drewBar) {
+                for (std::size_t metricIndex = 0; metricIndex < account.snapshot.metrics.size(); ++metricIndex) {
+                    if (!account.snapshot.metrics[metricIndex].visibleOnMonitor()) continue;
+                    firstMetric = metricIndex;
+                    hits_.push_back({RECT{8, y - 2, logicalWidth_ - 8, y + 16}, providerIndex, metricIndex});
+                    y += 16;
+                    break;
+                }
             }
             y += 6;
             if (firstMetric) hits_.push_back({RECT{0, nameTop, logicalWidth_, y}, providerIndex, *firstMetric});
+            }
         }
         logicalHeight_ = std::max(48, y + 3);
     }
@@ -2670,17 +2952,21 @@ void App::renderMonitorBitmap() {
     const ULONGLONG nowTick = GetTickCount64();
     for (std::size_t providerIndex = 0; providerIndex < providers_.size(); ++providerIndex) {
         const auto& provider = providers_[providerIndex];
-        if (!monitorIncludesProvider(provider.snapshot)) continue;
-        any = true;
+        const auto rows = monitorRowsFor(provider);
         const bool flashing = providerIndex < rowFlashUntil_.size() && rowFlashUntil_[providerIndex] > nowTick;
-        const bool authFailed = !flashing && providerAuthenticationFailed(provider.snapshot);
-        const bool drawingDown = std::ranges::any_of(provider.snapshot.metrics, [](const Metric& metric) {
+        for (const auto& account : rows) {
+        if (!monitorIncludesProvider(account.snapshot)) continue;
+        any = true;
+        const bool authFailed = !flashing && providerAuthenticationFailed(account.snapshot);
+        const bool drawingDown = std::ranges::any_of(account.snapshot.metrics, [](const Metric& metric) {
             return metric.visibleOnMonitor() && metric.drawingDown;
         });
         int rowBottom = y + 20;
-        for (const auto& metric : provider.snapshot.metrics) {
-            if (metric.visibleOnMonitor()) rowBottom += 13;
+        int visibleBars = 0;
+        for (const auto& metric : account.snapshot.metrics) {
+            if (metric.visibleOnMonitor() && metric.remainingFraction()) ++visibleBars;
         }
+        rowBottom += visibleBars > 0 ? visibleBars * 13 : (authFailed ? 16 : 0);
         rowBottom += 6;
         if (flashing) {
             RECT row = scaled({0, y - 1, logicalWidth_, rowBottom - 1});
@@ -2697,11 +2983,14 @@ void App::renderMonitorBitmap() {
         } else {
             SetTextColor(mem, drawingDown ? RGB(248, 250, 252) : RGB(148, 152, 160));
         }
+        const std::wstring rowLabel = monitorRowLabel(provider, account, account.snapshot);
         RECT nameRect = scaled({10, y, logicalWidth_ - 10, y + 20});
-        DrawTextW(mem, provider.definition.name.c_str(), -1, &nameRect, DT_SINGLELINE | DT_NOPREFIX | DT_NOCLIP);
+        DrawTextW(mem, rowLabel.c_str(), -1, &nameRect, DT_SINGLELINE | DT_NOPREFIX | DT_NOCLIP);
         y += 20;
-        for (const auto& metric : provider.snapshot.metrics) {
-            if (!metric.visibleOnMonitor()) continue;
+        bool drewBar = false;
+        for (const auto& metric : account.snapshot.metrics) {
+            if (!metric.visibleOnMonitor() || !metric.remainingFraction()) continue;
+            drewBar = true;
             const wchar_t* label = metric.kind == MetricKind::Session ? L"S" : metric.kind == MetricKind::Weekly ? L"W" : L"$";
             RECT labelRect = scaled({12, y - 3, 28, y + 12});
             DrawTextW(mem, label, -1, &labelRect, DT_SINGLELINE | DT_NOPREFIX | DT_NOCLIP);
@@ -2718,7 +3007,13 @@ void App::renderMonitorBitmap() {
             }
             y += 13;
         }
+        if (authFailed && !drewBar) {
+            RECT loginRect = scaled({12, y - 2, logicalWidth_ - 10, y + 16});
+            DrawTextW(mem, L"Login required", -1, &loginRect, DT_SINGLELINE | DT_NOPREFIX | DT_NOCLIP);
+            y += 16;
+        }
         y += 6;
+        }
     }
     if (!any) {
         RECT empty = scaled({10, 12, logicalWidth_ - 10, logicalHeight_ - 8});
@@ -2770,6 +3065,17 @@ void App::activateTooltip(POINT clientPoint) {
     SendMessageW(tooltip_, TTM_TRACKACTIVATE, TRUE, reinterpret_cast<LPARAM>(&info));
 }
 
+struct RefreshResult {
+    std::size_t index{};
+    DWORD slot{};
+    bool active{false};
+    std::wstring credentialId;
+    AuthMaterial auth;
+    DWORD thresholdCents{};
+    DWORD barFullCents{};
+    ProviderSnapshot snapshot;
+};
+
 void App::refresh() {
     if (signInInProgress_) return;
     if (refreshing_.exchange(true)) return;
@@ -2781,36 +3087,46 @@ void App::refresh() {
     }
     updateAll();
 
-    struct Request { std::size_t index; std::wstring id; AuthMaterial auth; DWORD thresholdCents; DWORD barFullCents; };
-    std::vector<Request> requests;
-    auto snapshots = std::make_unique<std::vector<ProviderSnapshot>>();
+    std::vector<RefreshResult> requests;
     for (std::size_t index = 0; index < providers_.size(); ++index) {
-        snapshots->push_back(providers_[index].snapshot);
-        if (!providers_[index].snapshot.enabled) continue;
-        AuthMaterial auth = loadAuth(providers_[index].definition.id);
-        if (auth.token.empty()) {
-            for (auto& metric : snapshots->back().metrics) {
-                if (metricFetchable(providers_[index].definition.id, metric.kind)) {
-                    markAuthenticationFailed(metric, "The saved credential was rejected. Connect again from Options.");
+        auto& provider = providers_[index];
+        if (!provider.snapshot.enabled) continue;
+        if (provider.monitorAccounts.empty()) seedMonitorAccounts(provider);
+        const DWORD active = activeAccount(provider.definition.id);
+        const std::wstring prefix = L"Provider." + provider.definition.id;
+        const DWORD threshold = readDword((prefix + L".ThresholdCents").c_str(), 1000);
+        const DWORD barFull = readDword((prefix + L".CreditBarFullCents").c_str(), 10000);
+        for (auto& account : provider.monitorAccounts) {
+            const bool isActive = account.slot == active;
+            AuthMaterial auth = isActive ? loadAuth(provider.definition.id) : loadStoredAuth(accountKey(provider.definition.id, account.slot));
+            if (auth.token.empty()) {
+                for (auto& metric : account.snapshot.metrics) {
+                    if (metricFetchable(provider.definition.id, metric.kind)) {
+                        markAuthenticationFailed(metric, "The saved credential was rejected. Connect again from Options.");
+                    }
                 }
+                if (isActive) provider.snapshot = account.snapshot;
+                continue;
             }
-            continue;
+            for (auto& metric : account.snapshot.metrics) {
+                if (metricFetchable(provider.definition.id, metric.kind)) metric.state = MetricState::Refreshing;
+            }
+            if (isActive) provider.snapshot = account.snapshot;
+            requests.push_back({index, account.slot, isActive,
+                isActive ? provider.definition.id : accountKey(provider.definition.id, account.slot),
+                std::move(auth), threshold, barFull, account.snapshot});
         }
-        const std::wstring prefix = L"Provider." + providers_[index].definition.id;
-        requests.push_back({index, providers_[index].definition.id, std::move(auth),
-                            readDword((prefix + L".ThresholdCents").c_str(), 1000),
-                            readDword((prefix + L".CreditBarFullCents").c_str(), 10000)});
     }
-    refreshThread_ = std::jthread([this, snapshots = std::move(snapshots), requests = std::move(requests)]() mutable {
+    refreshThread_ = std::jthread([this, requests = std::move(requests)]() mutable {
         applyWorkerPriorities();
         const auto now = std::chrono::system_clock::now();
         for (auto& request : requests) {
-            auto& snapshot = (*snapshots)[request.index];
-            fetchProviderUsage(request.id, request.auth, snapshot, now, request.thresholdCents / 100.0,
+            fetchProviderUsage(request.credentialId, request.auth, request.snapshot, now, request.thresholdCents / 100.0,
                                request.barFullCents / 100.0);
             SecureZeroMemory(request.auth.token.data(), request.auth.token.size());
+            SecureZeroMemory(request.auth.refreshToken.data(), request.auth.refreshToken.size());
         }
-        auto* completed = snapshots.release();
+        auto* completed = new std::vector<RefreshResult>(std::move(requests));
         if (!PostMessageW(trayWindow_, kRefreshCompleteMessage, 0, reinterpret_cast<LPARAM>(completed))) delete completed;
     });
 }
@@ -2988,6 +3304,7 @@ bool App::selectAccount(std::size_t index, DWORD slot, bool interactive) {
     provider.snapshot.lastSuccessfulRefresh.reset();
     for (auto& metric : provider.snapshot.metrics) metric = initialMetric(id, metric.kind);
     provider.snapshot.id = utf8(slot ? accountKey(id, slot) : id);
+    seedMonitorAccounts(provider);
     if (index < autoReauthTried_.size()) autoReauthTried_[index] = 0;
     updateAll();
     return true;
@@ -3043,6 +3360,7 @@ void App::addAccount() {
         writeDword((L"Provider." + id + L".ManagedAccounts").c_str(), wasManaged ? 1 : 0);
     }
     providers_[index].connected = hasAuth(id);
+    seedMonitorAccounts(providers_[index]);
     updateAll();
     refresh();
 }
@@ -3295,11 +3613,21 @@ void App::updateTrayIcon() {
     data.uID = 1;
     data.uFlags = NIF_ICON | NIF_TIP;
     data.hIcon = newIcon;
+    std::wstring signIn;
+    for (const auto& provider : providers_) {
+        if (!provider.snapshot.enabled || !providerAuthenticationFailed(provider.snapshot)) continue;
+        if (!signIn.empty()) signIn += L", ";
+        signIn += provider.definition.name;
+    }
     std::wstring tooltip = L"HypeLimits — status unknown or disconnected";
+    if (!signIn.empty()) tooltip = L"Sign in required: " + signIn;
     if (aggregate.remainingFraction) {
         const auto found = std::find_if(providers_.begin(), providers_.end(), [&](const Provider& p) { return p.snapshot.id == aggregate.providerId; });
-        if (found != providers_.end()) tooltip = std::format(L"{} — {:.0f}% {} remaining", found->definition.name,
-            *aggregate.remainingFraction * 100.0, kindName(aggregate.kind));
+        if (found != providers_.end()) {
+            const std::wstring usage = std::format(L"{} — {:.0f}% {} remaining", found->definition.name,
+                *aggregate.remainingFraction * 100.0, kindName(aggregate.kind));
+            tooltip = signIn.empty() ? usage : tooltip + L" · " + usage;
+        }
     }
     wcsncpy_s(data.szTip, tooltip.c_str(), _TRUNCATE);
     Shell_NotifyIconW(NIM_MODIFY, &data);
@@ -3738,15 +4066,17 @@ LRESULT App::onTray(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
     }
     switch (message) {
     case kRefreshCompleteMessage: {
-        std::unique_ptr<std::vector<ProviderSnapshot>> completed(reinterpret_cast<std::vector<ProviderSnapshot>*>(lParam));
-        for (std::size_t index = 0; index < providers_.size() && index < completed->size(); ++index) {
-            if (!providers_[index].connected) continue;
-            const bool enabled = providers_[index].snapshot.enabled;
-            providers_[index].snapshot = std::move((*completed)[index]);
-            providers_[index].snapshot.enabled = enabled;
-            for (const auto& metric : providers_[index].snapshot.metrics) {
+        std::unique_ptr<std::vector<RefreshResult>> completed(reinterpret_cast<std::vector<RefreshResult>*>(lParam));
+        for (auto& result : *completed) {
+            if (result.index >= providers_.size()) continue;
+            auto& provider = providers_[result.index];
+            result.snapshot.enabled = provider.snapshot.enabled;
+            if (result.active) provider.snapshot = result.snapshot;
+            const auto row = std::ranges::find_if(provider.monitorAccounts, [&](const MonitorAccount& account) { return account.slot == result.slot; });
+            if (row != provider.monitorAccounts.end()) row->snapshot = result.snapshot;
+            for (const auto& metric : result.snapshot.metrics) {
                 if ((metric.state != MetricState::Current && metric.state != MetricState::Stale) || !metric.observedAt) continue;
-                const std::wstring prefix = accountSetting(providers_[index].definition.id) + L"." + std::to_wstring(static_cast<int>(metric.kind));
+                const std::wstring prefix = accountSettingFor(provider.definition.id, result.slot) + L"." + std::to_wstring(static_cast<int>(metric.kind));
                 if (metric.used) writeQword((prefix + L".UsedMicros").c_str(), static_cast<ULONGLONG>(std::llround(*metric.used * 1000000.0)));
                 if (metric.capacity) writeQword((prefix + L".CapacityMicros").c_str(), static_cast<ULONGLONG>(std::llround(*metric.capacity * 1000000.0)));
                 if (metric.remaining) writeQword((prefix + L".RemainingMicros").c_str(), static_cast<ULONGLONG>(std::llround(*metric.remaining * 1000000.0)));

@@ -27,6 +27,9 @@ struct Metric {
     std::optional<double> lowBalanceThreshold;
     std::optional<double> barFullAmount;
     bool drawingDown{false};
+    // Set when a saved credential is rejected, so the monitor can show sign-in
+    // even if this allowance has no last numeric value.
+    bool announceAuthentication{false};
 
     [[nodiscard]] std::optional<double> remainingFraction() const;
     [[nodiscard]] std::optional<double> alertRemainingFraction() const;

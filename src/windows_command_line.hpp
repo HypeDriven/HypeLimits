@@ -39,17 +39,16 @@ inline void appendWindowsCommandLineArgument(std::wstring& commandLine, std::wst
 inline std::wstring buildWslCatCommandLine(std::wstring_view executable, std::wstring_view distro,
                                            std::wstring_view user, std::wstring_view path) {
     std::wstring commandLine;
+    // wsl.exe treats a quoted token such as "-d" as a command for the distro shell, not as its own flag.
     appendWindowsCommandLineArgument(commandLine, executable);
-    appendWindowsCommandLineArgument(commandLine, L"-d");
-    appendWindowsCommandLineArgument(commandLine, distro);
+    commandLine += L" -d ";
+    commandLine += quoteWindowsCommandLineArgument(distro);
     if (!user.empty()) {
-        appendWindowsCommandLineArgument(commandLine, L"-u");
-        appendWindowsCommandLineArgument(commandLine, user);
+        commandLine += L" -u ";
+        commandLine += quoteWindowsCommandLineArgument(user);
     }
-    appendWindowsCommandLineArgument(commandLine, L"--exec");
-    appendWindowsCommandLineArgument(commandLine, L"cat");
-    appendWindowsCommandLineArgument(commandLine, L"--");
-    appendWindowsCommandLineArgument(commandLine, path);
+    commandLine += L" --exec cat -- ";
+    commandLine += quoteWindowsCommandLineArgument(path);
     return commandLine;
 }
 

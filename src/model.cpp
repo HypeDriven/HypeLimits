@@ -43,10 +43,12 @@ std::optional<double> Metric::remainingFraction() const {
 }
 
 bool Metric::contributesToAggregate() const {
+    if (state == MetricState::AuthenticationRequired) return false;
     return kind != MetricKind::ApiCredit && remainingFraction().has_value();
 }
 
 bool Metric::visibleOnMonitor() const {
+    if (state == MetricState::AuthenticationRequired && announceAuthentication) return true;
     const bool hasValue = used.has_value() || remaining.has_value() || (capacity && *capacity > 0.0);
     if (!hasValue) return false;
     switch (state) {
@@ -104,6 +106,7 @@ std::optional<std::string> extractAuthorizationCode(std::string_view text) {
 }
 
 std::optional<double> Metric::alertRemainingFraction() const {
+    if (state == MetricState::AuthenticationRequired) return std::nullopt;
     if (kind == MetricKind::ApiCredit && remaining && lowBalanceThreshold && *lowBalanceThreshold > 0.0) {
         return std::clamp(*remaining / (*lowBalanceThreshold * 10.0), 0.0, 1.0);
     }

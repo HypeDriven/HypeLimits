@@ -5,6 +5,7 @@
 #include "windows_command_line.hpp"
 
 #include <algorithm>
+#include <ranges>
 #include <chrono>
 #include <cmath>
 #include <iostream>
@@ -132,6 +133,9 @@ int main() {
     Metric authRequired;
     authRequired.state = MetricState::AuthenticationRequired;
     check(!authRequired.visibleOnMonitor(), "unauthenticated metrics without a value stay off the monitor");
+    Metric authNotice = authRequired;
+    authNotice.announceAuthentication = true;
+    check(authNotice.visibleOnMonitor(), "a rejected credential is shown even without a last value");
     Metric authWithLast = percentage(MetricKind::Session, 40, 100);
     authWithLast.state = MetricState::AuthenticationRequired;
     check(authWithLast.visibleOnMonitor(), "authentication failure keeps last known usage on the monitor");
@@ -145,6 +149,9 @@ int main() {
     check(providerAuthenticationFailed(mixedAuth), "any visible authentication-required metric marks the provider row");
     ProviderSnapshot authHidden{"ah", "AH", true, {authRequired}};
     check(!providerAuthenticationFailed(authHidden), "authentication-required metrics without a value do not mark the row");
+    ProviderSnapshot authAnnounced{"aa", "AA", true, {authNotice}};
+    check(monitorIncludesProvider(authAnnounced), "a rejected credential stays on the monitor without a last value");
+    check(providerAuthenticationFailed(authAnnounced), "announced authentication failure marks the provider row");
     check(shouldAutoReauthenticate(true, true, false), "official sign-in accounts auto-reauthenticate once");
     check(!shouldAutoReauthenticate(true, true, true), "auto-reauth runs only once per failure");
     check(!shouldAutoReauthenticate(true, false, false), "paste-only API keys are not auto-reauthenticated");
@@ -281,8 +288,8 @@ int main() {
     const auto wslReadCommand = buildWslCatCommandLine(
         L"wsl.exe", L"Ubuntu 24.04", L"alice", L"/home/alice/.config/token$(id).json");
     check(wslReadCommand
-              == L"\"wsl.exe\" \"-d\" \"Ubuntu 24.04\" \"-u\" \"alice\" \"--exec\" \"cat\" \"--\" \"/home/alice/.config/token$(id).json\"",
-          "WSL credential reads use exec mode without shell evaluation");
+              == L"\"wsl.exe\" -d \"Ubuntu 24.04\" -u \"alice\" --exec cat -- \"/home/alice/.config/token$(id).json\"",
+          "WSL credential reads pass flags unquoted so wsl.exe does not hand them to bash");
     TokenRecord oldest;
     oldest.accessToken = "a";
     oldest.refreshToken = "ar";
@@ -322,6 +329,24 @@ int main() {
           "Codex write-back updates tokens.access_token and refresh_token");
     check(codexMerged.find("\"id_token\":\"\"") != std::string::npos && codexMerged.find("\"last_refresh\":\"keep-meta\"") != std::string::npos,
           "Codex account switch clears old identity while preserving unrelated metadata");
+
+    const char* agyExisting = R"({"token":{"access_token":"agy-old","token_type":"Bearer","refresh_token":"agy-old-r","expiry":"2026-09-28T09:50:34.322532681Z"},"auth_method":"consumer"})";
+    const auto agyParsed = parseCliTokenRecord(CliCredentialFormat::GeminiOauth, agyExisting);
+    check(agyParsed.accessToken == "agy-old" && agyParsed.refreshToken == "agy-old-r" && agyParsed.expiresAtMs && *agyParsed.expiresAtMs > 1'000'000'000'000LL,
+          "Antigravity CLI nested oauth token parses access, refresh, and expiry");
+    TokenRecord agyWinner;
+    agyWinner.accessToken = "agy-new";
+    agyWinner.refreshToken = "agy-new-r";
+    agyWinner.expiresAtMs = 1'758'000'000'000LL;
+    const auto agyMerged = mergeCliCredentialJson(CliCredentialFormat::GeminiOauth, agyExisting, agyWinner);
+    const auto agyRoundTrip = parseCliTokenRecord(CliCredentialFormat::GeminiOauth, agyMerged);
+    check(agyRoundTrip.accessToken == "agy-new" && agyRoundTrip.refreshToken == "agy-new-r" && agyRoundTrip.expiresAtMs && *agyRoundTrip.expiresAtMs == 1'758'000'000'000LL,
+          "Antigravity CLI write-back updates the nested token");
+    check(agyMerged.find("\"auth_method\":\"consumer\"") != std::string::npos && agyMerged.find("\"token_type\":\"Bearer\"") != std::string::npos,
+          "Antigravity CLI write-back leaves the agy envelope intact");
+    const auto antigravityPaths = cliHomeRelativePaths("antigravity");
+    check(std::ranges::find(antigravityPaths, ".gemini/antigravity-cli/antigravity-oauth-token") != antigravityPaths.end(),
+          "Antigravity CLI credential path is discovered");
 
     const char* geminiExisting = R"({"access_token":"old","refresh_token":"old-r","token_type":"Bearer","scope":"keep-scope","expiry_date":1})";
     TokenRecord geminiWinner;
