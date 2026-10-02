@@ -65,10 +65,20 @@ int main() {
     check(yellow.red > 200 && yellow.green > 150, "half allowance is yellow");
     check(red.red > red.green && red.red > red.blue, "empty allowance is red");
     const auto mid = statusColor(0.75);
-    const auto idle = applyUsageActivity(mid, false);
-    const auto active = applyUsageActivity(mid, true);
+    const auto idle = applyUsageActivity(mid, 0.0);
+    const auto active = applyUsageActivity(mid, 1.0);
+    const auto fading = applyUsageActivity(mid, 0.5);
     check(idle.red < mid.red && idle.green < mid.green, "idle usage darkens the row color");
     check(active.red > mid.red && active.green > mid.green, "drawdown brightens the row color");
+    check(fading.red > idle.red && fading.red < active.red, "partial activity sits between idle and bright");
+    const auto recent = TimePoint{std::chrono::seconds{1'000'000}};
+    check(usageActivityBrightness(std::nullopt, recent) == 0.0, "no drawdown is fully idle");
+    check(usageActivityBrightness(recent, recent) == 1.0, "a fresh drawdown is fully bright");
+    const auto halfway = usageActivityBrightness(recent - kUsageActivityFade / 2, recent);
+    check(halfway > 0.4 && halfway < 0.6, "brightness is about half after half the fade");
+    check(usageActivityBrightness(recent - kUsageActivityFade, recent) == 0.0, "brightness is idle once the fade ends");
+    const auto early = usageActivityBrightness(recent - kUsageActivityFade / 4, recent);
+    check(early > halfway, "recent activity stays brighter than the midpoint");
     Metric before = percentage(MetricKind::Session, 20, 100);
     Metric after = percentage(MetricKind::Session, 28, 100);
     check(usageDrewDownSince(before, after), "higher used counts as drawdown");
@@ -94,6 +104,10 @@ int main() {
     check(claude && claude->session && std::abs(claude->session->used - 35.0) < 0.001, "Claude session utilization parses");
     check(claude && claude->weekly && std::abs(claude->weekly->used - 14.0) < 0.001, "Claude weekly utilization parses");
     check(claude && claude->credit && std::abs(claude->credit->amount - 975.0) < 0.001, "Claude extra usage is remaining dollars");
+
+    const auto claudeLive = parseClaudeUsage(R"LIVE({"five_hour":{"utilization":11.0,"resets_at":"2026-10-02T12:29:59.926893+00:00","limit_dollars":null,"used_dollars":null,"remaining_dollars":null,"locked_reason":null},"seven_day":{"utilization":48.0,"resets_at":"2026-10-05T22:59:59.926913+00:00","limit_dollars":null,"used_dollars":null,"remaining_dollars":null,"locked_reason":null},"seven_day_oauth_apps":null,"seven_day_opus":null,"seven_day_sonnet":null,"seven_day_cowork":null,"seven_day_omelette":null,"tangelo":null,"iguana_necktie":null,"omelette_promotional":null,"nimbus_quill":null,"cinder_cove":null,"copper_kite":null,"brass_thimble":null,"harbor_lantern":null,"wattle_ember":null,"amber_ladder":null,"amber_cistern":null,"juniper_tide":null,"cedar_ember":null,"amber_gauge":null,"extra_usage":{"is_enabled":false,"monthly_limit":null,"used_credits":null,"utilization":null,"currency":null,"decimal_places":null,"disabled_reason":null,"user_disabled":true,"spend_limit_reached":false,"credits_ever_enabled":true,"daily":null,"weekly":null},"limits":[{"kind":"session","group":"session","percent":11,"severity":"normal","resets_at":"2026-10-02T12:29:59.926893+00:00","scope":null,"is_active":false},{"kind":"weekly_all","group":"weekly","percent":48,"severity":"normal","resets_at":"2026-10-05T22:59:59.926913+00:00","scope":null,"is_active":true},{"kind":"weekly_scoped","group":"weekly","percent":0,"severity":"normal","resets_at":"2026-10-05T23:00:00+00:00","scope":{"model":{"id":null,"display_name":"Fable"},"surface":null},"is_active":false}],"spend":{"used":{"amount_minor":0,"currency":"USD","exponent":2},"limit":null,"percent":0,"severity":"normal","enabled":false,"disabled_reason":null,"cap":null,"balance":null,"auto_reload":null,"disclaimer":"Usage credits cover you when you hit your plan limits. [Learn more](https://support.claude.com/articles/12429409)","can_purchase_credits":false,"can_toggle":false},"member_dashboard_available":false,"seven_day_breakdown":{"as_of":"2026-10-02T12:14:13.952167+00:00","window_started_at":"2026-09-28T22:59:59.926913+00:00","rows":[{"key":"claude_code","display_name":"Claude Code","percent":100},{"key":"chat","display_name":"Chats","percent":0},{"key":"cowork","display_name":"Cowork","percent":0},{"key":"other","display_name":"Other","percent":0}]}})LIVE");
+    check(claudeLive && claudeLive->session && claudeLive->session->used == 11.0, "Claude live response session parses");
+    check(claudeLive && claudeLive->weekly && claudeLive->weekly->used == 48.0, "Claude live response weekly parses");
 
     const auto claudeLimits = parseClaudeUsage(R"({"limits":[{"kind":"session","percent":40.0,"resets_at":"2026-03-01T00:00:00Z"},{"kind":"weekly_all","percent":22.0,"resets_at":"2026-03-07T00:00:00Z"}]})");
     check(claudeLimits && claudeLimits->session && claudeLimits->session->used == 40.0, "Claude structured session limit parses");

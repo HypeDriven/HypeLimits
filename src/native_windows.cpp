@@ -57,6 +57,7 @@
 #include <format>
 #include <functional>
 #include <memory>
+#include <map>
 #include <mutex>
 #include <optional>
 #include <ranges>
@@ -77,6 +78,8 @@ constexpr UINT kNetworkChangedMessage = WM_APP + 3;
 constexpr UINT kAutoReauthMessage = WM_APP + 4;
 constexpr UINT_PTR kPollTimer = 1;
 constexpr UINT_PTR kFlashTimer = 2;
+constexpr UINT_PTR kActivityTimer = 3;
+constexpr UINT kActivityTimerMs = 2000;
 constexpr ULONGLONG kResetFlashMs = 2000;
 constexpr COLORREF kResetRowBackground = RGB(36, 214, 78);
 constexpr COLORREF kResetRowText = RGB(255, 255, 255);
@@ -147,6 +150,7 @@ struct MetricHit {
     RECT rect{};
     std::size_t provider{};
     std::size_t metric{};
+    DWORD slot{};
 };
 
 std::string utf8(std::wstring_view value) {
@@ -889,14 +893,28 @@ bool writeUtf8FileAtomic(const std::wstring& path, std::string_view body) {
 bool applyAccountToCli(std::wstring_view id, const AuthMaterial& auth);
 bool backgroundSyncAllowed(std::wstring_view id);
 bool antigravityCliTokenPath(const std::wstring& path);
+AuthMaterial loadCliAuth(std::wstring_view id);
+std::optional<std::int64_t> accessTokenExpiryMs(const AuthMaterial& auth);
 
 void syncProviderTokens(std::wstring_view id) {
     if (!backgroundSyncAllowed(id)) return;
     if (managedAccounts(id)) {
         // Explicit selection authorizes ongoing write-back for that account.
         if (readDword((accountSetting(id) + L".SelectionSync").c_str(), 0)) {
-            const bool ok = applyAccountToCli(id, loadStoredAuth(id));
-            writeDword((accountSetting(id) + L".SyncFailed").c_str(), ok ? 0 : 1);
+            // Only push a stored token that is still valid and newer than the CLI's; never overwrite a fresh CLI
+            // login (or a CLI-side refresh) with an older copy, which signs the CLI out.
+            auto stored = loadStoredAuth(id);
+            const auto cli = loadCliAuth(id);
+            const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+            const auto storedExpiry = accessTokenExpiryMs(stored);
+            const bool storedValid = !stored.token.empty() && (!storedExpiry || *storedExpiry > nowMs);
+            const bool cliMissing = cli.token.empty() && cli.refreshToken.empty();
+            if (storedValid && (cliMissing || pickLatestValidToken(recordFromAuth(stored), recordFromAuth(cli), nowMs) == TokenPick::Left)) {
+                const bool ok = applyAccountToCli(id, stored);
+                writeDword((accountSetting(id) + L".SyncFailed").c_str(), ok ? 0 : 1);
+            }
+            SecureZeroMemory(stored.token.data(), stored.token.size());
+            SecureZeroMemory(stored.refreshToken.data(), stored.refreshToken.size());
         }
         return;
     }
@@ -1254,10 +1272,10 @@ std::vector<AntigravityOAuthClient> clientsFromAgyBinary(const std::wstring& pat
     if (file == INVALID_HANDLE_VALUE) return {};
     constexpr std::string_view kSecretMarker = "generateContentGOCSPX-";
     constexpr std::string_view kClientSuffix = ".apps.googleusercontent.com";
+    std::string window;
     const auto markerAt = [&](std::size_t i, std::string_view marker) {
         return i + marker.size() <= window.size() && std::string_view(window).substr(i, marker.size()) == marker;
     };
-    std::string window;
     std::string secret;
     std::vector<std::string> ids;
     char buffer[64 * 1024];
@@ -1339,6 +1357,16 @@ HttpResponse refreshAntigravityToken(const std::string& refreshToken) {
 
 bool refreshOAuth(std::wstring_view credentialId, AuthMaterial& auth) {
     if (auth.refreshToken.empty()) return false;
+    // A rejected refresh token is stale (rotated elsewhere). Retrying it only invites the provider to revoke the
+    // whole token family, which signs the provider's CLI out. Back off instead.
+    static std::map<std::wstring, ULONGLONG> blockedUntil;
+    static std::mutex blockedMutex;
+    const std::wstring blockKey = std::wstring(credentialId) + L"|" + wide(auth.refreshToken.substr(auth.refreshToken.size() > 12 ? auth.refreshToken.size() - 12 : 0));
+    {
+        std::lock_guard lock(blockedMutex);
+        const auto found = blockedUntil.find(blockKey);
+        if (found != blockedUntil.end() && found->second > GetTickCount64()) return false;
+    }
     const auto slotMarker = credentialId.find(L"/account-");
     const std::wstring providerStorage = slotMarker == std::wstring_view::npos
         ? std::wstring(credentialId) : std::wstring(credentialId.substr(0, slotMarker));
@@ -1368,7 +1396,13 @@ bool refreshOAuth(std::wstring_view credentialId, AuthMaterial& auth) {
     } else {
         return false;
     }
-    if (response.status != 200 || !jsonString(response.body, "access_token")) return false;
+    if (response.status != 200 || !jsonString(response.body, "access_token")) {
+        if (response.status >= 400 && response.status < 500 && response.status != 429) {
+            std::lock_guard lock(blockedMutex);
+            blockedUntil[blockKey] = GetTickCount64() + 6ULL * 60 * 60 * 1000;
+        }
+        return false;
+    }
     applyTokenResponse(auth, response.body);
     saveAuth(credentialId, auth);
     // Only the selected account is written back to the CLI. Other slots stay in Credential Manager.
@@ -1861,6 +1895,7 @@ void applyWindow(ProviderSnapshot& snapshot, MetricKind kind, const UsageWindow&
     metric->observedAt = now;
     metric->diagnostic.clear();
     metric->drawingDown = usageDrewDownSince(previous, *metric);
+    if (metric->drawingDown) metric->lastDrawdownAt = now;
 }
 
 void applyCredit(ProviderSnapshot& snapshot, const BalanceValue& credit, TimePoint now, std::optional<double> threshold,
@@ -1879,6 +1914,7 @@ void applyCredit(ProviderSnapshot& snapshot, const BalanceValue& credit, TimePoi
     metric->barFullAmount = barFull > 0.0 ? barFull : 100.0;
     metric->diagnostic.clear();
     metric->drawingDown = usageDrewDownSince(previous, *metric);
+    if (metric->drawingDown) metric->lastDrawdownAt = now;
 }
 
 void applyUsage(ProviderSnapshot& snapshot, const ProviderUsage& usage, TimePoint now, std::optional<double> threshold,
@@ -1941,11 +1977,61 @@ bool mergeHttpUsage(ProviderSnapshot& snapshot, const HttpResponse& response, co
     return false;
 }
 
+// Expiry from the explicit field, else the access token's own JWT "exp" claim. Unknown means "do not refresh":
+// refresh tokens rotate, so a blind refresh would invalidate the copy the provider's CLI is holding.
+std::optional<std::int64_t> accessTokenExpiryMs(const AuthMaterial& auth) {
+    if (auth.expiresAtMs) return auth.expiresAtMs;
+    const auto first = auth.token.find('.');
+    if (first == std::string::npos) return std::nullopt;
+    const auto second = auth.token.find('.', first + 1);
+    if (second == std::string::npos) return std::nullopt;
+    std::string payload;
+    unsigned int bits = 0;
+    int count = 0;
+    for (std::size_t i = first + 1; i < second; ++i) {
+        const char ch = auth.token[i];
+        int value = -1;
+        if (ch >= 'A' && ch <= 'Z') value = ch - 'A';
+        else if (ch >= 'a' && ch <= 'z') value = ch - 'a' + 26;
+        else if (ch >= '0' && ch <= '9') value = ch - '0' + 52;
+        else if (ch == '-' || ch == '+') value = 62;
+        else if (ch == '_' || ch == '/') value = 63;
+        if (value < 0) continue;
+        bits = (bits << 6) | static_cast<unsigned int>(value);
+        count += 6;
+        if (count >= 8) {
+            count -= 8;
+            payload.push_back(static_cast<char>((bits >> count) & 0xFF));
+        }
+    }
+    if (const auto exp = jsonNumber(payload, "exp")) return static_cast<std::int64_t>(*exp * 1000.0);
+    return std::nullopt;
+}
+
 bool accessTokenNeedsRefresh(const AuthMaterial& auth) {
     if (auth.refreshToken.empty()) return false;
-    if (!auth.expiresAtMs) return true;
+    const auto expiry = accessTokenExpiryMs(auth);
+    if (!expiry) return false;
     const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
-    return *auth.expiresAtMs <= now + 120000;
+    return *expiry <= now;
+}
+
+// The CLI may have refreshed since this credential was loaded. Adopt its unexpired token instead of rotating
+// the shared refresh token a second time.
+bool adoptNewerCliToken(std::wstring_view id, AuthMaterial& auth) {
+    if (!allowOfficialCli(id)) return false;
+    // For managed accounts the CLI file holds the selected account's live token only after an explicit selection.
+    if (managedAccounts(id) && !readDword((accountSetting(id) + L".SelectionSync").c_str(), 0)) return false;
+    AuthMaterial cli = loadCliAuth(id);
+    const bool usable = !cli.token.empty() && (cli.token != auth.token || cli.refreshToken != auth.refreshToken)
+        && !accessTokenNeedsRefresh(cli) && (cli.expiresAtMs || accessTokenExpiryMs(cli));
+    if (usable) {
+        auth = cli;
+        saveAuth(id, auth);
+    }
+    SecureZeroMemory(cli.token.data(), cli.token.size());
+    SecureZeroMemory(cli.refreshToken.data(), cli.refreshToken.size());
+    return usable;
 }
 
 void queryProviderUsage(std::wstring_view id, const AuthMaterial& auth, ProviderSnapshot& snapshot,
@@ -2018,17 +2104,50 @@ void fetchProviderUsage(std::wstring_view credentialId, AuthMaterial& auth, Prov
         ? std::wstring(credentialId) : std::wstring(credentialId.substr(0, slotMarker));
     const std::wstring_view id = providerStorage;
     bool refreshed = false;
-    if (accessTokenNeedsRefresh(auth)) refreshed = refreshOAuth(credentialId, auth);
+    if (accessTokenNeedsRefresh(auth) && slotMarker == std::wstring_view::npos && adoptNewerCliToken(id, auth)) {
+        // The CLI already holds a fresh token; no refresh needed.
+    } else if (accessTokenNeedsRefresh(auth)) {
+        refreshed = refreshOAuth(credentialId, auth);
+    }
     DWORD lastStatus = 0;
     std::string lastError;
     bool gotData = false;
     bool authenticationRejected = false;
     queryProviderUsage(id, auth, snapshot, now, threshold, barFull, lastStatus, lastError, gotData, authenticationRejected);
+    if (authenticationRejected && !refreshed && slotMarker == std::wstring_view::npos && adoptNewerCliToken(id, auth)) {
+        for (auto& metric : snapshot.metrics) {
+            if (metricFetchable(id, metric.kind) && metric.state != MetricState::Current) metric.state = MetricState::Refreshing;
+        }
+        queryProviderUsage(id, auth, snapshot, now, threshold, barFull, lastStatus, lastError, gotData, authenticationRejected);
+    }
     if (authenticationRejected && !refreshed && refreshOAuth(credentialId, auth)) {
         for (auto& metric : snapshot.metrics) {
             if (metricFetchable(id, metric.kind) && metric.state != MetricState::Current) metric.state = MetricState::Refreshing;
         }
         queryProviderUsage(id, auth, snapshot, now, threshold, barFull, lastStatus, lastError, gotData, authenticationRejected);
+    }
+    if (authenticationRejected && slotMarker == std::wstring_view::npos && !managedAccounts(id)) {
+        // The CLI file and the stored copy can diverge; one may hold a token the provider has since invalidated.
+        // Try the other source before declaring the login rejected.
+        std::vector<AuthMaterial> alternates;
+        alternates.push_back(loadStoredAuth(id));
+        if (allowOfficialCli(id)) alternates.push_back(loadCliAuth(id));
+        for (auto& alt : alternates) {
+            const bool differs = alt.token != auth.token || alt.refreshToken != auth.refreshToken;
+            if (!differs || (alt.token.empty() && alt.refreshToken.empty())) continue;
+            if (alt.token.empty() || accessTokenNeedsRefresh(alt)) continue; // never rotate a refresh token speculatively
+            for (auto& metric : snapshot.metrics) {
+                if (metricFetchable(id, metric.kind) && metric.state != MetricState::Current) metric.state = MetricState::Refreshing;
+            }
+            queryProviderUsage(id, alt, snapshot, now, threshold, barFull, lastStatus, lastError, gotData, authenticationRejected);
+            if (!authenticationRejected) {
+                saveAuth(credentialId, alt);
+                auth = alt;
+            }
+            SecureZeroMemory(alt.token.data(), alt.token.size());
+            SecureZeroMemory(alt.refreshToken.data(), alt.refreshToken.size());
+            if (!authenticationRejected) break;
+        }
     }
     finishRefresh(snapshot, gotData, authenticationRejected, lastStatus, lastError);
 }
@@ -2051,13 +2170,23 @@ std::wstring formatTime(const std::optional<TimePoint>& value) {
     return output;
 }
 
-COLORREF remainingColor(double remaining, bool drawingDown = false) {
-    const auto color = applyUsageActivity(statusColor(remaining), drawingDown);
+COLORREF lerpColor(COLORREF from, COLORREF to, double activity) {
+    activity = std::clamp(activity, 0.0, 1.0);
+    auto channel = [&](int shift) {
+        const int start = (from >> shift) & 0xFF;
+        const int end = (to >> shift) & 0xFF;
+        return static_cast<int>(std::lround(start + (end - start) * activity));
+    };
+    return RGB(channel(0), channel(8), channel(16));
+}
+
+COLORREF remainingColor(double remaining, double activity = 0.0) {
+    const auto color = applyUsageActivity(statusColor(remaining), activity);
     return RGB(color.red, color.green, color.blue);
 }
 
-std::wstring tooltipText(const Provider& provider, const Metric& metric) {
-    std::wstring text = provider.definition.name + L" — Account " + std::to_wstring(activeAccount(provider.definition.id) + 1) + L" — " + kindName(metric.kind) + L"\r\n";
+std::wstring tooltipText(const Provider& provider, const Metric& metric, DWORD slot) {
+    std::wstring text = provider.definition.name + L" — Account " + std::to_wstring(slot + 1) + L" — " + kindName(metric.kind) + L"\r\n";
     if (metric.used && metric.capacity) {
         text += std::format(L"{:.0f} / {:.0f} {} used\r\n", *metric.used, *metric.capacity, wide(metric.unit));
     }
@@ -2108,7 +2237,7 @@ private:
     [[nodiscard]] POINT toLogical(POINT client) const;
     enum class ResizeEdge { None, Right, Bottom, Corner };
     [[nodiscard]] ResizeEdge resizeEdgeAt(POINT client) const;
-    void refresh();
+    void refresh(bool queueIfBusy = false);
     void scheduleNextPoll(bool failed);
     void connectProvider();
     void addAccount();
@@ -2135,6 +2264,7 @@ private:
     void syncGoogleSecretControls();
     [[nodiscard]] HWND dialogParent() const;
     [[nodiscard]] const MetricHit* hitAt(POINT client) const;
+    [[nodiscard]] const ProviderSnapshot& hitSnapshotFor(const MetricHit& hit) const;
     [[nodiscard]] bool authenticationFailedAt(POINT client) const;
     void handleMonitorClick(POINT client);
 
@@ -2201,6 +2331,8 @@ private:
     std::vector<unsigned char> soundBuffer_;
     std::jthread refreshThread_;
     std::atomic_bool refreshing_{false};
+    bool refreshQueued_{false};
+    ULONGLONG lastRefreshTick_{0};
     unsigned int failureStreak_{0};
     std::vector<char> autoReauthTried_;
     std::vector<std::size_t> autoReauthQueue_;
@@ -2284,6 +2416,9 @@ void restoreAccountSnapshot(ProviderSnapshot& snapshot, std::wstring_view id, DW
         if (remaining) metric.remaining = *remaining / 1000000.0;
         metric.observedAt = TimePoint{std::chrono::seconds{*observed}};
         if (reset) metric.resetAt = TimePoint{std::chrono::seconds{*reset}};
+        if (const auto drawdown = readQword((prefix + L".DrawdownUnix").c_str())) {
+            metric.lastDrawdownAt = TimePoint{std::chrono::seconds{*drawdown}};
+        }
         metric.currency = readDword((prefix + L".Currency").c_str(), 1) == 2 ? "CNY " : "$";
         metric.unit = metric.kind == MetricKind::ApiCredit ? metric.currency : "%";
         metric.diagnostic = "Showing the last successful value while a refresh is pending.";
@@ -2383,6 +2518,9 @@ void App::createProviders() {
                 if (remaining) metric.remaining = *remaining / 1000000.0;
                 metric.observedAt = TimePoint{std::chrono::seconds{*observed}};
                 if (reset) metric.resetAt = TimePoint{std::chrono::seconds{*reset}};
+                if (const auto drawdown = readQword((prefix + L".DrawdownUnix").c_str())) {
+                    metric.lastDrawdownAt = TimePoint{std::chrono::seconds{*drawdown}};
+                }
                 metric.currency = readDword((prefix + L".Currency").c_str(), 1) == 2 ? "CNY " : "$";
                 metric.unit = metric.kind == MetricKind::ApiCredit ? metric.currency : "%";
                 if (metric.kind == MetricKind::ApiCredit) {
@@ -2867,7 +3005,7 @@ void App::layoutMonitor() {
                 const auto& metric = account.snapshot.metrics[metricIndex];
                 if (!metric.visibleOnMonitor() || !metric.remainingFraction()) continue;
                 if (!firstMetric) firstMetric = metricIndex;
-                hits_.push_back({RECT{8, y - 5, logicalWidth_ - 8, y + 11}, providerIndex, metricIndex});
+                hits_.push_back({RECT{8, y - 5, logicalWidth_ - 8, y + 11}, providerIndex, metricIndex, account.slot});
                 y += 13;
                 drewBar = true;
             }
@@ -2875,13 +3013,13 @@ void App::layoutMonitor() {
                 for (std::size_t metricIndex = 0; metricIndex < account.snapshot.metrics.size(); ++metricIndex) {
                     if (!account.snapshot.metrics[metricIndex].visibleOnMonitor()) continue;
                     firstMetric = metricIndex;
-                    hits_.push_back({RECT{8, y - 2, logicalWidth_ - 8, y + 16}, providerIndex, metricIndex});
+                    hits_.push_back({RECT{8, y - 2, logicalWidth_ - 8, y + 16}, providerIndex, metricIndex, account.slot});
                     y += 16;
                     break;
                 }
             }
             y += 6;
-            if (firstMetric) hits_.push_back({RECT{0, nameTop, logicalWidth_, y}, providerIndex, *firstMetric});
+            if (firstMetric) hits_.push_back({RECT{0, nameTop, logicalWidth_, y}, providerIndex, *firstMetric, account.slot});
             }
         }
         logicalHeight_ = std::max(48, y + 3);
@@ -2958,9 +3096,12 @@ void App::renderMonitorBitmap() {
         if (!monitorIncludesProvider(account.snapshot)) continue;
         any = true;
         const bool authFailed = !flashing && providerAuthenticationFailed(account.snapshot);
-        const bool drawingDown = std::ranges::any_of(account.snapshot.metrics, [](const Metric& metric) {
-            return metric.visibleOnMonitor() && metric.drawingDown;
-        });
+        const auto now = std::chrono::system_clock::now();
+        double activity = 0.0;
+        for (const auto& metric : account.snapshot.metrics) {
+            if (!metric.visibleOnMonitor()) continue;
+            activity = std::max(activity, usageActivityBrightness(metric.lastDrawdownAt, now));
+        }
         int rowBottom = y + 20;
         int visibleBars = 0;
         for (const auto& metric : account.snapshot.metrics) {
@@ -2981,7 +3122,7 @@ void App::renderMonitorBitmap() {
             DeleteObject(tint);
             SetTextColor(mem, kAuthRowText);
         } else {
-            SetTextColor(mem, drawingDown ? RGB(248, 250, 252) : RGB(148, 152, 160));
+            SetTextColor(mem, lerpColor(RGB(148, 152, 160), RGB(248, 250, 252), activity));
         }
         const std::wstring rowLabel = monitorRowLabel(provider, account, account.snapshot);
         RECT nameRect = scaled({10, y, logicalWidth_ - 10, y + 20});
@@ -2995,13 +3136,13 @@ void App::renderMonitorBitmap() {
             RECT labelRect = scaled({12, y - 3, 28, y + 12});
             DrawTextW(mem, label, -1, &labelRect, DT_SINGLELINE | DT_NOPREFIX | DT_NOCLIP);
             RECT bar = scaled({30, y, logicalWidth_ - 12, y + 6});
-            HBRUSH track = CreateSolidBrush(flashing ? kResetRowTrack : (authFailed ? kAuthRowTrack : (drawingDown ? RGB(78, 82, 94) : RGB(46, 48, 56))));
+            HBRUSH track = CreateSolidBrush(flashing ? kResetRowTrack : (authFailed ? kAuthRowTrack : lerpColor(RGB(46, 48, 56), RGB(78, 82, 94), activity)));
             FillRect(mem, &bar, track);
             DeleteObject(track);
             if (const auto fraction = metric.remainingFraction()) {
                 RECT fill = bar;
                 fill.right = fill.left + static_cast<LONG>((fill.right - fill.left) * *fraction);
-                HBRUSH color = CreateSolidBrush(flashing ? kResetRowFill : (authFailed ? kAuthRowText : remainingColor(*fraction, drawingDown)));
+                HBRUSH color = CreateSolidBrush(flashing ? kResetRowFill : (authFailed ? kAuthRowText : remainingColor(*fraction, activity)));
                 FillRect(mem, &fill, color);
                 DeleteObject(color);
             }
@@ -3019,6 +3160,17 @@ void App::renderMonitorBitmap() {
         RECT empty = scaled({10, 12, logicalWidth_ - 10, logicalHeight_ - 8});
         DrawTextW(mem, L"Configure an account in Options", -1, &empty, DT_WORDBREAK | DT_NOPREFIX | DT_NOCLIP);
     }
+    bool fading = false;
+    for (const auto& provider : providers_) {
+        for (const auto& account : monitorRowsFor(provider)) {
+            if (!monitorIncludesProvider(account.snapshot)) continue;
+            for (const auto& metric : account.snapshot.metrics) {
+                if (metric.visibleOnMonitor() && usageActivityBrightness(metric.lastDrawdownAt, std::chrono::system_clock::now()) > 0.0) fading = true;
+            }
+        }
+    }
+    if (fading) SetTimer(floatingWindow_, kActivityTimer, kActivityTimerMs, nullptr);
+    else KillTimer(floatingWindow_, kActivityTimer);
 
     SelectObject(mem, oldFont);
     DeleteObject(drawFont);
@@ -3053,7 +3205,8 @@ void App::activateTooltip(POINT clientPoint) {
         SendMessageW(tooltip_, TTM_TRACKACTIVATE, FALSE, 0);
         return;
     }
-    activeTooltip_ = tooltipText(providers_[found->provider], providers_[found->provider].snapshot.metrics[found->metric]);
+    const auto& hitSnapshot = hitSnapshotFor(*found);
+    activeTooltip_ = tooltipText(providers_[found->provider], hitSnapshot.metrics[std::min(found->metric, hitSnapshot.metrics.size() - 1)], found->slot);
     TOOLINFOW info{sizeof(info)};
     info.hwnd = floatingWindow_;
     info.uId = 1;
@@ -3076,13 +3229,23 @@ struct RefreshResult {
     ProviderSnapshot snapshot;
 };
 
-void App::refresh() {
+void App::refresh(bool queueIfBusy) {
     if (signInInProgress_) return;
-    if (refreshing_.exchange(true)) return;
+    if (refreshing_.exchange(true)) {
+        // A reconnect during an in-flight refresh would otherwise keep the old rejected-credential result on screen.
+        if (queueIfBusy) refreshQueued_ = true;
+        return;
+    }
+    lastRefreshTick_ = GetTickCount64();
     for (auto& provider : providers_) {
         if (!provider.snapshot.enabled || !provider.connected) continue;
         for (auto& metric : provider.snapshot.metrics) {
             if (metricFetchable(provider.definition.id, metric.kind)) metric.state = MetricState::Refreshing;
+        }
+        for (auto& account : provider.monitorAccounts) {
+            for (auto& metric : account.snapshot.metrics) {
+                if (metricFetchable(provider.definition.id, metric.kind)) metric.state = MetricState::Refreshing;
+            }
         }
     }
     updateAll();
@@ -3210,7 +3373,8 @@ void App::processAutoReauth() {
     const bool ok = attemptAutoReauth(index);
     autoReauthBusy_ = false;
     if (ok) {
-        if (index < autoReauthTried_.size()) autoReauthTried_[index] = 0;
+        // Keep the tried flag: it clears only once a refresh returns current data. Clearing it here loops forever
+        // when re-auth "succeeds" with a token the usage endpoint still rejects.
         refresh();
         return;
     }
@@ -3229,16 +3393,24 @@ const MetricHit* App::hitAt(POINT client) const {
     return found == hits_.end() ? nullptr : &*found;
 }
 
+const ProviderSnapshot& App::hitSnapshotFor(const MetricHit& hit) const {
+    const auto& provider = providers_[hit.provider];
+    const auto row = std::ranges::find_if(provider.monitorAccounts, [&](const MonitorAccount& account) { return account.slot == hit.slot; });
+    return row != provider.monitorAccounts.end() ? row->snapshot : provider.snapshot;
+}
+
 bool App::authenticationFailedAt(POINT client) const {
     const auto* hit = hitAt(client);
-    return hit && providerAuthenticationFailed(providers_[hit->provider].snapshot);
+    return hit && providerAuthenticationFailed(hitSnapshotFor(*hit));
 }
 
 void App::handleMonitorClick(POINT client) {
     if (autoReauthBusy_ || signInInProgress_) return;
     const auto* hit = hitAt(client);
-    if (!hit || !providerAuthenticationFailed(providers_[hit->provider].snapshot)) return;
+    if (!hit || !providerAuthenticationFailed(hitSnapshotFor(*hit))) return;
     selectedProvider_ = hit->provider;
+    // A rejected non-selected account must be selected first so the sign-in replaces that account's credential.
+    if (hit->slot != activeAccount(providers_[hit->provider].definition.id) && !selectAccount(hit->provider, hit->slot, true)) return;
     connectProvider();
 }
 
@@ -3753,6 +3925,12 @@ LRESULT App::onFloating(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
         return 0;
     }
     case WM_ERASEBKGND: return 1;
+    case WM_TIMER:
+        if (wParam == kActivityTimer) {
+            destroyMonitorBitmap();
+            InvalidateRect(hwnd, nullptr, FALSE);
+        }
+        return 0;
     case WM_PAINT: paintFloating(); return 0;
     case WM_SIZE:
         InvalidateRect(hwnd, nullptr, FALSE);
@@ -3909,7 +4087,7 @@ LRESULT App::onOptions(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
             updateAll();
             return 0;
         }
-        case IdRefresh: refresh(); return 0;
+        case IdRefresh: refresh(true); return 0;
         case IdDisconnect:
             if (refreshing_ || signInInProgress_ || autoReauthBusy_) return 0;
             CredentialStore::remove(providers_[selectedProvider_].definition.id);
@@ -3924,7 +4102,7 @@ LRESULT App::onOptions(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
                 deleteSetting((prefix + L".SelectionSync").c_str());
                 deleteSetting((prefix + L".ExhaustedUntil").c_str());
                 for (const auto& metric : providers_[selectedProvider_].snapshot.metrics) {
-                    for (const auto* field : {L"UsedMicros", L"CapacityMicros", L"RemainingMicros", L"ObservedUnix", L"ResetUnix", L"Currency"})
+                    for (const auto* field : {L"UsedMicros", L"CapacityMicros", L"RemainingMicros", L"ObservedUnix", L"ResetUnix", L"Currency", L"DrawdownUnix"})
                         deleteSetting((prefix + L"." + std::to_wstring(static_cast<int>(metric.kind)) + L"." + field).c_str());
                 }
                 deleteSetting((prefix + L".BalanceMicros").c_str());
@@ -4081,6 +4259,9 @@ LRESULT App::onTray(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
                 if (metric.capacity) writeQword((prefix + L".CapacityMicros").c_str(), static_cast<ULONGLONG>(std::llround(*metric.capacity * 1000000.0)));
                 if (metric.remaining) writeQword((prefix + L".RemainingMicros").c_str(), static_cast<ULONGLONG>(std::llround(*metric.remaining * 1000000.0)));
                 writeQword((prefix + L".ObservedUnix").c_str(), static_cast<ULONGLONG>(std::chrono::duration_cast<std::chrono::seconds>(metric.observedAt->time_since_epoch()).count()));
+                if (metric.lastDrawdownAt) {
+                    writeQword((prefix + L".DrawdownUnix").c_str(), static_cast<ULONGLONG>(std::chrono::duration_cast<std::chrono::seconds>(metric.lastDrawdownAt->time_since_epoch()).count()));
+                }
                 if (metric.resetAt) {
                     writeQword((prefix + L".ResetUnix").c_str(), static_cast<ULONGLONG>(std::chrono::duration_cast<std::chrono::seconds>(metric.resetAt->time_since_epoch()).count()));
                 }
@@ -4088,6 +4269,7 @@ LRESULT App::onTray(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
             }
         }
         refreshing_ = false;
+        if (refreshQueued_) { refreshQueued_ = false; refresh(); return 0; }
         if (rotateAccounts()) { refresh(); return 0; }
         for (std::size_t index = 0; index < providers_.size(); ++index) {
             if (index < autoReauthTried_.size()
@@ -4119,12 +4301,13 @@ LRESULT App::onTray(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
         }
         return 0;
     case kNetworkChangedMessage:
-        refresh();
+        // Virtual adapters (WSL, VPN) flap constantly; do not hammer providers or burn rate limits.
+        if (GetTickCount64() - lastRefreshTick_ >= 60000) refresh();
         return 0;
     case WM_COMMAND:
         switch (LOWORD(wParam)) {
         case IdTrayShow: toggleMonitor(); break;
-        case IdTrayRefresh: refresh(); break;
+        case IdTrayRefresh: refresh(true); break;
         case IdTrayOptions: showOptions(); break;
         case IdTrayQuit:
             persistGoogleClientSecretField();

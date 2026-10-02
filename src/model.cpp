@@ -144,12 +144,24 @@ RgbColor statusColor(double remaining) {
     return {static_cast<int>(255 * (0.92 + 0.08 * t)), static_cast<int>(255 * (0.18 + 0.60 * t)), 31};
 }
 
-RgbColor applyUsageActivity(RgbColor color, bool drawingDown) {
-    auto channel = [](int value, double factor, int lift) {
-        return std::clamp(static_cast<int>(std::lround(value * factor + lift)), 0, 255);
+double usageActivityBrightness(std::optional<TimePoint> lastDrawdownAt, TimePoint now) {
+    if (!lastDrawdownAt) return 0.0;
+    const double age = std::chrono::duration<double>(now - *lastDrawdownAt).count();
+    const double window = std::chrono::duration<double>(kUsageActivityFade).count();
+    if (age <= 0.0) return 1.0;
+    if (age >= window) return 0.0;
+    const double u = age / window;
+    const double smooth = u * u * (3.0 - 2.0 * u);
+    return 1.0 - smooth;
+}
+
+RgbColor applyUsageActivity(RgbColor color, double activity) {
+    activity = std::clamp(activity, 0.0, 1.0);
+    auto channel = [&](int value, int lift) {
+        const double factor = 0.52 + (1.14 - 0.52) * activity;
+        return std::clamp(static_cast<int>(std::lround(value * factor + lift * activity)), 0, 255);
     };
-    if (drawingDown) return {channel(color.red, 1.14, 20), channel(color.green, 1.14, 20), channel(color.blue, 1.14, 14)};
-    return {channel(color.red, 0.52, 0), channel(color.green, 0.52, 0), channel(color.blue, 0.52, 0)};
+    return {channel(color.red, 20), channel(color.green, 20), channel(color.blue, 14)};
 }
 
 bool usageDrewDownSince(const Metric& previous, const Metric& current) {

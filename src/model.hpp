@@ -27,6 +27,8 @@ struct Metric {
     std::optional<double> lowBalanceThreshold;
     std::optional<double> barFullAmount;
     bool drawingDown{false};
+    // Last time this allowance decreased. Row brightness fades from this instant.
+    std::optional<TimePoint> lastDrawdownAt;
     // Set when a saved credential is rejected, so the monitor can show sign-in
     // even if this allowance has no last numeric value.
     bool announceAuthentication{false};
@@ -67,7 +69,11 @@ struct RgbColor {
                                             bool alreadyTried);
 [[nodiscard]] std::optional<std::string> extractAuthorizationCode(std::string_view text);
 [[nodiscard]] RgbColor statusColor(double remainingFraction);
-[[nodiscard]] RgbColor applyUsageActivity(RgbColor color, bool drawingDown);
+inline constexpr std::chrono::seconds kUsageActivityFade{60 * 60};
+
+// 1 right after a drawdown, easing to 0 across kUsageActivityFade.
+[[nodiscard]] double usageActivityBrightness(std::optional<TimePoint> lastDrawdownAt, TimePoint now);
+[[nodiscard]] RgbColor applyUsageActivity(RgbColor color, double activity);
 [[nodiscard]] bool usageDrewDownSince(const Metric& previous, const Metric& current);
 [[nodiscard]] std::string_view metricKindName(MetricKind kind);
 [[nodiscard]] std::string_view metricStateName(MetricState state);
