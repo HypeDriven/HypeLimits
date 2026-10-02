@@ -896,71 +896,60 @@ bool antigravityCliTokenPath(const std::wstring& path);
 AuthMaterial loadCliAuth(std::wstring_view id);
 std::optional<std::int64_t> accessTokenExpiryMs(const AuthMaterial& auth);
 
+// Background sync only imports. A CLI login the user made is never overwritten from here: CLI files are written
+// only to pass on a refresh of the file's own token (propagateRefreshToCli) or after an explicit sign-in or account
+// selection (applyAccountToCli). Writing a "newer looking" stored copy is how a stale session replaced fresh logins.
 void syncProviderTokens(std::wstring_view id) {
-    if (!backgroundSyncAllowed(id)) return;
-    if (managedAccounts(id)) {
-        // Explicit selection authorizes ongoing write-back for that account.
-        if (readDword((accountSetting(id) + L".SelectionSync").c_str(), 0)) {
-            // Only push a stored token that is still valid and newer than the CLI's; never overwrite a fresh CLI
-            // login (or a CLI-side refresh) with an older copy, which signs the CLI out.
-            auto stored = loadStoredAuth(id);
-            const auto cli = loadCliAuth(id);
-            const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
-            const auto storedExpiry = accessTokenExpiryMs(stored);
-            const bool storedValid = !stored.token.empty() && (!storedExpiry || *storedExpiry > nowMs);
-            const bool cliMissing = cli.token.empty() && cli.refreshToken.empty();
-            if (storedValid && (cliMissing || pickLatestValidToken(recordFromAuth(stored), recordFromAuth(cli), nowMs) == TokenPick::Left)) {
-                const bool ok = applyAccountToCli(id, stored);
-                writeDword((accountSetting(id) + L".SyncFailed").c_str(), ok ? 0 : 1);
-            }
-            SecureZeroMemory(stored.token.data(), stored.token.size());
-            SecureZeroMemory(stored.refreshToken.data(), stored.refreshToken.size());
-        }
-        return;
-    }
-    if (!cliTokenSyncEnabled()) return;
+    if (!backgroundSyncAllowed(id) || !cliTokenSyncEnabled()) return;
+    // Managed accounts follow the selected CLI token through loadAuth and adoptNewerCliToken.
+    if (managedAccounts(id)) return;
     const auto format = cliFormatForProvider(utf8(id));
     if (!format) return;
     const auto paths = tokenSyncWritePaths(id);
     if (paths.empty()) return;
-    std::vector<std::string> bodies(paths.size());
-    std::vector<TokenRecord> records;
-    records.reserve(paths.size() + 1);
-    const TokenRecord stored = recordFromAuth(loadStoredAuth(id));
-    records.push_back(stored);
-    for (std::size_t i = 0; i < paths.size(); ++i) {
-        if (auto body = readUtf8File(paths[i])) bodies[i] = std::move(*body);
-        records.push_back(parseCliTokenRecord(*format, bodies[i]));
-    }
     const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
-    std::optional<TokenRecord> agyWinner;
-    if (id == L"antigravity") {
-        for (std::size_t i = 0; i < paths.size(); ++i) {
-            if (!antigravityCliTokenPath(paths[i]) || !tokenRecordUsable(records[i + 1], nowMs)) continue;
-            if (!agyWinner || pickLatestValidToken(*agyWinner, records[i + 1], nowMs) == TokenPick::Right) agyWinner = records[i + 1];
+    std::optional<TokenRecord> best;
+    bool bestIsAgy = false;
+    for (const auto& path : paths) {
+        auto body = readUtf8File(path);
+        if (!body) continue;
+        auto record = parseCliTokenRecord(*format, *body);
+        SecureZeroMemory(body->data(), body->size());
+        if (!tokenRecordUsable(record, nowMs)) continue;
+        // A Gemini CLI oauth_creds.json expiry can outrank agy even though that login cannot read Antigravity quota.
+        const bool agy = id == L"antigravity" && antigravityCliTokenPath(path);
+        if (bestIsAgy && !agy) continue;
+        if (!best || (agy && !bestIsAgy) || pickLatestValidToken(*best, record, nowMs) == TokenPick::Right) {
+            best = std::move(record);
+            bestIsAgy = agy;
         }
     }
-    const TokenRecord winner = agyWinner ? *agyWinner : records[pickLatestValidTokenIndex(records, nowMs)];
-    bool writeCli = false;
-    for (std::size_t i = 0; i < paths.size(); ++i) {
-        if (pickLatestValidToken(records[i + 1], winner, nowMs) != TokenPick::Tie
-            || GetFileAttributesW(paths[i].c_str()) == INVALID_FILE_ATTRIBUTES) {
-            writeCli = true;
-            break;
+    if (!best) return;
+    const TokenRecord stored = recordFromAuth(loadStoredAuth(id));
+    if (stored.accessToken == best->accessToken && stored.refreshToken == best->refreshToken) return;
+    if (!tokenRecordUsable(stored, nowMs) || bestIsAgy || pickLatestValidToken(*best, stored, nowMs) == TokenPick::Left) {
+        saveAuth(id, authFromRecord(*best));
+    }
+}
+
+// After HypeLimits rotates a refresh token, update exactly the CLI files that held the consumed token so their
+// CLI stays signed in. Files holding any other login are left alone, and missing files are not created.
+void propagateRefreshToCli(std::wstring_view id, const std::string& consumedRefreshToken, const AuthMaterial& refreshed) {
+    if (consumedRefreshToken.empty()) return;
+    const auto format = cliFormatForProvider(utf8(id));
+    if (!format) return;
+    for (const auto& path : tokenSyncWritePaths(id)) {
+        auto body = readUtf8File(path);
+        if (!body) continue;
+        auto record = parseCliTokenRecord(*format, *body);
+        if (record.refreshToken == consumedRefreshToken) {
+            auto merged = mergeCliCredentialJson(*format, *body, recordFromAuth(refreshed));
+            writeUtf8FileAtomic(path, merged);
+            SecureZeroMemory(merged.data(), merged.size());
         }
+        SecureZeroMemory(record.refreshToken.data(), record.refreshToken.size());
+        SecureZeroMemory(body->data(), body->size());
     }
-    if (pickLatestValidToken(stored, winner, nowMs) == TokenPick::Tie && !writeCli) {
-        for (auto& body : bodies) SecureZeroMemory(body.data(), body.size());
-        return;
-    }
-    saveAuth(id, authFromRecord(winner));
-    if (writeCli || pickLatestValidToken(stored, winner, nowMs) != TokenPick::Tie) {
-        for (std::size_t i = 0; i < paths.size(); ++i) {
-            const std::string merged = mergeCliCredentialJson(*format, bodies[i], winner);
-            writeUtf8FileAtomic(paths[i], merged);
-        }
-    }
-    for (auto& body : bodies) SecureZeroMemory(body.data(), body.size());
 }
 
 void syncAllProviderTokens() {
@@ -1403,10 +1392,11 @@ bool refreshOAuth(std::wstring_view credentialId, AuthMaterial& auth) {
         }
         return false;
     }
+    const std::string consumedRefreshToken = auth.refreshToken;
     applyTokenResponse(auth, response.body);
     saveAuth(credentialId, auth);
-    // Only the selected account is written back to the CLI. Other slots stay in Credential Manager.
-    if (slotMarker == std::wstring_view::npos) syncProviderTokens(id);
+    // Only CLI files that held the consumed token are updated; other slots and other logins are untouched.
+    if (slotMarker == std::wstring_view::npos) propagateRefreshToCli(id, consumedRefreshToken, auth);
     return true;
 }
 
@@ -2095,6 +2085,25 @@ void queryProviderUsage(std::wstring_view id, const AuthMaterial& auth, Provider
             if (mergeHttpUsage(snapshot, models, parseAntigravityModels(models.body), now, threshold, barFull, lastStatus, lastError, authenticationRejected)) gotData = true;
         }
     }
+}
+
+// Checks a login against the usage endpoint before it is adopted. An expired or rejected access token is refreshed
+// once; that rotation is passed on to the CLI files holding the token, so a working refresh also repairs the CLI.
+bool loginAccepted(std::wstring_view id, const ProviderSnapshot& shape, AuthMaterial& auth) {
+    if (auth.token.empty() && auth.refreshToken.empty()) return false;
+    ProviderSnapshot probe = shape;
+    const auto now = std::chrono::system_clock::now();
+    DWORD status = 0;
+    std::string error;
+    bool gotData = false;
+    bool rejected = false;
+    if (!auth.token.empty() && !accessTokenNeedsRefresh(auth)) {
+        queryProviderUsage(id, auth, probe, now, std::nullopt, 100.0, status, error, gotData, rejected);
+        if (!rejected) return true;
+    }
+    if (!refreshOAuth(id, auth)) return false;
+    queryProviderUsage(id, auth, probe, now, std::nullopt, 100.0, status, error, gotData, rejected);
+    return !rejected;
 }
 
 void fetchProviderUsage(std::wstring_view credentialId, AuthMaterial& auth, ProviderSnapshot& snapshot,
@@ -3337,7 +3346,6 @@ bool App::attemptAutoReauth(std::size_t index) {
     if (ok && !auth.token.empty() && saveAuth(id, auth)) {
         markOfficialLogin(id, true);
         provider.connected = true;
-        syncProviderTokens(id);
         SecureZeroMemory(auth.token.data(), auth.token.size());
         SecureZeroMemory(auth.refreshToken.data(), auth.refreshToken.size());
         return true;
@@ -3628,14 +3636,25 @@ void App::connectProvider() {
     TaskDialogIndirect(&cfg, &chosen, nullptr, nullptr);
 
     if (chosen == kUseCli) {
-        if (!saveAuth(provider.definition.id, loadCliAuth(provider.definition.id))) return;
+        AuthMaterial cli = loadCliAuth(provider.definition.id);
+        const bool accepted = loginAccepted(provider.definition.id, provider.snapshot, cli);
+        const bool saved = accepted && saveAuth(provider.definition.id, cli);
+        SecureZeroMemory(cli.token.data(), cli.token.size());
+        SecureZeroMemory(cli.refreshToken.data(), cli.refreshToken.size());
+        if (!accepted) {
+            MessageBoxW(parent, (L"The " + provider.definition.name + L" CLI login saved on this PC was rejected by the provider: "
+                L"it has been signed out or revoked, even if a CLI window that is already open still works.\n\n"
+                L"Sign in again in the CLI (for example `codex login` or `claude /login`) and choose this option again, "
+                L"or choose \"Sign in with subscription\".").c_str(), kAppName, MB_ICONWARNING);
+            return;
+        }
+        if (!saved) return;
         writeDword((accountSetting(provider.definition.id) + L".UseOfficialCli").c_str(), 1);
         provider.snapshot.enabled = true;
         writeDword((L"Provider." + provider.definition.id + L".Enabled").c_str(), 1);
         markOfficialLogin(provider.definition.id, true);
         if (selectedProvider_ < autoReauthTried_.size()) autoReauthTried_[selectedProvider_] = 0;
         provider.connected = true;
-        syncProviderTokens(provider.definition.id);
         PostMessageW(trayWindow_, WM_COMMAND, IdTrayRefresh, 0);
         return;
     }
@@ -3662,7 +3681,10 @@ void App::connectProvider() {
         markOfficialLogin(provider.definition.id, true);
         if (selectedProvider_ < autoReauthTried_.size()) autoReauthTried_[selectedProvider_] = 0;
         provider.connected = true;
-        syncProviderTokens(provider.definition.id);
+        // An explicit sign-in is the one background-free case that may replace the CLI's login.
+        if (cliTokenSyncEnabled() && allowOfficialCli(provider.definition.id)) applyAccountToCli(provider.definition.id, auth);
+        SecureZeroMemory(auth.token.data(), auth.token.size());
+        SecureZeroMemory(auth.refreshToken.data(), auth.refreshToken.size());
         PostMessageW(trayWindow_, WM_COMMAND, IdTrayRefresh, 0);
         return;
     }
@@ -3687,7 +3709,6 @@ void App::connectProvider() {
             markOfficialLogin(provider.definition.id, !pasted.refreshToken.empty());
             if (selectedProvider_ < autoReauthTried_.size()) autoReauthTried_[selectedProvider_] = 0;
             provider.connected = true;
-            syncProviderTokens(provider.definition.id);
         }
         SecureZeroMemory(secret, sizeof(secret));
         PostMessageW(trayWindow_, WM_COMMAND, IdTrayRefresh, 0);

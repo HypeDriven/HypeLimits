@@ -352,6 +352,11 @@ std::string mergeCliCredentialJson(CliCredentialFormat format, std::string_view 
         json = setStringField(std::move(json), nested->first, "access_token", winner.accessToken);
         json = setStringField(std::move(json), nested->first, "refresh_token", winner.refreshToken);
         json = setStringField(std::move(json), root, "account_id", winner.accountId);
+        // Keep last_refresh describing these tokens; a stale value makes an older login look newer than it is.
+        if (winner.observedAtMs) {
+            const auto at = std::chrono::sys_time<std::chrono::milliseconds>(std::chrono::milliseconds(*winner.observedAtMs));
+            json = setStringField(std::move(json), skipWs(json, 0), "last_refresh", std::format("{:%FT%T}Z", at));
+        }
         return json;
     }
 

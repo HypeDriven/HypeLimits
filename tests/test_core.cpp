@@ -343,6 +343,12 @@ int main() {
           "Codex write-back updates tokens.access_token and refresh_token");
     check(codexMerged.find("\"id_token\":\"\"") != std::string::npos && codexMerged.find("\"last_refresh\":\"keep-meta\"") != std::string::npos,
           "Codex account switch clears old identity while preserving unrelated metadata");
+    TokenRecord codexRefreshed = codexWinner;
+    codexRefreshed.observedAtMs = 1790945000000; // 2026-10-02T12:43:20Z
+    const auto stampedMerged = mergeCliCredentialJson(CliCredentialFormat::CodexTokens, codexExisting, codexRefreshed);
+    check(stampedMerged.find("\"last_refresh\":\"2026-10-02T12:43:20.000Z\"") != std::string::npos
+              && parseCliTokenRecord(CliCredentialFormat::CodexTokens, stampedMerged).observedAtMs == codexRefreshed.observedAtMs,
+          "Codex write-back stamps last_refresh for the tokens it writes");
 
     const char* agyExisting = R"({"token":{"access_token":"agy-old","token_type":"Bearer","refresh_token":"agy-old-r","expiry":"2026-09-28T09:50:34.322532681Z"},"auth_method":"consumer"})";
     const auto agyParsed = parseCliTokenRecord(CliCredentialFormat::GeminiOauth, agyExisting);
