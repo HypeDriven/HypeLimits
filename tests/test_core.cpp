@@ -243,6 +243,14 @@ int main() {
     TokenRecord sameB = fresh;
     sameB.expiresAtMs = nowMs + 9'000'000;
     check(pickLatestValidToken(sameA, sameB, nowMs) == TokenPick::Tie, "equal access and refresh tokens are a no-op");
+
+    check(cliLoginMayRecoverSlot("acct-2", "acct-2", true, false, false), "matching identity recovers an unselected slot");
+    check(!cliLoginMayRecoverSlot("acct-2", "acct-1", true, true, false), "a different account never recovers a known slot");
+    check(!cliLoginMayRecoverSlot("acct-2", "", true, true, false), "an unidentified login never recovers a known slot");
+    check(cliLoginMayRecoverSlot("", "acct-1", false, true, false), "single-account providers adopt any live CLI login");
+    check(cliLoginMayRecoverSlot("", "acct-1", true, true, false), "selected unidentified slot adopts the CLI login");
+    check(!cliLoginMayRecoverSlot("", "acct-1", true, false, false), "unselected unidentified slot is never guessed");
+    check(!cliLoginMayRecoverSlot("", "acct-1", true, true, true), "a login owned by another slot is not adopted");
     TokenRecord codexLike;
     codexLike.accessToken = "cli-codex-access";
     codexLike.refreshToken = "cli-codex-refresh";

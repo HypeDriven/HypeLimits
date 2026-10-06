@@ -95,6 +95,9 @@ constexpr int kMonitorClickSlop = 4;
 constexpr COLORREF kAuthRowBackground = RGB(118, 58, 14);
 constexpr COLORREF kAuthRowText = RGB(255, 196, 96);
 constexpr COLORREF kAuthRowTrack = RGB(160, 88, 28);
+constexpr COLORREF kMonitorBackground = RGB(31, 33, 39);
+// Accounts that are neither selected nor drawing down render at half strength.
+constexpr double kIdleAccountDim = 0.5;
 
 enum ControlId {
     IdTab = 100,
@@ -199,6 +202,27 @@ void writeQword(const wchar_t* name, ULONGLONG value) {
     }
 }
 
+std::wstring readString(const wchar_t* name) {
+    DWORD size = 0;
+    if (RegGetValueW(HKEY_CURRENT_USER, kRegistryKey, name, RRF_RT_REG_SZ, nullptr, nullptr, &size) != ERROR_SUCCESS
+        || size < sizeof(wchar_t)) {
+        return {};
+    }
+    std::wstring value(size / sizeof(wchar_t), L'\0');
+    if (RegGetValueW(HKEY_CURRENT_USER, kRegistryKey, name, RRF_RT_REG_SZ, nullptr, value.data(), &size) != ERROR_SUCCESS) return {};
+    if (const auto n = value.find(L'\0'); n != std::wstring::npos) value.resize(n);
+    return value;
+}
+
+void writeString(const wchar_t* name, const std::wstring& value) {
+    HKEY key{};
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, kRegistryKey, 0, nullptr, 0, KEY_SET_VALUE, nullptr, &key, nullptr) == ERROR_SUCCESS) {
+        RegSetValueExW(key, name, 0, REG_SZ, reinterpret_cast<const BYTE*>(value.c_str()),
+                       static_cast<DWORD>((value.size() + 1) * sizeof(wchar_t)));
+        RegCloseKey(key);
+    }
+}
+
 void deleteSetting(const wchar_t* name) {
     HKEY key{};
     if (RegOpenKeyExW(HKEY_CURRENT_USER, kRegistryKey, 0, KEY_SET_VALUE, &key) == ERROR_SUCCESS) {
@@ -287,6 +311,10 @@ std::wstring accountSetting(std::wstring_view id) {
     const DWORD slot = activeAccount(id);
     return L"Provider." + std::wstring(id) + (slot ? L".Account." + std::to_wstring(slot) : L"");
 }
+std::wstring accountSettingFor(std::wstring_view id, DWORD slot) {
+    return L"Provider." + std::wstring(id) + (slot ? L".Account." + std::to_wstring(slot) : L"");
+}
+
 bool managedAccounts(std::wstring_view id) {
     return readDword((L"Provider." + std::wstring(id) + L".ManagedAccounts").c_str(), 0) != 0;
 }
@@ -2006,6 +2034,86 @@ bool accessTokenNeedsRefresh(const AuthMaterial& auth) {
     return *expiry <= now;
 }
 
+// Stable account identity: the account id a token carries (Codex), else the Claude profile account uuid.
+// Empty when unknown. Lookups are cached per access token so a rejected slot does not re-query every poll.
+std::string credentialIdentity(std::wstring_view id, const AuthMaterial& auth) {
+    if (!auth.accountId.empty()) return auth.accountId;
+    if (id != L"anthropic" || auth.token.empty()) return {};
+    static std::map<std::size_t, std::string> cache;
+    static std::mutex cacheMutex;
+    const std::size_t key = std::hash<std::string>{}(auth.token);
+    {
+        std::lock_guard lock(cacheMutex);
+        if (const auto found = cache.find(key); found != cache.end()) return found->second;
+    }
+    const auto response = httpsGet(L"api.anthropic.com", L"/api/oauth/profile", auth.token,
+                                   L"anthropic-beta: oauth-2025-04-20\r\nanthropic-version: 2023-06-01\r\n");
+    if (response.status != 200) return {};
+    const auto account = response.body.find("\"account\"");
+    if (account == std::string::npos) return {};
+    std::string identity = jsonString(response.body, "uuid", account).value_or(std::string{});
+    std::lock_guard lock(cacheMutex);
+    if (cache.size() > 64) cache.clear();
+    cache[key] = identity;
+    return identity;
+}
+
+std::wstring slotIdentitySetting(std::wstring_view id, DWORD slot) {
+    return accountSettingFor(id, slot) + L".Identity";
+}
+
+void rememberSlotIdentity(std::wstring_view id, DWORD slot, const AuthMaterial& auth) {
+    if (!readString(slotIdentitySetting(id, slot).c_str()).empty()) return;
+    const auto identity = credentialIdentity(id, auth);
+    if (!identity.empty()) writeString(slotIdentitySetting(id, slot).c_str(), wide(identity));
+}
+
+DWORD credentialSlot(std::wstring_view credentialId, std::wstring_view id) {
+    const auto marker = credentialId.find(L"/account-");
+    if (marker == std::wstring_view::npos) return activeAccount(id);
+    return static_cast<DWORD>(std::wcstoul(std::wstring(credentialId.substr(marker + 9)).c_str(), nullptr, 10));
+}
+
+bool cliLoginMatchesSlot(std::wstring_view id, DWORD slot, const AuthMaterial& candidate) {
+    const std::string identity = credentialIdentity(id, candidate);
+    bool ownedByOther = false;
+    if (!identity.empty()) {
+        const DWORD count = std::min<DWORD>(readDword((L"Provider." + std::wstring(id) + L".AccountCount").c_str(), 1), 100);
+        for (DWORD other = 0; other < count && !ownedByOther; ++other) {
+            ownedByOther = other != slot && utf8(readString(slotIdentitySetting(id, other).c_str())) == identity;
+        }
+    }
+    return cliLoginMayRecoverSlot(utf8(readString(slotIdentitySetting(id, slot).c_str())), identity,
+                                  managedAccounts(id), slot == activeAccount(id), ownedByOther);
+}
+
+// Every CLI login on this PC (Windows and synced WSL homes) whose access token is still valid, newest first.
+// Only unexpired access tokens are offered, so recovery never rotates a CLI's refresh token.
+std::vector<AuthMaterial> usableCliLogins(std::wstring_view id, const AuthMaterial& current) {
+    std::vector<AuthMaterial> logins;
+    const auto format = cliFormatForProvider(utf8(id));
+    if (!format) return logins;
+    for (const auto& path : allCliReadPaths(id)) {
+        auto json = readUtf8File(path);
+        if (!json) continue;
+        AuthMaterial login = authFromRecord(parseCliTokenRecord(*format, *json));
+        SecureZeroMemory(json->data(), json->size());
+        const bool duplicate = login.token == current.token
+            || std::ranges::any_of(logins, [&](const AuthMaterial& seen) { return seen.token == login.token; });
+        if (login.token.empty() || duplicate || accessTokenNeedsRefresh(login)) {
+            SecureZeroMemory(login.token.data(), login.token.size());
+            SecureZeroMemory(login.refreshToken.data(), login.refreshToken.size());
+            continue;
+        }
+        login.antigravityCli = id == L"antigravity" && antigravityCliTokenPath(path);
+        logins.push_back(std::move(login));
+    }
+    std::ranges::stable_sort(logins, [](const AuthMaterial& left, const AuthMaterial& right) {
+        return left.expiresAtMs.value_or(0) > right.expiresAtMs.value_or(0);
+    });
+    return logins;
+}
+
 // The CLI may have refreshed since this credential was loaded. Adopt its unexpired token instead of rotating
 // the shared refresh token a second time.
 bool adoptNewerCliToken(std::wstring_view id, AuthMaterial& auth) {
@@ -2014,7 +2122,8 @@ bool adoptNewerCliToken(std::wstring_view id, AuthMaterial& auth) {
     if (managedAccounts(id) && !readDword((accountSetting(id) + L".SelectionSync").c_str(), 0)) return false;
     AuthMaterial cli = loadCliAuth(id);
     const bool usable = !cli.token.empty() && (cli.token != auth.token || cli.refreshToken != auth.refreshToken)
-        && !accessTokenNeedsRefresh(cli) && (cli.expiresAtMs || accessTokenExpiryMs(cli));
+        && !accessTokenNeedsRefresh(cli) && (cli.expiresAtMs || accessTokenExpiryMs(cli))
+        && (!managedAccounts(id) || cliLoginMatchesSlot(id, activeAccount(id), cli));
     if (usable) {
         auth = cli;
         saveAuth(id, auth);
@@ -2158,6 +2267,25 @@ void fetchProviderUsage(std::wstring_view credentialId, AuthMaterial& auth, Prov
             if (!authenticationRejected) break;
         }
     }
+    const DWORD slot = credentialSlot(credentialId, id);
+    if (authenticationRejected && readDword((accountSettingFor(id, slot) + L".UseOfficialCli").c_str(), 1) != 0) {
+        // The saved login is dead. Recover from any live CLI login for the same account, e.g. Claude Code in WSL.
+        for (auto& login : usableCliLogins(id, auth)) {
+            if (authenticationRejected && cliLoginMatchesSlot(id, slot, login)) {
+                for (auto& metric : snapshot.metrics) {
+                    if (metricFetchable(id, metric.kind) && metric.state != MetricState::Current) metric.state = MetricState::Refreshing;
+                }
+                queryProviderUsage(id, login, snapshot, now, threshold, barFull, lastStatus, lastError, gotData, authenticationRejected);
+                if (!authenticationRejected) {
+                    saveAuth(credentialId, login);
+                    auth = login;
+                }
+            }
+            SecureZeroMemory(login.token.data(), login.token.size());
+            SecureZeroMemory(login.refreshToken.data(), login.refreshToken.size());
+        }
+    }
+    if (gotData && !authenticationRejected) rememberSlotIdentity(id, slot, auth);
     finishRefresh(snapshot, gotData, authenticationRejected, lastStatus, lastError);
 }
 
@@ -2246,8 +2374,9 @@ private:
     [[nodiscard]] POINT toLogical(POINT client) const;
     enum class ResizeEdge { None, Right, Bottom, Corner };
     [[nodiscard]] ResizeEdge resizeEdgeAt(POINT client) const;
-    void refresh(bool queueIfBusy = false);
+    bool refresh(bool queueIfBusy = false);
     void scheduleNextPoll(bool failed);
+    void armPollTimer();
     void connectProvider();
     void addAccount();
     void showAccountMenu(std::size_t index, POINT screen);
@@ -2386,10 +2515,6 @@ LRESULT CALLBACK App::trayProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lP
     }
     if (auto* self = appFrom(hwnd)) return self->onTray(hwnd, message, wParam, lParam);
     return DefWindowProcW(hwnd, message, wParam, lParam);
-}
-
-std::wstring accountSettingFor(std::wstring_view id, DWORD slot) {
-    return L"Provider." + std::wstring(id) + (slot ? L".Account." + std::to_wstring(slot) : L"");
 }
 
 std::vector<DWORD> listAccountSlots(std::wstring_view id) {
@@ -3083,7 +3208,7 @@ void App::renderMonitorBitmap() {
     const auto oldFont = SelectObject(mem, drawFont);
 
     RECT full{0, 0, bmpW, bmpH};
-    HBRUSH background = CreateSolidBrush(RGB(31, 33, 39));
+    HBRUSH background = CreateSolidBrush(kMonitorBackground);
     FillRect(mem, &full, background);
     DeleteObject(background);
     SetBkMode(mem, TRANSPARENT);
@@ -3100,6 +3225,7 @@ void App::renderMonitorBitmap() {
     for (std::size_t providerIndex = 0; providerIndex < providers_.size(); ++providerIndex) {
         const auto& provider = providers_[providerIndex];
         const auto rows = monitorRowsFor(provider);
+        const DWORD selectedSlot = activeAccount(provider.definition.id);
         const bool flashing = providerIndex < rowFlashUntil_.size() && rowFlashUntil_[providerIndex] > nowTick;
         for (const auto& account : rows) {
         if (!monitorIncludesProvider(account.snapshot)) continue;
@@ -3111,6 +3237,8 @@ void App::renderMonitorBitmap() {
             if (!metric.visibleOnMonitor()) continue;
             activity = std::max(activity, usageActivityBrightness(metric.lastDrawdownAt, now));
         }
+        const bool idle = !flashing && !authFailed && account.slot != selectedSlot && activity <= 0.0;
+        auto shade = [idle](COLORREF color) { return idle ? lerpColor(color, kMonitorBackground, kIdleAccountDim) : color; };
         int rowBottom = y + 20;
         int visibleBars = 0;
         for (const auto& metric : account.snapshot.metrics) {
@@ -3131,7 +3259,7 @@ void App::renderMonitorBitmap() {
             DeleteObject(tint);
             SetTextColor(mem, kAuthRowText);
         } else {
-            SetTextColor(mem, lerpColor(RGB(148, 152, 160), RGB(248, 250, 252), activity));
+            SetTextColor(mem, shade(lerpColor(RGB(148, 152, 160), RGB(248, 250, 252), activity)));
         }
         const std::wstring rowLabel = monitorRowLabel(provider, account, account.snapshot);
         RECT nameRect = scaled({10, y, logicalWidth_ - 10, y + 20});
@@ -3145,13 +3273,13 @@ void App::renderMonitorBitmap() {
             RECT labelRect = scaled({12, y - 3, 28, y + 12});
             DrawTextW(mem, label, -1, &labelRect, DT_SINGLELINE | DT_NOPREFIX | DT_NOCLIP);
             RECT bar = scaled({30, y, logicalWidth_ - 12, y + 6});
-            HBRUSH track = CreateSolidBrush(flashing ? kResetRowTrack : (authFailed ? kAuthRowTrack : lerpColor(RGB(46, 48, 56), RGB(78, 82, 94), activity)));
+            HBRUSH track = CreateSolidBrush(flashing ? kResetRowTrack : (authFailed ? kAuthRowTrack : shade(lerpColor(RGB(46, 48, 56), RGB(78, 82, 94), activity))));
             FillRect(mem, &bar, track);
             DeleteObject(track);
             if (const auto fraction = metric.remainingFraction()) {
                 RECT fill = bar;
                 fill.right = fill.left + static_cast<LONG>((fill.right - fill.left) * *fraction);
-                HBRUSH color = CreateSolidBrush(flashing ? kResetRowFill : (authFailed ? kAuthRowText : remainingColor(*fraction, activity)));
+                HBRUSH color = CreateSolidBrush(flashing ? kResetRowFill : (authFailed ? kAuthRowText : shade(remainingColor(*fraction, activity))));
                 FillRect(mem, &fill, color);
                 DeleteObject(color);
             }
@@ -3238,12 +3366,13 @@ struct RefreshResult {
     ProviderSnapshot snapshot;
 };
 
-void App::refresh(bool queueIfBusy) {
-    if (signInInProgress_) return;
+// Returns false when no refresh is or will be in flight, so the caller must keep the poll timer armed itself.
+bool App::refresh(bool queueIfBusy) {
+    if (signInInProgress_) return false;
     if (refreshing_.exchange(true)) {
         // A reconnect during an in-flight refresh would otherwise keep the old rejected-credential result on screen.
         if (queueIfBusy) refreshQueued_ = true;
-        return;
+        return true;
     }
     lastRefreshTick_ = GetTickCount64();
     for (auto& provider : providers_) {
@@ -3301,10 +3430,16 @@ void App::refresh(bool queueIfBusy) {
         auto* completed = new std::vector<RefreshResult>(std::move(requests));
         if (!PostMessageW(trayWindow_, kRefreshCompleteMessage, 0, reinterpret_cast<LPARAM>(completed))) delete completed;
     });
+    return true;
 }
 
 void App::scheduleNextPoll(bool failed) {
     failureStreak_ = failed ? std::min(failureStreak_ + 1, 5U) : 0U;
+    armPollTimer();
+}
+
+// The poll timer is one-shot. Every path that kills it must re-arm it, or polling silently stops for good.
+void App::armPollTimer() {
     const ULONGLONG base = static_cast<ULONGLONG>(std::clamp<DWORD>(readDword(L"PollingMinutes", 5), 1, 1440)) * 60000ULL;
     const ULONGLONG multiplier = 1ULL << failureStreak_;
     const ULONGLONG jitter = GetTickCount64() % 5001ULL;
@@ -4290,8 +4425,8 @@ LRESULT App::onTray(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
             }
         }
         refreshing_ = false;
-        if (refreshQueued_) { refreshQueued_ = false; refresh(); return 0; }
-        if (rotateAccounts()) { refresh(); return 0; }
+        if (refreshQueued_) { refreshQueued_ = false; if (!refresh()) armPollTimer(); return 0; }
+        if (rotateAccounts()) { if (!refresh()) armPollTimer(); return 0; }
         for (std::size_t index = 0; index < providers_.size(); ++index) {
             if (index < autoReauthTried_.size()
                 && !providerAuthenticationFailed(providers_[index].snapshot)
@@ -4339,8 +4474,8 @@ LRESULT App::onTray(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
     case WM_TIMER:
         if (wParam == kPollTimer) {
             KillTimer(hwnd, kPollTimer);
-            if (!autoReauthBusy_) refresh();
-            else scheduleNextPoll(true);
+            // A sign-in or re-auth can own the UI when the poll fires; retry later instead of dropping the poll.
+            if (autoReauthBusy_ || !refresh()) armPollTimer();
         } else if (wParam == kFlashTimer) {
             KillTimer(hwnd, kFlashTimer);
             tickRowFlashes();

@@ -217,6 +217,13 @@ bool sameCredentialAccount(const TokenRecord& left, const TokenRecord& right) {
         (!left.accessToken.empty() && left.accessToken == right.accessToken);
 }
 
+bool cliLoginMayRecoverSlot(std::string_view slotIdentity, std::string_view loginIdentity, bool managed,
+                            bool selectedSlot, bool ownedByOtherSlot) {
+    if (!slotIdentity.empty()) return slotIdentity == loginIdentity;
+    if (!managed) return true;
+    return selectedSlot && !ownedByOtherSlot;
+}
+
 bool tokenRecordUsable(const TokenRecord& record, std::int64_t nowMs) {
     if (record.accessToken.empty() && record.refreshToken.empty()) return false;
     if (record.expiresAtMs && *record.expiresAtMs <= nowMs && record.refreshToken.empty()) return false;
