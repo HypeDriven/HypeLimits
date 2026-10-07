@@ -64,6 +64,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <utility>
 #include <vector>
 
 using namespace hypelimits;
@@ -147,6 +148,10 @@ struct Provider {
     ProviderSnapshot snapshot;
     std::vector<MonitorAccount> monitorAccounts;
     bool connected{false};
+    // Backoff is per provider, so one broken login cannot slow polling for every other account.
+    unsigned int failureStreak{0};
+    ULONGLONG nextPollTick{0};
+    bool polling{false};
 };
 
 struct MetricHit {
@@ -2374,8 +2379,7 @@ private:
     [[nodiscard]] POINT toLogical(POINT client) const;
     enum class ResizeEdge { None, Right, Bottom, Corner };
     [[nodiscard]] ResizeEdge resizeEdgeAt(POINT client) const;
-    bool refresh(bool queueIfBusy = false);
-    void scheduleNextPoll(bool failed);
+    bool refresh(bool queueIfBusy = false, bool scheduled = false);
     void armPollTimer();
     void connectProvider();
     void addAccount();
@@ -2471,7 +2475,6 @@ private:
     std::atomic_bool refreshing_{false};
     bool refreshQueued_{false};
     ULONGLONG lastRefreshTick_{0};
-    unsigned int failureStreak_{0};
     std::vector<char> autoReauthTried_;
     std::vector<std::size_t> autoReauthQueue_;
     bool autoReauthBusy_{false};
@@ -2741,7 +2744,7 @@ bool App::initialize(HINSTANCE instance) {
     for (auto& provider : providers_) provider.connected = hasAuth(provider.definition.id);
 
     updateAll();
-    scheduleNextPoll(false);
+    armPollTimer();
     refresh();
 
     RECT monitorRect{};
@@ -3367,16 +3370,23 @@ struct RefreshResult {
 };
 
 // Returns false when no refresh is or will be in flight, so the caller must keep the poll timer armed itself.
-bool App::refresh(bool queueIfBusy) {
+bool App::refresh(bool queueIfBusy, bool scheduled) {
     if (signInInProgress_) return false;
     if (refreshing_.exchange(true)) {
         // A reconnect during an in-flight refresh would otherwise keep the old rejected-credential result on screen.
         if (queueIfBusy) refreshQueued_ = true;
         return true;
     }
-    lastRefreshTick_ = GetTickCount64();
+    const ULONGLONG nowTick = GetTickCount64();
+    // A scheduled poll skips providers that are still backing off; every other trigger refreshes everything.
+    for (auto& provider : providers_) provider.polling = provider.snapshot.enabled && (!scheduled || provider.nextPollTick <= nowTick);
+    if (scheduled && std::ranges::none_of(providers_, &Provider::polling)) {
+        refreshing_ = false;
+        return false;
+    }
+    lastRefreshTick_ = nowTick;
     for (auto& provider : providers_) {
-        if (!provider.snapshot.enabled || !provider.connected) continue;
+        if (!provider.polling || !provider.connected) continue;
         for (auto& metric : provider.snapshot.metrics) {
             if (metricFetchable(provider.definition.id, metric.kind)) metric.state = MetricState::Refreshing;
         }
@@ -3391,7 +3401,7 @@ bool App::refresh(bool queueIfBusy) {
     std::vector<RefreshResult> requests;
     for (std::size_t index = 0; index < providers_.size(); ++index) {
         auto& provider = providers_[index];
-        if (!provider.snapshot.enabled) continue;
+        if (!provider.polling) continue;
         if (provider.monitorAccounts.empty()) seedMonitorAccounts(provider);
         const DWORD active = activeAccount(provider.definition.id);
         const std::wstring prefix = L"Provider." + provider.definition.id;
@@ -3433,17 +3443,15 @@ bool App::refresh(bool queueIfBusy) {
     return true;
 }
 
-void App::scheduleNextPoll(bool failed) {
-    failureStreak_ = failed ? std::min(failureStreak_ + 1, 5U) : 0U;
-    armPollTimer();
+ULONGLONG pollIntervalMs() {
+    return static_cast<ULONGLONG>(std::clamp<DWORD>(readDword(L"PollingMinutes", 5), 1, 1440)) * 60000ULL;
 }
 
 // The poll timer is one-shot. Every path that kills it must re-arm it, or polling silently stops for good.
+// It always fires at the base interval; failing providers back off individually (see refresh()).
 void App::armPollTimer() {
-    const ULONGLONG base = static_cast<ULONGLONG>(std::clamp<DWORD>(readDword(L"PollingMinutes", 5), 1, 1440)) * 60000ULL;
-    const ULONGLONG multiplier = 1ULL << failureStreak_;
     const ULONGLONG jitter = GetTickCount64() % 5001ULL;
-    SetTimer(trayWindow_, kPollTimer, static_cast<UINT>(std::min<ULONGLONG>(base * multiplier + jitter, 0xFFFFFFFEULL)), nullptr);
+    SetTimer(trayWindow_, kPollTimer, static_cast<UINT>(std::min<ULONGLONG>(pollIntervalMs() + jitter, 0xFFFFFFFEULL)), nullptr);
 }
 
 void App::reloadCliConnections() {
@@ -3616,9 +3624,20 @@ bool App::selectAccount(std::size_t index, DWORD slot, bool interactive) {
     writeDword((accountSetting(id) + L".SelectionSync").c_str(), 1);
     writeDword((accountSetting(id) + L".SyncFailed").c_str(), 0);
     provider.connected = true;
-    provider.snapshot.lastSuccessfulRefresh.reset();
-    for (auto& metric : provider.snapshot.metrics) metric = initialMetric(id, metric.kind);
+    // Keep the newly selected account's last values and drawdown time, so the very next poll can already show it
+    // drawing down instead of spending a poll on a fresh baseline.
+    const auto known = std::ranges::find_if(provider.monitorAccounts, [slot](const MonitorAccount& row) { return row.slot == slot; });
+    if (known != provider.monitorAccounts.end()) {
+        const bool enabled = provider.snapshot.enabled;
+        provider.snapshot = known->snapshot;
+        provider.snapshot.enabled = enabled;
+    } else {
+        provider.snapshot.lastSuccessfulRefresh.reset();
+        for (auto& metric : provider.snapshot.metrics) metric = initialMetric(id, metric.kind);
+    }
     provider.snapshot.id = utf8(slot ? accountKey(id, slot) : id);
+    provider.failureStreak = 0;
+    provider.nextPollTick = 0;
     seedMonitorAccounts(provider);
     if (index < autoReauthTried_.size()) autoReauthTried_[index] = 0;
     updateAll();
@@ -4318,7 +4337,7 @@ LRESULT App::onOptions(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
                 wchar_t value[16]{}; GetWindowTextW(interval_, value, static_cast<int>(std::size(value)));
                 const DWORD minutes = std::clamp<DWORD>(wcstoul(value, nullptr, 10), 1, 1440);
                 writeDword(L"PollingMinutes", minutes);
-                scheduleNextPoll(false);
+                armPollTimer();
                 SetWindowTextW(interval_, std::to_wstring(minutes).c_str());
             }
             return 0;
@@ -4424,6 +4443,12 @@ LRESULT App::onTray(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
                 writeDword((prefix + L".Currency").c_str(), metric.currency == "CNY " ? 2 : 1);
             }
         }
+        for (auto& provider : providers_) {
+            if (!std::exchange(provider.polling, false)) continue;
+            const bool failed = provider.connected && providerPollFailed(provider.snapshot);
+            provider.failureStreak = failed ? std::min(provider.failureStreak + 1, 5U) : 0U;
+            provider.nextPollTick = lastRefreshTick_ + (pollIntervalMs() << provider.failureStreak);
+        }
         refreshing_ = false;
         if (refreshQueued_) { refreshQueued_ = false; if (!refresh()) armPollTimer(); return 0; }
         if (rotateAccounts()) { if (!refresh()) armPollTimer(); return 0; }
@@ -4436,14 +4461,7 @@ LRESULT App::onTray(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
             }
         }
         updateAll();
-        const bool failed = std::ranges::any_of(providers_, [](const Provider& provider) {
-            if (!provider.snapshot.enabled || !provider.connected) return false;
-            return std::ranges::any_of(provider.snapshot.metrics, [](const Metric& metric) {
-                return metric.state == MetricState::Error || metric.state == MetricState::Stale
-                    || metric.state == MetricState::AuthenticationRequired;
-            });
-        });
-        scheduleNextPoll(failed);
+        armPollTimer();
         queueAutoReauth();
         return 0;
     }
@@ -4475,7 +4493,7 @@ LRESULT App::onTray(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
         if (wParam == kPollTimer) {
             KillTimer(hwnd, kPollTimer);
             // A sign-in or re-auth can own the UI when the poll fires; retry later instead of dropping the poll.
-            if (autoReauthBusy_ || !refresh()) armPollTimer();
+            if (autoReauthBusy_ || !refresh(false, true)) armPollTimer();
         } else if (wParam == kFlashTimer) {
             KillTimer(hwnd, kFlashTimer);
             tickRowFlashes();

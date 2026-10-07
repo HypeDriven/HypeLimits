@@ -78,6 +78,16 @@ bool providerAuthenticationFailed(const ProviderSnapshot& provider) {
     });
 }
 
+bool providerPollFailed(const ProviderSnapshot& provider) {
+    if (std::ranges::any_of(provider.metrics, [](const Metric& metric) { return metric.state == MetricState::Current; })) {
+        return false;
+    }
+    return std::ranges::any_of(provider.metrics, [](const Metric& metric) {
+        return metric.state == MetricState::Error || metric.state == MetricState::Stale
+            || metric.state == MetricState::AuthenticationRequired;
+    });
+}
+
 bool shouldAutoReauthenticate(bool providerSupportsOfficialSignIn, bool accountUsedOfficialSignIn, bool alreadyTried) {
     return providerSupportsOfficialSignIn && accountUsedOfficialSignIn && !alreadyTried;
 }

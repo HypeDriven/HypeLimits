@@ -65,6 +65,9 @@ struct RgbColor {
 [[nodiscard]] AggregateStatus aggregateStatus(const std::vector<ProviderSnapshot>& providers);
 [[nodiscard]] bool monitorIncludesProvider(const ProviderSnapshot& provider);
 [[nodiscard]] bool providerAuthenticationFailed(const ProviderSnapshot& provider);
+// A poll failed when nothing came back current and some metric is stale, errored, or rejected. Partial results
+// (e.g. usage succeeded but credit failed) keep the normal cadence.
+[[nodiscard]] bool providerPollFailed(const ProviderSnapshot& provider);
 [[nodiscard]] bool shouldAutoReauthenticate(bool providerSupportsOfficialSignIn, bool accountUsedOfficialSignIn,
                                             bool alreadyTried);
 [[nodiscard]] std::optional<std::string> extractAuthorizationCode(std::string_view text);

@@ -92,6 +92,14 @@ int main() {
     creditAfter.remaining = 32.0;
     check(usageDrewDownSince(creditBefore, creditAfter), "lower remaining credit counts as drawdown");
 
+    ProviderSnapshot polled;
+    polled.metrics = {percentage(MetricKind::Session, 10, 100), Metric{MetricKind::ApiCredit, MetricState::Stale}};
+    check(!providerPollFailed(polled), "partial results keep the normal poll cadence");
+    polled.metrics[0].state = MetricState::AuthenticationRequired;
+    check(providerPollFailed(polled), "a provider with nothing current backs off");
+    polled.metrics = {Metric{MetricKind::Session, MetricState::Unsupported}};
+    check(!providerPollFailed(polled), "unsupported-only results are not a failure");
+
     const auto moonshot = parseMoonshotBalance(R"({"code":0,"data":{"available_balance":49.58894,"cash_balance":3.0},"status":true})");
     check(moonshot && std::abs(moonshot->amount - 49.58894) < 0.000001 && moonshot->currency == "$",
           "Moonshot sanitized balance fixture parses");
