@@ -52,7 +52,7 @@ The aggregate tray status is the most exhausted currently available percentage-b
 
 The tray icon transitions continuously from bright green at 100% remaining to yellow at 50% remaining and red at 0% remaining. Unknown or disconnected status uses neutral gray. This color appears on a simple monochrome gauge-style tray glyph with adequate contrast.
 
-The tray tooltip summarizes the most constrained limit, its remaining percentage, and its reset time. Right-clicking the tray icon opens a menu containing **Show/Hide Monitor**, **Refresh now**, **Options**, and **Quit**. **Options** opens the detailed provider view described below.
+The tray tooltip summarizes the most constrained limit, its remaining percentage, and its reset time. Right-clicking the tray icon opens a menu containing **Show/Hide Monitor**, **Activity**, **Refresh now**, **Options**, and **Quit**. **Activity** opens the token history in §4.3. **Options** opens the detailed provider view described below.
 
 ### 3.3 Alerts and reset detection
 
@@ -114,6 +114,28 @@ Shared application settings cover the refresh interval, sounds, thresholds, laun
 
 After onboarding, the application starts in the tray and restores the floating monitor's saved visibility. It does not show a taskbar or dock entry unless a window is open, subject to platform conventions.
 
+### 4.3 Activity history
+
+**Activity** on the tray menu opens a window whose main graphic is a GitHub-style calendar of total token use, summed across every provider and account. The calendar is a trailing year of local calendar days: week columns, Sunday–Saturday rows, one cell per day, month labels on the week columns, and a less-to-more legend. It covers at least 365 local days through today and at most 53 weeks, aligned so each column starts on Sunday. The window states the token total for that visible year. Pointing at a day shows that day's token count and date.
+
+A day with zero tokens is an empty cell. Positive days use four increasing green levels chosen from quartiles of the positive daily totals in that year. Equal counts share a level, a higher count is never a lower level, and the busiest day is the darkest level present. The legend shows all five levels, from empty through the darkest green.
+
+The same window shows five statistics from the full stored history, not only the visible year:
+
+- Lifetime token use, as one number.
+- Peak tokens per day ever.
+- Longest task duration, shown so a person can read it.
+- Longest streak of using AI daily.
+- Current streak of using AI daily.
+
+A day counts toward a streak only when its token total is greater than zero. The longest streak is the longest run of consecutive positive local days. The current streak counts backward from today when today is positive, otherwise from yesterday, and stops at the first zero day. With no recorded use, every statistic is zero and every cell is empty.
+
+Totals count only positive increases in an absolute token `used` counter between two current observations of the same provider account and the same allowance window. The increase is added to the local calendar day of the later observation. The first observation is a baseline and adds nothing. A drop, such as a window reset, adds nothing and becomes the new baseline. Percentage, request, credit, and currency metrics add nothing. Non-current observations add nothing. Session and weekly windows for one account are not both added; when both are absolute token counts, only the longer window (weekly) counts.
+
+A task is a maximal run of positive token deltas whose successive gaps are at most twice the current refresh interval. Its duration is the last timestamp minus the first. A single delta lasts zero. The statistic is the longest such duration. This is poll granularity, not a provider-reported request timer.
+
+The history persists across restarts in the existing non-secret settings, including daily totals, positive deltas, and the last absolute token counter per provider account and window. Reloading restores those daily totals and deltas. Malformed saved data yields an empty history instead of a crash or a fabricated total. Credentials are not written into that history. Days use the machine's local calendar, not UTC.
+
 ## 5. First Run and Launch at Login
 
 On first run, prompt the user once to choose whether HypeLimits should start automatically when they log in. The prompt must offer **Enable**, **Not now**, and a way to change the choice later in Settings. Declining must not prompt again automatically.
@@ -154,7 +176,7 @@ Suggested modules:
 - `model`: normalized limits, balances, reset periods, and aggregate status.
 - `polling`: scheduling, backoff, connectivity handling, and refresh orchestration.
 - `alerts`: threshold transitions, deduplication, reset detection, and sounds.
-- `ui`: tray icon/menu, floating monitor, provider-tabbed Options window, official sign-in, and accessible status presentation. The monitor renders to an offscreen bitmap and stretches it when the user resizes width.
+- `ui`: tray icon/menu, floating monitor, activity history, provider-tabbed Options window, official sign-in, and accessible status presentation. The monitor renders to an offscreen bitmap and stretches it when the user resizes width. Activity paints the token calendar and the five statistics from the portable history.
 - `platform`: Windows Credential Manager, launch-at-login, WebView2 and installed-browser cookie/credential stores for official re-auth, plus background-class process/thread/memory/power priorities. Browser sign-in remains user-driven.
 - `persistence`: non-secret settings and minimal cached observations.
 
@@ -165,7 +187,7 @@ Networking and provider parsing run off the UI thread. Updates are delivered to 
 - Collect only information required to display allowance state.
 - Send no telemetry by default.
 - Redact authorization headers, tokens, account identifiers, and sensitive response fields from diagnostics.
-- Cache only the minimum data needed to show the last known state and deduplicate alerts. Do not log tokens, refresh tokens, WebView cookies, imported browser cookies, or other sign-in material.
+- Cache only the minimum data needed to show the last known state, deduplicate alerts, and show token activity. The activity history stores daily totals, positive token deltas, and allowance baselines. It does not store credentials. Do not log tokens, refresh tokens, WebView cookies, imported browser cookies, or other sign-in material.
 - Use atomic settings persistence and tolerate malformed or partially missing cached data.
 - Keep functioning when one or more providers fail.
 - Make provider polling independently disableable. Disconnecting or disabling a provider from Options must stop background CLI token sync for that provider until the user connects it again from Options.
@@ -179,6 +201,7 @@ Networking and provider parsing run off the UI thread. Updates are delivered to 
 - Hovering over a provider row or bar shows available usage, remaining balance, reset, refresh, and status details in a tooltip without fabricating unknown values.
 - Authentication-required provider rows on the floating monitor are tinted orange. After a silent refresh-token failure, official OAuth or device-code re-auth runs automatically by any available method. Clicking the row still opens that provider's connect flow if every automatic method fails or is cancelled.
 - Right-clicking the tray icon and choosing **Options** opens a detailed window with one tab per provider.
+- Right-clicking the tray icon and choosing **Activity** opens the token calendar and the lifetime, peak-day, longest-task, longest-streak, and current-streak statistics described in §4.3. Only absolute token increases are counted. The history reloads from non-secret settings and never stores credentials.
 - Every provider tab includes a login or connection button that opens the provider's official website and supports the safest authorized connection flow available.
 - Supported session, weekly, and topped-up fund data appear per provider without fabricating unavailable values.
 - Crossing 90% exhaustion produces exactly one warning sound per metric and reset period.
@@ -190,7 +213,7 @@ Networking and provider parsing run off the UI thread. Updates are delivered to 
 - Secrets are stored using native credential storage and never appear in logs. The Google OAuth client secret is configured in Options and is not present in the distributed binary.
 - When an official subscription login's refresh token is rejected, HypeLimits retries silent re-auth with no visible UI. If that cannot finish, the orange row stays; clicking it (or Connect) is a manual, visible official sign-in the user completes. Paste-only API-key accounts are not auto-reauthenticated this way.
 - Provider and network failures are visible, non-blocking, and do not freeze the UI.
-- Automated tests cover normalization, icon color interpolation, threshold deduplication, reset detection, stale data, adapter parsing with sanitized fixtures, and which providers and metrics appear on the floating monitor.
+- Automated tests cover normalization, icon color interpolation, threshold deduplication, reset detection, stale data, adapter parsing with sanitized fixtures, which providers and metrics appear on the floating monitor, and the token activity history (daily deltas, streaks, task duration, and the year calendar).
 
 ## 10. Implementation Status
 
@@ -202,5 +225,6 @@ Networking and provider parsing run off the UI thread. Updates are delivered to 
 - Usage retrieval implemented for every initial provider, using the same authorized endpoints as Claude Code, Codex, Grok CLI, Kimi Code, Moonshot, DeepSeek, xAI Management API, and Antigravity/Cloud Code Assist. Connect runs the official OAuth or device-code subscription login for Claude, Codex, Grok, Kimi Code, and Antigravity so session/weekly plan usage is used; access tokens refresh automatically from the stored refresh token. Claude uses the same authorize page (`claude.com/cai/oauth/authorize`), manual redirect (`platform.claude.com/oauth/code/callback`), scopes, and token endpoint (`platform.claude.com/v1/oauth/token`) as the current Claude Code CLI. Kimi Code uses the same `auth.kimi.com` device-code login as the official CLI (`/api/oauth/device_authorization` then `/api/oauth/token`); the Connect button and orange-row click open that flow at kimi.com / kimi.ai rather than only offering a pasted Moonshot API key. Automatic re-auth is silent (no visible login window). Clicking the orange row or Connect is a manual, visible official sign-in. HypeLimits does not auto-click login, MFA, or consent. After a refresh-token failure, it retries CLI reuse and imported cookies in the background, then waits on the orange row if a person is needed. One automatic round runs per failure. Paste-only API keys are not auto-reauthenticated. Antigravity in-app Google sign-in and Google token refresh require the client secret from Options. Kimi Code CLI OAuth (15-minute access tokens) is refreshed at `auth.kimi.com` using the stored refresh token. Official CLI logins can be reused, or a token/API key can be pasted. Metrics a connected endpoint does not return are marked unsupported.
 - Optional bidirectional sync of official CLI credential JSON files: first-run prompt with persisted yes/no, Options checkbox, extra-key-preserving merge, and no legacy background CLI writes when opted out; explicit account selection separately authorizes write-back. Disconnect and the per-provider show-on-monitor checkbox stop that provider's background CLI import until Connect or the checkbox is on again. Optional WSL CLI inclusion with a detected-username list and per-user checkboxes (on by default); selected WSL homes are read for tokens and written only for refresh propagation, explicit sign-in, or explicit account selection. Kimi Code CLI credentials are read from `~/.kimi-code/credentials/` and the legacy `~/.kimi/credentials/` paths. Enabling WSL sync reloads connections and refreshes usage. WSL discovery and fallback file reads use only the explicitly selected native system `wsl.exe` (including `Sysnative` under WOW64), with each command argument safely quoted and `--exec` used to avoid shell evaluation.
 - Portable core and sanitized provider-parser tests implemented; the application builds and tests with Visual Studio Build Tools.
+- Activity history is implemented. The tray **Activity** command opens a Sunday-aligned year calendar of total token use and the five statistics in §4.3. Startup loads that history from non-secret settings, and a new absolute token delta saves it back. Malformed saved data is ignored. Credentials are not stored in the history.
 
 - Multiple credential slots, Options account controls and per-provider rotation checkbox, floating-row account menu, account-isolated persistence, and explicit Windows/WSL selection sync implemented. Portable tests cover exhaustion eligibility, reset handling, account identity isolation, and Codex identity replacement. Native Windows builds and core tests pass; live sign-in, WSL write-back, and running-client reload behavior require interactive integration validation.

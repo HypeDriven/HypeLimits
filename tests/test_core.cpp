@@ -1,3 +1,4 @@
+#include "activity_history.hpp"
 #include "alert_engine.hpp"
 #include "model.hpp"
 #include "provider_parsing.hpp"
@@ -10,6 +11,7 @@
 #include <cmath>
 #include <iostream>
 #include <string>
+#include <vector>
 
 using namespace hypelimits;
 
@@ -26,6 +28,290 @@ void check(bool condition, const std::string& message) {
 Metric percentage(MetricKind kind, double used, double capacity, TimePoint reset = {}) {
     return Metric{kind, MetricState::Current, used, capacity, std::nullopt, "tokens", {},
                   TimePoint{}, reset, {}};
+}
+
+TokenObservation observation(std::string provider, std::string account, AllowanceWindow window, CounterUnit unit,
+                             double used, MetricState state, TimePoint at) {
+    return TokenObservation{std::move(provider), std::move(account), window, unit, used, state, at};
+}
+
+void recordOne(TokenHistory& history, TokenObservation sample) {
+    const TokenObservation batch[]{sample};
+    recordTokenObservations(history, batch);
+}
+
+void testActivityHistory() {
+    const CivilDay today{2026, 6, 15};
+    const auto now = timePointOnLocalDay(today, 15, 0);
+    const auto interval = std::chrono::seconds{60};
+    check(localCivilDay(now) == today, "local noon helper stays on the requested civil day");
+    check(sundayIndex(CivilDay{2026, 6, 14}) == 0, "Sunday is the first row of the calendar");
+
+    const auto at = [&](int dayOffset, int hour = 12) {
+        return timePointOnLocalDay(shiftCivilDay(today, dayOffset), hour, 0);
+    };
+
+    {
+        TokenHistory history;
+        recordOne(history, observation("anthropic", "0", AllowanceWindow::Weekly, CounterUnit::Tokens, 0, MetricState::Current, at(0, 10)));
+        recordOne(history, observation("openai", "1", AllowanceWindow::Session, CounterUnit::Tokens, 0, MetricState::Current, at(0, 10)));
+        recordOne(history, observation("anthropic", "0", AllowanceWindow::Weekly, CounterUnit::Tokens, 40, MetricState::Current, at(0, 11)));
+        recordOne(history, observation("openai", "1", AllowanceWindow::Session, CounterUnit::Tokens, 25, MetricState::Current, at(0, 11)));
+        const auto stats = activityStats(history, now, interval);
+        check(std::abs(stats.lifetimeTokens - 65.0) < 0.001, "cross-provider token deltas sum on the local day");
+        check(history.days.size() == 1 && history.days.front().day == today, "deltas land on the later observation's local day");
+        check(std::abs(stats.lifetimeTokens - history.days.front().tokens) < 0.001, "lifetime equals the sum of stored daily totals");
+        check(std::abs(stats.peakTokensPerDay - 65.0) < 0.001, "peak equals the max daily total");
+    }
+
+    {
+        TokenHistory history;
+        const TokenObservation batch[]{
+            observation("anthropic", "0", AllowanceWindow::Session, CounterUnit::Tokens, 100, MetricState::Current, at(-1, 9)),
+            observation("anthropic", "0", AllowanceWindow::Weekly, CounterUnit::Tokens, 100, MetricState::Current, at(-1, 9)),
+            observation("anthropic", "0", AllowanceWindow::Session, CounterUnit::Tokens, 180, MetricState::Current, at(-1, 10)),
+            observation("anthropic", "0", AllowanceWindow::Weekly, CounterUnit::Tokens, 180, MetricState::Current, at(-1, 10)),
+            observation("openai", "3", AllowanceWindow::Session, CounterUnit::Tokens, 0, MetricState::Current, at(-1, 9)),
+            observation("openai", "3", AllowanceWindow::Session, CounterUnit::Tokens, 15, MetricState::Current, at(-1, 10)),
+        };
+        recordTokenObservations(history, batch);
+        const auto stats = activityStats(history, now, interval);
+        check(std::abs(stats.lifetimeTokens - 95.0) < 0.001, "weekly is preferred over session so the same tokens are not doubled");
+    }
+
+    {
+        TokenHistory history;
+        const auto earlier = at(-3, 8);
+        const auto later = at(-3, 9);
+        for (const auto unit : {CounterUnit::Percent, CounterUnit::Requests, CounterUnit::Credits, CounterUnit::Currency}) {
+            recordOne(history, observation("anthropic", "0", AllowanceWindow::Weekly, unit, 10, MetricState::Current, earlier));
+            recordOne(history, observation("anthropic", "0", AllowanceWindow::Weekly, unit, 90, MetricState::Current, later));
+        }
+        check(activityStats(history, now, interval).lifetimeTokens == 0.0, "percent, request, credit, and currency counters add zero");
+        recordOne(history, observation("anthropic", "0", AllowanceWindow::Weekly, CounterUnit::Tokens, 500, MetricState::Current, earlier));
+        check(activityStats(history, now, interval).lifetimeTokens == 0.0, "the first token sample is a baseline and adds nothing");
+        check(history.deltas.empty(), "a baseline does not store a delta");
+    }
+
+    {
+        TokenHistory history;
+        recordOne(history, observation("anthropic", "1", AllowanceWindow::Weekly, CounterUnit::Tokens, 0, MetricState::Current, at(-4, 8)));
+        recordOne(history, observation("anthropic", "1", AllowanceWindow::Weekly, CounterUnit::Tokens, 100, MetricState::Current, at(-4, 9)));
+        recordOne(history, observation("anthropic", "1", AllowanceWindow::Weekly, CounterUnit::Tokens, 10, MetricState::Current, at(-4, 10)));
+        recordOne(history, observation("anthropic", "1", AllowanceWindow::Weekly, CounterUnit::Tokens, 40, MetricState::Current, at(-4, 11)));
+        const auto stats = activityStats(history, now, interval);
+        check(std::abs(stats.lifetimeTokens - 130.0) < 0.001, "a used drop does not subtract and the next rise is the delta from the new baseline");
+    }
+
+    {
+        TokenHistory history;
+        recordOne(history, observation("anthropic", "0", AllowanceWindow::Session, CounterUnit::Tokens, 5, MetricState::Stale, at(-2, 8)));
+        recordOne(history, observation("anthropic", "0", AllowanceWindow::Session, CounterUnit::Tokens, 5, MetricState::Current, at(-2, 9)));
+        recordOne(history, observation("anthropic", "0", AllowanceWindow::Session, CounterUnit::Tokens, 80, MetricState::Refreshing, at(-2, 10)));
+        check(activityStats(history, now, interval).lifetimeTokens == 0.0, "a non-current observation adds nothing");
+        recordOne(history, observation("anthropic", "0", AllowanceWindow::Session, CounterUnit::Tokens, 9, MetricState::Current, at(-2, 11)));
+        check(std::abs(activityStats(history, now, interval).lifetimeTokens - 4.0) < 0.001,
+              "a non-current reading does not move the baseline");
+    }
+
+    {
+        TokenHistory history;
+        const auto positive = [&](int offset, double usedBefore, double usedAfter) {
+            recordOne(history, observation("anthropic", "0", AllowanceWindow::Weekly, CounterUnit::Tokens, usedBefore, MetricState::Current, at(offset, 8)));
+            recordOne(history, observation("anthropic", "0", AllowanceWindow::Weekly, CounterUnit::Tokens, usedAfter, MetricState::Current, at(offset, 18)));
+        };
+        positive(-10, 0, 5);
+        positive(-9, 5, 8);
+        positive(-8, 8, 11);
+        positive(-7, 11, 14);
+        positive(-6, 14, 20);
+        positive(-2, 0, 3);
+        positive(-1, 3, 6);
+        const auto stats = activityStats(history, now, interval);
+        check(stats.longestStreakDays == 5, "a zero day breaks a streak and the longest streak is the longest positive run");
+        check(stats.currentStreakDays == 2, "the current streak keeps yesterday when today is still zero");
+        check(std::abs(stats.lifetimeTokens - 26.0) < 0.001, "lifetime equals the sum of stored daily totals");
+        check(std::abs(stats.peakTokensPerDay - 6.0) < 0.001, "peak equals the max daily total");
+    }
+
+    {
+        TokenHistory history;
+        recordOne(history, observation("openai", "0", AllowanceWindow::Session, CounterUnit::Tokens, 0, MetricState::Current, at(-4, 8)));
+        recordOne(history, observation("openai", "0", AllowanceWindow::Session, CounterUnit::Tokens, 4, MetricState::Current, at(-4, 12)));
+        const auto stats = activityStats(history, now, interval);
+        check(stats.currentStreakDays == 0, "the current streak is zero when yesterday is also zero");
+        check(stats.longestStreakDays == 1, "a single positive day is a streak of one");
+    }
+
+    {
+        TokenHistory history;
+        recordOne(history, observation("openai", "0", AllowanceWindow::Weekly, CounterUnit::Tokens, 0, MetricState::Current, at(-1, 8)));
+        recordOne(history, observation("openai", "0", AllowanceWindow::Weekly, CounterUnit::Tokens, 2, MetricState::Current, at(-1, 12)));
+        recordOne(history, observation("openai", "0", AllowanceWindow::Weekly, CounterUnit::Tokens, 2, MetricState::Current, at(0, 8)));
+        recordOne(history, observation("openai", "0", AllowanceWindow::Weekly, CounterUnit::Tokens, 9, MetricState::Current, at(0, 12)));
+        check(activityStats(history, now, interval).currentStreakDays == 2, "the current streak counts backward from today when today is positive");
+    }
+
+    {
+        const ActivityStats empty = activityStats(TokenHistory{}, now, interval);
+        check(empty.lifetimeTokens == 0.0 && empty.peakTokensPerDay == 0.0 && empty.longestTask == std::chrono::seconds::zero()
+                  && empty.longestStreakDays == 0 && empty.currentStreakDays == 0,
+              "empty history statistics are all zero");
+        const auto calendar = activityCalendar(TokenHistory{}, now);
+        int cells = 0;
+        double total = 0;
+        for (const auto& week : calendar.weeks) {
+            for (const auto& cell : week.days) {
+                if (!cell) continue;
+                ++cells;
+                total += cell->tokens;
+                check(cell->level == 0 && cell->tokens == 0.0, "empty history leaves every cell empty");
+            }
+        }
+        check(calendar.yearTokens == 0.0 && total == 0.0, "an empty year total is zero");
+        check(cells >= 365 && calendar.weeks.size() <= 53, "an empty calendar still covers the trailing year");
+    }
+
+    {
+        TokenHistory history;
+        const auto origin = at(0, 12);
+        const auto stamp = [&](int seconds) { return origin + std::chrono::seconds{seconds}; };
+        recordOne(history, observation("anthropic", "0", AllowanceWindow::Weekly, CounterUnit::Tokens, 0, MetricState::Current, stamp(0)));
+        recordOne(history, observation("anthropic", "0", AllowanceWindow::Weekly, CounterUnit::Tokens, 1, MetricState::Current, stamp(0)));
+        recordOne(history, observation("anthropic", "0", AllowanceWindow::Weekly, CounterUnit::Tokens, 2, MetricState::Current, stamp(120)));
+        recordOne(history, observation("anthropic", "0", AllowanceWindow::Weekly, CounterUnit::Tokens, 3, MetricState::Current, stamp(240)));
+        recordOne(history, observation("anthropic", "0", AllowanceWindow::Weekly, CounterUnit::Tokens, 4, MetricState::Current, stamp(361)));
+        check(activityStats(history, now, interval).longestTask == std::chrono::seconds{240},
+              "gaps at most twice the refresh interval stay one task and a longer gap splits tasks");
+        check(formatTaskDuration(std::chrono::seconds{240}) == "4m", "task duration is shown so a person can read it");
+        check(formatTaskDuration(std::chrono::seconds::zero()) == "0s", "a zero-length task reads as zero");
+
+        TokenHistory isolated;
+        recordOne(isolated, observation("anthropic", "0", AllowanceWindow::Weekly, CounterUnit::Tokens, 0, MetricState::Current, stamp(0)));
+        recordOne(isolated, observation("anthropic", "0", AllowanceWindow::Weekly, CounterUnit::Tokens, 8, MetricState::Current, stamp(0)));
+        check(activityStats(isolated, now, interval).longestTask == std::chrono::seconds::zero(), "an isolated delta has duration zero");
+        recordOne(isolated, observation("anthropic", "0", AllowanceWindow::Weekly, CounterUnit::Tokens, 9, MetricState::Current, stamp(121)));
+        check(activityStats(isolated, now, interval).longestTask == std::chrono::seconds::zero(),
+              "a gap longer than twice the refresh interval splits into zero-length tasks");
+    }
+
+    {
+        TokenHistory history;
+        recordOne(history, observation("anthropic", "0", AllowanceWindow::Weekly, CounterUnit::Tokens, 0, MetricState::Current, at(-400, 8)));
+        recordOne(history, observation("anthropic", "0", AllowanceWindow::Weekly, CounterUnit::Tokens, 70, MetricState::Current, at(-400, 12)));
+        const double amounts[] = {1, 2, 3, 4, 10, 10, 8};
+        double used = 0;
+        double inYear = 0;
+        for (int index = 0; index < 7; ++index) {
+            const double next = used + amounts[index];
+            recordOne(history, observation("anthropic", "0", AllowanceWindow::Weekly, CounterUnit::Tokens, used, MetricState::Current, at(-20 + index, 8)));
+            recordOne(history, observation("anthropic", "0", AllowanceWindow::Weekly, CounterUnit::Tokens, next, MetricState::Current, at(-20 + index, 18)));
+            used = next;
+            inYear += amounts[index];
+        }
+        const auto calendar = activityCalendar(history, now);
+        std::vector<CalendarCell> cells;
+        int labeledWeeks = 0;
+        bool sundayAligned = !calendar.weeks.empty();
+        for (std::size_t week = 0; week < calendar.weeks.size(); ++week) {
+            if (!calendar.weeks[week].monthLabel.empty()) ++labeledWeeks;
+            bool gap = false;
+            for (int row = 0; row < 7; ++row) {
+                const auto& cell = calendar.weeks[week].days[static_cast<std::size_t>(row)];
+                if (!cell) {
+                    gap = true;
+                    continue;
+                }
+                if (gap) sundayAligned = false;
+                if (sundayIndex(cell->day) != row) sundayAligned = false;
+                cells.push_back(*cell);
+            }
+        }
+        check(sundayAligned, "the calendar is Sunday-aligned");
+        check(cells.size() >= 365 && calendar.weeks.size() <= 53, "the calendar covers at least 365 local days and at most 53 weeks");
+        check(!cells.empty() && cells.back().day == today, "the calendar runs through today");
+        bool onePerDay = cells.size() >= 2;
+        for (std::size_t index = 1; index < cells.size(); ++index) {
+            if (cells[index].day != shiftCivilDay(cells[index - 1].day, 1)) onePerDay = false;
+        }
+        check(onePerDay, "the calendar has one cell per day");
+
+        bool levelsOk = true;
+        int darkest = 0;
+        double busiest = 0;
+        double ranged = 0;
+        for (const auto& cell : cells) {
+            if (cell.level < 0 || cell.level > 4) levelsOk = false;
+            if (cell.tokens <= 0.0) {
+                if (cell.level != 0) levelsOk = false;
+            } else if (cell.level < 1) {
+                levelsOk = false;
+            }
+            darkest = std::max(darkest, cell.level);
+            busiest = std::max(busiest, cell.tokens);
+            ranged += cell.tokens;
+        }
+        for (const auto& left : cells) {
+            for (const auto& right : cells) {
+                if (left.tokens > right.tokens && left.level < right.level) levelsOk = false;
+                if (left.tokens == right.tokens && left.level != right.level) levelsOk = false;
+            }
+        }
+        for (const auto& cell : cells) {
+            if (cell.tokens == busiest && busiest > 0.0 && cell.level != darkest) levelsOk = false;
+        }
+        check(levelsOk, "levels are 0-4, monotonic, and 0 only for zero tokens");
+        check(std::abs(calendar.yearTokens - ranged) < 0.001, "the year total equals the sum of days inside the range");
+        check(std::abs(calendar.yearTokens - inYear) < 0.001, "the year total leaves out older stored days");
+        check(labeledWeeks >= 8, "month labels sit on the week columns");
+        const auto stats = activityStats(history, now, interval);
+        double stored = 0;
+        double peak = 0;
+        for (const auto& day : history.days) {
+            stored += day.tokens;
+            peak = std::max(peak, day.tokens);
+        }
+        check(std::abs(stats.lifetimeTokens - stored) < 0.001, "lifetime equals the sum of stored daily totals");
+        check(std::abs(stats.peakTokensPerDay - peak) < 0.001, "peak equals the max daily total");
+    }
+
+    {
+        TokenHistory history;
+        recordOne(history, observation("anthropic", "0", AllowanceWindow::Weekly, CounterUnit::Tokens, 0, MetricState::Current, at(-2, 9)));
+        recordOne(history, observation("anthropic", "0", AllowanceWindow::Weekly, CounterUnit::Tokens, 12, MetricState::Current, at(-2, 15)));
+        recordOne(history, observation("openai", "2", AllowanceWindow::Session, CounterUnit::Tokens, 3, MetricState::Current, at(-1, 9)));
+        recordOne(history, observation("openai", "2", AllowanceWindow::Session, CounterUnit::Tokens, 8, MetricState::Current, at(-1, 11)));
+        const auto text = serializeTokenHistory(history);
+        check(text.find("sk-") == std::string::npos && text.find("Bearer") == std::string::npos && text.find("secret") == std::string::npos,
+              "credentials are not written into the history");
+        const auto restored = parseTokenHistory(text);
+        check(restored.days.size() == history.days.size(), "a round trip restores every daily total");
+        for (std::size_t index = 0; index < history.days.size(); ++index) {
+            check(restored.days[index].day == history.days[index].day, "a round trip restores the local day");
+            check(std::abs(restored.days[index].tokens - history.days[index].tokens) < 0.001, "a round trip restores the daily total");
+        }
+        check(restored.deltas.size() == history.deltas.size(), "a round trip restores every delta");
+        for (std::size_t index = 0; index < history.deltas.size(); ++index) {
+            check(restored.deltas[index].at == history.deltas[index].at, "a round trip restores the delta time");
+            check(std::abs(restored.deltas[index].tokens - history.deltas[index].tokens) < 0.001, "a round trip restores the delta size");
+        }
+        check(restored.baselines.size() == history.baselines.size(), "a round trip restores baselines");
+        auto continued = restored;
+        recordOne(continued, observation("anthropic", "0", AllowanceWindow::Weekly, CounterUnit::Tokens, 18, MetricState::Current, at(0, 12)));
+        check(std::abs(activityStats(continued, now, interval).lifetimeTokens - 23.0) < 0.001,
+              "reloaded baselines continue from the saved counter");
+
+        const auto malformed = parseTokenHistory("HLHIST1\nD 2026-06-01 50\nNOPE\n");
+        const auto malformedStats = activityStats(malformed, now, interval);
+        check(malformed.days.empty() && malformed.deltas.empty() && malformedStats.lifetimeTokens == 0.0,
+              "malformed input yields an empty history instead of a fabricated total");
+        check(parseTokenHistory("").days.empty(), "empty saved data is an empty history");
+        check(parseTokenHistory("this is not history").days.empty(), "a missing header yields an empty history");
+        check(parseTokenHistory("HLHIST1\nD 2026-99-01 4\n").days.empty(), "an impossible date yields an empty history");
+        check(parseTokenHistory("HLHIST1\nD 2026-06-01 -5\n").days.empty(), "a negative total yields an empty history");
+        check(parseTokenHistory("HLHIST1\nD 2026-06-01 5\nD 2026-06-01 9\n").days.empty(), "a duplicate day yields an empty history");
+        check(parseTokenHistory("HLHIST1\nD 2026-06-01\n").days.empty(), "truncated saved data yields an empty history");
+    }
 }
 } // namespace
 
@@ -487,6 +773,8 @@ int main() {
     check(!shouldBackgroundSyncProvider(false, true), "disabled providers do not background-sync");
     check(!shouldBackgroundSyncProvider(true, false), "disconnected providers do not background-sync until Connect");
     check(!shouldBackgroundSyncProvider(false, false), "disabled disconnected providers stay unsynced");
+
+    testActivityHistory();
 
     if (failures == 0) {
         std::cout << "All core tests passed\n";

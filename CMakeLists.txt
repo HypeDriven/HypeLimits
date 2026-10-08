@@ -12,6 +12,7 @@ add_library(hypelimits_core
     src/alert_engine.cpp
     src/provider_parsing.cpp
     src/token_sync.cpp
+    src/activity_history.cpp
 )
 target_include_directories(hypelimits_core PUBLIC src)
 target_compile_features(hypelimits_core PUBLIC cxx_std_20)

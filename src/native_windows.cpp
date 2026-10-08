@@ -1,3 +1,4 @@
+#include "activity_history.hpp"
 #include "alert_engine.hpp"
 #include "auto_reauth.hpp"
 #include "browser_cookies.hpp"
@@ -97,6 +98,17 @@ constexpr COLORREF kAuthRowBackground = RGB(118, 58, 14);
 constexpr COLORREF kAuthRowText = RGB(255, 196, 96);
 constexpr COLORREF kAuthRowTrack = RGB(160, 88, 28);
 constexpr COLORREF kMonitorBackground = RGB(31, 33, 39);
+constexpr COLORREF kActivityBackground = RGB(31, 33, 39);
+constexpr COLORREF kActivityText = RGB(232, 233, 236);
+constexpr COLORREF kActivityMuted = RGB(154, 160, 172);
+// Empty cell plus four increasing greens. The legend draws all five, less to more.
+constexpr COLORREF kActivityGreenLevels[] = {
+    RGB(22, 40, 28),
+    RGB(14, 68, 41),
+    RGB(0, 109, 50),
+    RGB(38, 166, 65),
+    RGB(57, 211, 83),
+};
 // Accounts that are neither selected nor drawing down render at half strength.
 constexpr double kIdleAccountDim = 0.5;
 
@@ -126,6 +138,7 @@ enum ControlId {
     IdTrayShow = 300,
     IdTrayRefresh,
     IdTrayOptions,
+    IdTrayActivity,
     IdTrayQuit,
     IdWslUserFirst = 500,
 };
@@ -176,6 +189,58 @@ std::wstring wide(std::string_view value) {
     MultiByteToWideChar(CP_UTF8, 0, value.data(), static_cast<int>(value.size()), result.data(), size);
     return result;
 }
+
+CounterUnit counterUnitFromLabel(std::string unit) {
+    for (char& character : unit) {
+        if (character >= 'A' && character <= 'Z') character = static_cast<char>(character - 'A' + 'a');
+    }
+    if (unit == "token" || unit == "tokens") return CounterUnit::Tokens;
+    if (unit == "%" || unit == "percent" || unit == "percentage") return CounterUnit::Percent;
+    if (unit == "request" || unit == "requests") return CounterUnit::Requests;
+    if (unit == "credit" || unit == "credits") return CounterUnit::Credits;
+    if (unit == "$" || unit == "usd" || unit == "cny" || unit == "currency") return CounterUnit::Currency;
+    return CounterUnit::Requests;
+}
+
+std::wstring formatTokenCount(double value) {
+    if (!std::isfinite(value)) return L"0";
+    if (!(std::abs(value - std::round(value)) < 0.000001) || std::abs(value) >= 1.0e15) {
+        return std::format(L"{:.1f}", value);
+    }
+    const auto rounded = static_cast<long long>(std::llround(value));
+    const bool negative = rounded < 0;
+    std::wstring digits = std::to_wstring(negative ? -rounded : rounded);
+    std::wstring grouped;
+    if (negative) grouped.push_back(L'-');
+    for (std::size_t index = 0; index < digits.size(); ++index) {
+        if (index > 0 && (digits.size() - index) % 3 == 0) grouped.push_back(L',');
+        grouped.push_back(digits[index]);
+    }
+    return grouped;
+}
+
+std::wstring formatActivityDay(CivilDay day) {
+    static const wchar_t* weekdays[] = {L"Sunday", L"Monday", L"Tuesday", L"Wednesday", L"Thursday", L"Friday", L"Saturday"};
+    static const wchar_t* months[] = {L"", L"Jan", L"Feb", L"Mar", L"Apr", L"May", L"Jun", L"Jul", L"Aug", L"Sep", L"Oct", L"Nov", L"Dec"};
+    const int weekday = std::clamp(sundayIndex(day), 0, 6);
+    const unsigned month = day.month >= 1 && day.month <= 12 ? day.month : 0;
+    return std::format(L"{}, {} {}, {}", weekdays[weekday], months[month], day.day, day.year);
+}
+
+struct ActivityHit {
+    RECT rect{};
+    CalendarCell cell;
+};
+
+struct ActivityLayout {
+    ActivityCalendar calendar;
+    ActivityStats stats;
+    int originX{52};
+    int originY{108};
+    int cell{12};
+    int gap{3};
+    std::vector<ActivityHit> hits;
+};
 
 DWORD readDword(const wchar_t* name, DWORD fallback) {
     DWORD value = fallback;
@@ -2352,9 +2417,11 @@ private:
     static LRESULT CALLBACK floatingProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam);
     static LRESULT CALLBACK optionsProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam);
     static LRESULT CALLBACK trayProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam);
+    static LRESULT CALLBACK activityProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam);
     LRESULT onFloating(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam);
     LRESULT onOptions(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam);
     LRESULT onTray(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam);
+    LRESULT onActivity(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam);
 
     void createProviders();
     void seedMonitorAccounts(Provider& provider);
@@ -2389,6 +2456,9 @@ private:
     void showOptions(std::optional<std::size_t> provider = std::nullopt);
     void toggleMonitor();
     void showTrayMenu();
+    void showActivity();
+    void paintActivity(HWND hwnd);
+    [[nodiscard]] ActivityLayout layoutActivity(RECT client) const;
     void installTrayIcon();
     void updateTrayIcon();
     HICON createGaugeIcon(std::optional<double> remaining);
@@ -2410,6 +2480,7 @@ private:
     HWND trayWindow_{};
     HWND floatingWindow_{};
     HWND optionsWindow_{};
+    HWND activityWindow_{};
     HWND tooltip_{};
     HWND tab_{};
     HWND status_{};
@@ -2442,6 +2513,8 @@ private:
     HWND googleSecret_{};
     HWND close_{};
     HFONT font_{};
+    HFONT activityFont_{};
+    HFONT activitySmallFont_{};
     HICON trayIcon_{};
     HBRUSH darkBrush_{};
     HBRUSH editBrush_{};
@@ -2465,6 +2538,9 @@ private:
     int logicalWidth_{kMonitorDefaultWidth};
     int logicalHeight_{48};
     AlertEngine alerts_;
+    TokenHistory activityHistory_;
+    std::optional<CivilDay> activityHoverDay_;
+    bool activityTracking_{false};
     std::vector<ULONGLONG> rowFlashUntil_;
     std::vector<unsigned char> soundBuffer_;
     std::jthread refreshThread_;
@@ -2513,6 +2589,15 @@ LRESULT CALLBACK App::trayProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lP
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(create->lpCreateParams));
     }
     if (auto* self = appFrom(hwnd)) return self->onTray(hwnd, message, wParam, lParam);
+    return DefWindowProcW(hwnd, message, wParam, lParam);
+}
+
+LRESULT CALLBACK App::activityProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
+    if (message == WM_NCCREATE) {
+        auto* create = reinterpret_cast<CREATESTRUCTW*>(lParam);
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(create->lpCreateParams));
+    }
+    if (auto* self = appFrom(hwnd)) return self->onActivity(hwnd, message, wParam, lParam);
     return DefWindowProcW(hwnd, message, wParam, lParam);
 }
 
@@ -2692,9 +2777,12 @@ bool App::initialize(HINSTANCE instance) {
         LoadCursorW(nullptr, IDC_ARROW), nullptr, nullptr, L"HypeLimitsFloating", nullptr};
     const WNDCLASSEXW optionsClass{sizeof(WNDCLASSEXW), CS_DBLCLKS, optionsProc, 0, 0, instance_, nullptr,
         LoadCursorW(nullptr, IDC_ARROW), darkBrush_, nullptr, L"HypeLimitsOptions", nullptr};
+    const WNDCLASSEXW activityClass{sizeof(WNDCLASSEXW), CS_HREDRAW | CS_VREDRAW, activityProc, 0, 0, instance_, nullptr,
+        LoadCursorW(nullptr, IDC_ARROW), darkBrush_, nullptr, L"HypeLimitsActivity", nullptr};
     const WNDCLASSEXW trayClass{sizeof(WNDCLASSEXW), 0, trayProc, 0, 0, instance_, nullptr,
         nullptr, nullptr, nullptr, L"HypeLimitsTray", nullptr};
-    if (!RegisterClassExW(&floatingClass) || !RegisterClassExW(&optionsClass) || !RegisterClassExW(&trayClass)) return false;
+    if (!RegisterClassExW(&floatingClass) || !RegisterClassExW(&optionsClass) || !RegisterClassExW(&activityClass)
+        || !RegisterClassExW(&trayClass)) return false;
 
     trayWindow_ = CreateWindowExW(0, trayClass.lpszClassName, kAppName, 0, 0, 0, 0, 0,
                                   HWND_MESSAGE, nullptr, instance_, this);
@@ -2707,10 +2795,14 @@ bool App::initialize(HINSTANCE instance) {
         floatingClass.lpszClassName, kAppName, WS_POPUP, x, y, width, 80, nullptr, nullptr, instance_, this);
     optionsWindow_ = CreateWindowExW(WS_EX_APPWINDOW, optionsClass.lpszClassName, L"HypeLimits Options",
         WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT, 720, 820, nullptr, nullptr, instance_, this);
-    if (!trayWindow_ || !floatingWindow_ || !optionsWindow_) return false;
+    activityWindow_ = CreateWindowExW(WS_EX_APPWINDOW, activityClass.lpszClassName, L"HypeLimits Activity",
+        WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT, 940, 460, nullptr, nullptr, instance_, this);
+    if (!trayWindow_ || !floatingWindow_ || !optionsWindow_ || !activityWindow_) return false;
 
     BOOL dark = TRUE;
     DwmSetWindowAttribute(optionsWindow_, 20, &dark, sizeof(dark));
+    DwmSetWindowAttribute(activityWindow_, 20, &dark, sizeof(dark));
+    activityHistory_ = parseTokenHistory(utf8(readString(L"ActivityHistory")));
     createOptionsControls();
     RECT optionsClient{};
     GetClientRect(optionsWindow_, &optionsClient);
@@ -2763,6 +2855,12 @@ void App::createOptionsControls() {
     font_ = CreateFontW(-16, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
                         OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
                         DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+    activityFont_ = CreateFontW(-20, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+                                OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+                                DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+    activitySmallFont_ = CreateFontW(-13, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+                                     OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+                                     DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
     auto make = [&](const wchar_t* cls, const wchar_t* text, DWORD style, int id) {
         HWND control = CreateWindowExW(0, cls, text, WS_CHILD | WS_VISIBLE | style, 0, 0, 10, 10,
                                        optionsWindow_, reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), instance_, nullptr);
@@ -3999,6 +4097,7 @@ void App::toggleMonitor() {
 void App::showTrayMenu() {
     HMENU menu = CreatePopupMenu();
     AppendMenuW(menu, MF_STRING, IdTrayShow, IsWindowVisible(floatingWindow_) ? L"Hide Monitor" : L"Show Monitor");
+    AppendMenuW(menu, MF_STRING, IdTrayActivity, L"Activity");
     AppendMenuW(menu, MF_STRING, IdTrayRefresh, L"Refresh now");
     AppendMenuW(menu, MF_STRING, IdTrayOptions, L"Options...");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
@@ -4008,6 +4107,229 @@ void App::showTrayMenu() {
     SetForegroundWindow(trayWindow_);
     TrackPopupMenu(menu, TPM_RIGHTBUTTON | TPM_BOTTOMALIGN | TPM_LEFTALIGN, cursor.x, cursor.y, 0, trayWindow_, nullptr);
     DestroyMenu(menu);
+}
+
+ActivityLayout App::layoutActivity(RECT client) const {
+    const auto now = std::chrono::system_clock::now();
+    const auto refreshInterval = std::chrono::seconds{static_cast<std::chrono::seconds::rep>(pollIntervalMs() / 1000ULL)};
+    ActivityLayout layout;
+    layout.calendar = activityCalendar(activityHistory_, now);
+    layout.stats = activityStats(activityHistory_, now, refreshInterval);
+    const int weeks = std::max(1, static_cast<int>(layout.calendar.weeks.size()));
+    const int available = std::max(weeks * 8, static_cast<int>(client.right) - layout.originX - 16);
+    int stride = available / weeks;
+    if (stride < 9) stride = 9;
+    if (stride > 18) stride = 18;
+    layout.gap = std::max(2, stride / 5);
+    layout.cell = std::max(6, stride - layout.gap);
+    layout.hits.reserve(static_cast<std::size_t>(weeks) * 7);
+    for (int week = 0; week < static_cast<int>(layout.calendar.weeks.size()); ++week) {
+        for (int row = 0; row < 7; ++row) {
+            const auto& cell = layout.calendar.weeks[static_cast<std::size_t>(week)].days[static_cast<std::size_t>(row)];
+            if (!cell) continue;
+            ActivityHit hit;
+            hit.cell = *cell;
+            const int left = layout.originX + week * (layout.cell + layout.gap);
+            const int top = layout.originY + 18 + row * (layout.cell + layout.gap);
+            hit.rect = RECT{left, top, left + layout.cell, top + layout.cell};
+            layout.hits.push_back(hit);
+        }
+    }
+    return layout;
+}
+
+void App::paintActivity(HWND hwnd) {
+    PAINTSTRUCT paint{};
+    HDC screen = BeginPaint(hwnd, &paint);
+    RECT client{};
+    GetClientRect(hwnd, &client);
+    if (client.right <= 0 || client.bottom <= 0) {
+        EndPaint(hwnd, &paint);
+        return;
+    }
+    HDC dc = CreateCompatibleDC(screen);
+    HBITMAP bitmap = CreateCompatibleBitmap(screen, client.right, client.bottom);
+    const auto oldBitmap = SelectObject(dc, bitmap);
+    HBRUSH background = CreateSolidBrush(kActivityBackground);
+    FillRect(dc, &client, background);
+    DeleteObject(background);
+    SetBkMode(dc, TRANSPARENT);
+
+    const ActivityLayout layout = layoutActivity(client);
+    const HFONT body = activityFont_ ? activityFont_ : static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
+    const HFONT labelFont = activitySmallFont_ ? activitySmallFont_ : body;
+    const auto oldFont = SelectObject(dc, body);
+
+    const wchar_t* statLabels[] = {
+        L"Lifetime tokens",
+        L"Peak tokens per day",
+        L"Longest task",
+        L"Longest streak",
+        L"Current streak",
+    };
+    const std::wstring statValues[] = {
+        formatTokenCount(layout.stats.lifetimeTokens),
+        formatTokenCount(layout.stats.peakTokensPerDay),
+        wide(formatTaskDuration(layout.stats.longestTask)),
+        std::format(L"{} day{}", layout.stats.longestStreakDays, layout.stats.longestStreakDays == 1 ? L"" : L"s"),
+        std::format(L"{} day{}", layout.stats.currentStreakDays, layout.stats.currentStreakDays == 1 ? L"" : L"s"),
+    };
+    const int statWidth = std::max(140, (static_cast<int>(client.right) - 32) / 5);
+    for (int index = 0; index < 5; ++index) {
+        RECT label{16 + index * statWidth, 14, 16 + (index + 1) * statWidth - 8, 34};
+        RECT value = label;
+        value.top = 36;
+        value.bottom = 68;
+        SetTextColor(dc, kActivityMuted);
+        SelectObject(dc, labelFont);
+        DrawTextW(dc, statLabels[index], -1, &label, DT_LEFT | DT_SINGLELINE | DT_NOPREFIX | DT_NOCLIP);
+        SetTextColor(dc, kActivityText);
+        SelectObject(dc, body);
+        DrawTextW(dc, statValues[index].c_str(), -1, &value, DT_LEFT | DT_SINGLELINE | DT_NOPREFIX | DT_NOCLIP);
+    }
+
+    SelectObject(dc, labelFont);
+    SetTextColor(dc, kActivityMuted);
+    const wchar_t* weekdays[] = {L"Sun", L"Mon", L"Tue", L"Wed", L"Thu", L"Fri", L"Sat"};
+    for (int row = 0; row < 7; ++row) {
+        RECT label{4, layout.originY + 18 + row * (layout.cell + layout.gap), layout.originX - 6,
+                   layout.originY + 18 + row * (layout.cell + layout.gap) + layout.cell};
+        DrawTextW(dc, weekdays[row], -1, &label, DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_NOCLIP);
+    }
+    for (std::size_t week = 0; week < layout.calendar.weeks.size(); ++week) {
+        const auto& column = layout.calendar.weeks[week];
+        if (column.monthLabel.empty()) continue;
+        const auto labelText = wide(column.monthLabel);
+        RECT label{
+            layout.originX + static_cast<int>(week) * (layout.cell + layout.gap),
+            layout.originY,
+            layout.originX + static_cast<int>(week) * (layout.cell + layout.gap) + 52,
+            layout.originY + 16,
+        };
+        DrawTextW(dc, labelText.c_str(), -1, &label, DT_LEFT | DT_SINGLELINE | DT_NOPREFIX | DT_NOCLIP);
+    }
+    for (const auto& hit : layout.hits) {
+        const int level = std::clamp(hit.cell.level, 0, 4);
+        HBRUSH brush = CreateSolidBrush(kActivityGreenLevels[level]);
+        FillRect(dc, &hit.rect, brush);
+        DeleteObject(brush);
+        if (activityHoverDay_ && *activityHoverDay_ == hit.cell.day) {
+            HBRUSH frame = CreateSolidBrush(kActivityText);
+            FrameRect(dc, &hit.rect, frame);
+            DeleteObject(frame);
+        }
+    }
+
+    const int legendY = layout.originY + 18 + 7 * (layout.cell + layout.gap) + 16;
+    RECT less{layout.originX, legendY, layout.originX + 40, legendY + layout.cell + 2};
+    DrawTextW(dc, L"Less", -1, &less, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+    for (int level = 0; level < 5; ++level) {
+        RECT swatch{
+            layout.originX + 46 + level * (layout.cell + layout.gap),
+            legendY,
+            layout.originX + 46 + level * (layout.cell + layout.gap) + layout.cell,
+            legendY + layout.cell,
+        };
+        HBRUSH brush = CreateSolidBrush(kActivityGreenLevels[level]);
+        FillRect(dc, &swatch, brush);
+        DeleteObject(brush);
+    }
+    RECT more{
+        layout.originX + 46 + 5 * (layout.cell + layout.gap) + 8,
+        legendY,
+        layout.originX + 46 + 5 * (layout.cell + layout.gap) + 64,
+        legendY + layout.cell + 2,
+    };
+    DrawTextW(dc, L"More", -1, &more, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+    const std::wstring yearTotal = std::format(L"{} tokens in the last year", formatTokenCount(layout.calendar.yearTokens));
+    RECT year{more.right + 8, legendY, client.right - 16, legendY + layout.cell + 4};
+    DrawTextW(dc, yearTotal.c_str(), -1, &year, DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+
+    std::wstring readout = L"Point at a day to see its token count and date.";
+    if (activityHoverDay_) {
+        const auto found = std::ranges::find_if(layout.hits, [&](const ActivityHit& hit) {
+            return hit.cell.day == *activityHoverDay_;
+        });
+        if (found != layout.hits.end()) {
+            readout = std::format(L"{} tokens on {}", formatTokenCount(found->cell.tokens), formatActivityDay(found->cell.day));
+        }
+    }
+    RECT readoutRect{16, legendY + layout.cell + 14, client.right - 16, legendY + layout.cell + 42};
+    SetTextColor(dc, kActivityText);
+    SelectObject(dc, body);
+    DrawTextW(dc, readout.c_str(), -1, &readoutRect, DT_LEFT | DT_SINGLELINE | DT_NOPREFIX | DT_NOCLIP);
+
+    SelectObject(dc, oldFont);
+    BitBlt(screen, 0, 0, client.right, client.bottom, dc, 0, 0, SRCCOPY);
+    SelectObject(dc, oldBitmap);
+    DeleteObject(bitmap);
+    DeleteDC(dc);
+    EndPaint(hwnd, &paint);
+}
+
+void App::showActivity() {
+    if (!activityWindow_) return;
+    ShowWindow(activityWindow_, SW_SHOW);
+    SetForegroundWindow(activityWindow_);
+    InvalidateRect(activityWindow_, nullptr, FALSE);
+}
+
+LRESULT App::onActivity(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
+    switch (message) {
+    case WM_ERASEBKGND:
+        return 1;
+    case WM_GETMINMAXINFO: {
+        auto* size = reinterpret_cast<MINMAXINFO*>(lParam);
+        size->ptMinTrackSize.x = 880;
+        size->ptMinTrackSize.y = 440;
+        return 0;
+    }
+    case WM_SIZE:
+        InvalidateRect(hwnd, nullptr, FALSE);
+        return 0;
+    case WM_PAINT:
+        paintActivity(hwnd);
+        return 0;
+    case WM_MOUSEMOVE: {
+        RECT client{};
+        GetClientRect(hwnd, &client);
+        const ActivityLayout layout = layoutActivity(client);
+        const POINT point{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+        std::optional<CivilDay> hover;
+        for (const auto& hit : layout.hits) {
+            if (PtInRect(&hit.rect, point)) {
+                hover = hit.cell.day;
+                break;
+            }
+        }
+        if (hover != activityHoverDay_) {
+            activityHoverDay_ = hover;
+            InvalidateRect(hwnd, nullptr, FALSE);
+        }
+        if (!activityTracking_) {
+            TRACKMOUSEEVENT track{sizeof(track), TME_LEAVE, hwnd, 0};
+            activityTracking_ = TrackMouseEvent(&track) != FALSE;
+        }
+        return 0;
+    }
+    case WM_MOUSELEAVE:
+        activityTracking_ = false;
+        if (activityHoverDay_) {
+            activityHoverDay_.reset();
+            InvalidateRect(hwnd, nullptr, FALSE);
+        }
+        return 0;
+    case WM_KEYDOWN:
+        if (wParam == VK_ESCAPE) {
+            ShowWindow(hwnd, SW_HIDE);
+            return 0;
+        }
+        break;
+    case WM_CLOSE:
+        ShowWindow(hwnd, SW_HIDE);
+        return 0;
+    }
+    return DefWindowProcW(hwnd, message, wParam, lParam);
 }
 
 void App::playTone(bool reset) {
@@ -4439,6 +4761,31 @@ LRESULT App::onTray(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
                 writeDword((prefix + L".Currency").c_str(), metric.currency == "CNY " ? 2 : 1);
             }
         }
+        std::vector<TokenObservation> observations;
+        for (const auto& result : *completed) {
+            if (result.index >= providers_.size()) continue;
+            // Slot number only. Credentials stay in Credential Manager and are not part of this history.
+            const std::string providerId = utf8(providers_[result.index].definition.id);
+            const std::string accountId = std::to_string(result.slot);
+            for (const auto& metric : result.snapshot.metrics) {
+                if (!metric.used || !metric.observedAt) continue;
+                TokenObservation sample;
+                sample.providerId = providerId;
+                sample.accountId = accountId;
+                sample.window = metric.kind == MetricKind::Weekly ? AllowanceWindow::Weekly : AllowanceWindow::Session;
+                sample.unit = metric.kind == MetricKind::ApiCredit
+                    ? (metric.currency.empty() ? CounterUnit::Credits : CounterUnit::Currency)
+                    : counterUnitFromLabel(metric.unit);
+                sample.used = *metric.used;
+                sample.state = metric.state;
+                sample.observedAt = *metric.observedAt;
+                observations.push_back(std::move(sample));
+            }
+        }
+        if (recordTokenObservations(activityHistory_, observations)) {
+            writeString(L"ActivityHistory", wide(serializeTokenHistory(activityHistory_)));
+            if (activityWindow_) InvalidateRect(activityWindow_, nullptr, FALSE);
+        }
         for (auto& provider : providers_) {
             if (!std::exchange(provider.polling, false)) continue;
             const bool failed = provider.connected && providerPollFailed(provider.snapshot);
@@ -4477,6 +4824,7 @@ LRESULT App::onTray(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
     case WM_COMMAND:
         switch (LOWORD(wParam)) {
         case IdTrayShow: toggleMonitor(); break;
+        case IdTrayActivity: showActivity(); break;
         case IdTrayRefresh: refresh(true); break;
         case IdTrayOptions: showOptions(); break;
         case IdTrayQuit:
@@ -4500,6 +4848,12 @@ LRESULT App::onTray(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
         Shell_NotifyIconW(NIM_DELETE, &data);
         if (networkNotification_) CancelMibChangeNotify2(networkNotification_);
         if (trayIcon_) DestroyIcon(trayIcon_);
+        if (activityWindow_) {
+            DestroyWindow(activityWindow_);
+            activityWindow_ = nullptr;
+        }
+        if (activityFont_) DeleteObject(activityFont_);
+        if (activitySmallFont_) DeleteObject(activitySmallFont_);
         if (font_) DeleteObject(font_);
         if (darkBrush_) DeleteObject(darkBrush_);
         if (editBrush_) DeleteObject(editBrush_);
