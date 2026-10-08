@@ -55,10 +55,20 @@ struct TokenBaseline {
     TimePoint observedAt{};
 };
 
+// Absolute tokens a provider reported for one account on one day.
+// This is a daily total, not an allowance-window counter.
+struct ImportedDailyTokens {
+    std::string providerId;
+    std::string accountId;
+    CivilDay day{};
+    double tokens{0};
+};
+
 struct TokenHistory {
     std::vector<DailyTokens> days;
     std::vector<TokenDelta> deltas;
     std::vector<TokenBaseline> baselines;
+    std::vector<ImportedDailyTokens> imported;
 };
 
 struct ActivityStats {
@@ -94,6 +104,15 @@ struct ActivityCalendar {
 // Session is ignored when that account also reports weekly absolute tokens.
 // Returns true when daily totals, deltas, or baselines change.
 bool recordTokenObservations(TokenHistory& history, std::span<const TokenObservation> observations);
+
+// Codex daily analytics. nullopt when the body has no data array, so a failed
+// response cannot wipe a saved import. An empty array is a real empty report.
+[[nodiscard]] std::optional<std::vector<DailyTokens>> parseCodexDailyTokens(std::string_view json);
+
+// Replaces one account's imported days. Other accounts and recorded deltas stay.
+// Returns true when that account's imported days change.
+bool replaceImportedDailyTokens(TokenHistory& history, std::string_view providerId, std::string_view accountId,
+                                std::span<const DailyTokens> days);
 
 [[nodiscard]] ActivityStats activityStats(const TokenHistory& history, TimePoint now, std::chrono::seconds refreshInterval);
 [[nodiscard]] ActivityCalendar activityCalendar(const TokenHistory& history, TimePoint now);

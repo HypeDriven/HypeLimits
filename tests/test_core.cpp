@@ -312,6 +312,73 @@ void testActivityHistory() {
         check(parseTokenHistory("HLHIST1\nD 2026-06-01 5\nD 2026-06-01 9\n").days.empty(), "a duplicate day yields an empty history");
         check(parseTokenHistory("HLHIST1\nD 2026-06-01\n").days.empty(), "truncated saved data yields an empty history");
     }
+
+    {
+        const char* report = R"({
+            "data": [
+                {"date":"2026-06-14","totals":{"text_total_tokens":100,"cached_text_input_tokens":40,"uncached_text_input_tokens":30,"text_output_tokens":20},
+                 "clients":[{"client_id":"codex","text_total_tokens":999,"cached_text_input_tokens":999}]},
+                {"date":"2026-06-15","totals":{"text_total_tokens":0,"cached_text_input_tokens":10,"uncached_text_input_tokens":5,"text_output_tokens":2}},
+                {"date":"2026-06-13","totals":{"credits":3,"turns":1}},
+                {"date":"not-a-date","totals":{"text_total_tokens":50}}
+            ]
+        })";
+        const auto parsed = parseCodexDailyTokens(report);
+        check(parsed.has_value(), "a Codex daily report with a data array is accepted");
+        check(parsed && parsed->size() == 2, "only days with absolute tokens are kept");
+        if (parsed && parsed->size() == 2) {
+            check(parsed->front().day == CivilDay{2026, 6, 14} && std::abs(parsed->front().tokens - 100.0) < 0.001,
+                  "text_total_tokens is used and nested client tokens are not added again");
+            check(parsed->back().day == CivilDay{2026, 6, 15} && std::abs(parsed->back().tokens - 17.0) < 0.001,
+                  "a zero text total falls back to cached, uncached, and output tokens");
+        }
+        check(!parseCodexDailyTokens(R"({"error":"nope"})"), "a body without a data array does not replace saved days");
+        const auto emptyReport = parseCodexDailyTokens(R"({"data":[]})");
+        check(emptyReport && emptyReport->empty(), "an empty data array is a real empty report");
+
+        TokenHistory history;
+        const std::vector<DailyTokens> importedDays = parsed.value_or(std::vector<DailyTokens>{});
+        check(parsed && replaceImportedDailyTokens(history, "openai", "1", importedDays), "the first Codex import is stored");
+        check(std::abs(activityStats(history, now, interval).lifetimeTokens - 117.0) < 0.001, "imported daily tokens count toward lifetime");
+        check(activityStats(history, now, interval).longestTask.count() == 0, "imported days do not invent a task duration");
+        const auto calendar = activityCalendar(history, now);
+        double ranged = 0.0;
+        for (const auto& week : calendar.weeks) {
+            for (const auto& cell : week.days) {
+                if (!cell) continue;
+                if (cell->day == CivilDay{2026, 6, 14}) check(std::abs(cell->tokens - 100.0) < 0.001, "the calendar shows the imported day");
+                ranged += cell->tokens;
+            }
+        }
+        check(std::abs(ranged - 117.0) < 0.001, "imported days inside the visible year are summed");
+        std::vector<DailyTokens> replacement{{CivilDay{2026, 6, 14}, 40.0}};
+        check(replaceImportedDailyTokens(history, "openai", "1", replacement), "a later report replaces that account's imported days");
+        check(!replaceImportedDailyTokens(history, "openai", "1", replacement), "the same report does not count twice");
+        check(std::abs(activityStats(history, now, interval).lifetimeTokens - 40.0) < 0.001, "replacement does not add to the previous import");
+
+        recordOne(history, observation("anthropic", "0", AllowanceWindow::Weekly, CounterUnit::Tokens, 0, MetricState::Current, at(0, 9)));
+        recordOne(history, observation("anthropic", "0", AllowanceWindow::Weekly, CounterUnit::Tokens, 7, MetricState::Current, at(0, 12)));
+        check(std::abs(activityStats(history, now, interval).lifetimeTokens - 47.0) < 0.001,
+              "a live token delta is added beside imported days");
+        check(replaceImportedDailyTokens(history, "openai", "1", {}), "clearing one account leaves the other provider's deltas");
+        check(std::abs(activityStats(history, now, interval).lifetimeTokens - 7.0) < 0.001, "clearing an import removes only that account");
+
+        const std::vector<DailyTokens> both{{CivilDay{2026, 6, 15}, 17.0}};
+        replaceImportedDailyTokens(history, "openai", "1", both);
+        const auto text = serializeTokenHistory(history);
+        check(text.find("sk-") == std::string::npos && text.find("Bearer") == std::string::npos, "an import stores no credential");
+        const auto restored = parseTokenHistory(text);
+        check(restored.imported.size() == 1 && restored.imported.front().providerId == "openai"
+                  && restored.imported.front().accountId == "1"
+                  && restored.imported.front().day == CivilDay{2026, 6, 15}
+                  && std::abs(restored.imported.front().tokens - 17.0) < 0.001,
+              "a round trip restores the imported day");
+        check(std::abs(activityStats(restored, now, interval).lifetimeTokens - 24.0) < 0.001,
+              "a reloaded import still adds to recorded deltas");
+        check(parseTokenHistory("HLHIST1\nI openai 0 2026-06-14 5\nI openai 0 2026-06-14 9\n").days.empty(),
+              "a duplicate imported day yields an empty history");
+        check(parseTokenHistory("HLHIST1\nI openai 0 2026-06-14\n").imported.empty(), "a truncated import yields an empty history");
+    }
 }
 } // namespace
 
