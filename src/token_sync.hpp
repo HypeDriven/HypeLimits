@@ -45,6 +45,8 @@ enum class TokenPick { Left, Right, Tie };
 [[nodiscard]] std::vector<std::string> cliHomeRelativePaths(std::string_view providerId);
 [[nodiscard]] std::string wslUserSettingKey(std::string_view distro, std::string_view user);
 [[nodiscard]] TokenRecord parseCliTokenRecord(CliCredentialFormat format, std::string_view json);
+// ChatGPT account id carried in an OpenAI access or id token's JWT payload; empty when absent.
+[[nodiscard]] std::string chatgptAccountIdFromJwt(std::string_view token);
 [[nodiscard]] std::string mergeCliCredentialJson(CliCredentialFormat format, std::string_view existingJson, const TokenRecord& winner);
 
 } // namespace hypelimits

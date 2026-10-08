@@ -1248,12 +1248,8 @@ void applyTokenResponse(AuthMaterial& auth, const std::string& json) {
         auth.expiresAtMs = now + static_cast<std::int64_t>(*expIn * 1000.0);
     }
     auth.observedAtMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
-    if (auth.accountId.empty()) {
-        const auto jwt = auth.token.find('.');
-        if (jwt != std::string::npos) {
-            if (auto id = jsonString(auth.token, "chatgpt_account_id")) auth.accountId = *id;
-        }
-    }
+    if (auth.accountId.empty()) auth.accountId = chatgptAccountIdFromJwt(auth.token);
+    if (auth.accountId.empty()) auth.accountId = chatgptAccountIdFromJwt(auth.idToken);
 }
 
 std::wstring kimiIdentityHeaders() {

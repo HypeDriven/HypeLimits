@@ -366,6 +366,18 @@ int main() {
               && parseCliTokenRecord(CliCredentialFormat::CodexTokens, stampedMerged).observedAtMs == codexRefreshed.observedAtMs,
           "Codex write-back stamps last_refresh for the tokens it writes");
 
+    // Payload: {"https://api.openai.com/auth":{"chatgpt_account_id":"acct-jwt"}}
+    const std::string codexJwt = "e30.eyJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF9hY2NvdW50X2lkIjoiYWNjdC1qd3QifX0.sig";
+    check(chatgptAccountIdFromJwt(codexJwt) == "acct-jwt" && chatgptAccountIdFromJwt("opaque-token").empty(),
+          "ChatGPT account id decodes from the JWT payload");
+    TokenRecord codexNoAccount;
+    codexNoAccount.accessToken = codexJwt;
+    codexNoAccount.refreshToken = "codex-new-r";
+    const auto jwtMerged = mergeCliCredentialJson(CliCredentialFormat::CodexTokens, codexExisting, codexNoAccount);
+    check(jwtMerged.find("\"account_id\":\"\"") == std::string::npos
+              && parseCliTokenRecord(CliCredentialFormat::CodexTokens, jwtMerged).accountId == "acct-jwt",
+          "Codex write-back without an account id takes it from the access token");
+
     const char* agyExisting = R"({"token":{"access_token":"agy-old","token_type":"Bearer","refresh_token":"agy-old-r","expiry":"2026-09-28T09:50:34.322532681Z"},"auth_method":"consumer"})";
     const auto agyParsed = parseCliTokenRecord(CliCredentialFormat::GeminiOauth, agyExisting);
     check(agyParsed.accessToken == "agy-old" && agyParsed.refreshToken == "agy-old-r" && agyParsed.expiresAtMs && *agyParsed.expiresAtMs > 1'000'000'000'000LL,

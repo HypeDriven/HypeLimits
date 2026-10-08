@@ -28,6 +28,29 @@ std::string escapeJson(std::string_view value) {
     return out;
 }
 
+std::string base64UrlDecode(std::string_view in) {
+    std::string out;
+    unsigned int buffer = 0;
+    int bits = 0;
+    for (const char ch : in) {
+        int value = -1;
+        if (ch >= 'A' && ch <= 'Z') value = ch - 'A';
+        else if (ch >= 'a' && ch <= 'z') value = ch - 'a' + 26;
+        else if (ch >= '0' && ch <= '9') value = ch - '0' + 52;
+        else if (ch == '-' || ch == '+') value = 62;
+        else if (ch == '_' || ch == '/') value = 63;
+        else if (ch == '=') break;
+        else return {};
+        buffer = (buffer << 6) | static_cast<unsigned int>(value);
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            out.push_back(static_cast<char>((buffer >> bits) & 0xFF));
+        }
+    }
+    return out;
+}
+
 std::size_t skipJsonString(std::string_view json, std::size_t quote) {
     std::size_t i = quote + 1;
     while (i < json.size()) {
@@ -321,6 +344,15 @@ TokenRecord parseCliTokenRecord(CliCredentialFormat format, std::string_view jso
     return parseFromObject(json, root);
 }
 
+std::string chatgptAccountIdFromJwt(std::string_view token) {
+    const auto first = token.find('.');
+    if (first == std::string_view::npos) return {};
+    const auto second = token.find('.', first + 1);
+    if (second == std::string_view::npos) return {};
+    const auto payload = base64UrlDecode(token.substr(first + 1, second - first - 1));
+    return jsonString(payload, "chatgpt_account_id").value_or(std::string{});
+}
+
 std::string mergeCliCredentialJson(CliCredentialFormat format, std::string_view existingJson, const TokenRecord& winner) {
     std::string json = looksLikeObject(existingJson) ? std::string(existingJson) : emptySkeleton(format);
     auto root = skipWs(json, 0);
@@ -354,11 +386,16 @@ std::string mergeCliCredentialJson(CliCredentialFormat format, std::string_view 
         root = skipWs(json, 0);
         const auto nested = nestedObject(json, root, "tokens");
         if (!nested) return json;
+        // Codex reads its ChatGPT account from account_id at startup, so take it from the tokens' own claim
+        // when the record lacks one. The file's previous id is never reused: it may belong to another login.
+        std::string accountId = winner.accountId;
+        if (accountId.empty()) accountId = chatgptAccountIdFromJwt(winner.accessToken);
+        if (accountId.empty()) accountId = chatgptAccountIdFromJwt(winner.idToken);
         json = setStringField(std::move(json), nested->first, "id_token", winner.idToken);
-        json = setStringField(std::move(json), nested->first, "account_id", winner.accountId);
+        json = setStringField(std::move(json), nested->first, "account_id", accountId);
         json = setStringField(std::move(json), nested->first, "access_token", winner.accessToken);
         json = setStringField(std::move(json), nested->first, "refresh_token", winner.refreshToken);
-        json = setStringField(std::move(json), root, "account_id", winner.accountId);
+        json = setStringField(std::move(json), skipWs(json, 0), "account_id", accountId);
         // Keep last_refresh describing these tokens; a stale value makes an older login look newer than it is.
         if (winner.observedAtMs) {
             const auto at = std::chrono::sys_time<std::chrono::milliseconds>(std::chrono::milliseconds(*winner.observedAtMs));
