@@ -63,9 +63,14 @@ void testActivityHistory() {
         check(std::abs(stats.lifetimeTokens - 65.0) < 0.001, "cross-provider token deltas sum on the local day");
         check(history.days.size() == 2 && history.days[0].day == today && history.days[1].day == today,
               "deltas land on the later observation's local day");
-        check(history.days[0].providerId == "anthropic" && std::abs(history.days[0].tokens - 40.0) < 0.001
-                  && history.days[1].providerId == "openai" && std::abs(history.days[1].tokens - 25.0) < 0.001,
-              "each provider keeps its own daily total");
+        check(history.days[0].providerId == "anthropic" && history.days[0].accountId == "0"
+                  && std::abs(history.days[0].tokens - 40.0) < 0.001
+                  && history.days[1].providerId == "openai" && history.days[1].accountId == "1"
+                  && std::abs(history.days[1].tokens - 25.0) < 0.001,
+              "each provider account keeps its own daily total");
+        check(std::abs(activityStats(history, now, "anthropic", "0").lifetimeTokens - 40.0) < 0.001
+                  && activityStats(history, now, "anthropic", "1").lifetimeTokens == 0.0,
+              "an account filter keeps that account and leaves out the provider's other accounts");
         check(std::abs(stats.peakTokensPerDay - 65.0) < 0.001, "the all-providers peak is the summed day");
         check(std::abs(activityStats(history, now, "anthropic").lifetimeTokens - 40.0) < 0.001
                   && std::abs(activityStats(history, now, "openai").lifetimeTokens - 25.0) < 0.001,
@@ -292,12 +297,14 @@ void testActivityHistory() {
             check(restored.days[index].day == history.days[index].day, "a round trip restores the local day");
             check(std::abs(restored.days[index].tokens - history.days[index].tokens) < 0.001, "a round trip restores the daily total");
             check(restored.days[index].providerId == history.days[index].providerId, "a round trip restores which provider the day belongs to");
+            check(restored.days[index].accountId == history.days[index].accountId, "a round trip restores which account the day belongs to");
         }
         check(restored.deltas.size() == history.deltas.size(), "a round trip restores every delta");
         for (std::size_t index = 0; index < history.deltas.size(); ++index) {
             check(restored.deltas[index].at == history.deltas[index].at, "a round trip restores the delta time");
             check(std::abs(restored.deltas[index].tokens - history.deltas[index].tokens) < 0.001, "a round trip restores the delta size");
             check(restored.deltas[index].providerId == history.deltas[index].providerId, "a round trip restores which provider the delta belongs to");
+            check(restored.deltas[index].accountId == history.deltas[index].accountId, "a round trip restores which account the delta belongs to");
         }
         check(restored.baselines.size() == history.baselines.size(), "a round trip restores baselines");
         auto continued = restored;
@@ -469,6 +476,8 @@ void testActivityHistory() {
         check(refreshSessionLogCache(cache, other) == SessionLogScan::Updated, "a second home is recorded beside the first");
         auto imports = sessionLogImports(cache);
         check(imports.size() == 3, "local imports cover Claude, Grok, and Kimi");
+        check(std::ranges::all_of(imports, [](const LocalSessionImport& import) { return import.accountId == kLocalSessionAccount; }),
+              "logs that name no organization stay on the local account");
         check(std::abs(tokensFor(imports, "anthropic") - (37.0 + 10.0)) < 0.001, "Claude files from both homes are summed");
         check(std::abs(tokensFor(imports, "xai") - 46.0) < 0.001, "Grok completed turns are summed without the per-model breakdown");
         check(std::abs(tokensFor(imports, "moonshot") - 21.0) < 0.001, "Kimi turn usage is summed and session snapshots are not");
@@ -479,7 +488,17 @@ void testActivityHistory() {
               "the scan cache stores totals, not log text or secrets");
         const auto restored = parseSessionLogCache(saved);
         check(restored.entries.size() == cache.entries.size(), "a scan-cache round trip keeps every file");
+        check(saved.starts_with("HLSL2\n"), "the scan cache records which organization a file named");
+        check(std::ranges::all_of(restored.entries, [](const SessionLogCacheEntry& entry) { return entry.accountId == "local"; }),
+              "a log that names no organization stays unattributed in the scan cache");
         check(parseSessionLogCache("HLSL1\nE anthropic 1 1 1\n/tmp/a\n").entries.empty(), "a truncated scan cache is empty");
+        check(parseSessionLogCache("HLSL1\nE anthropic 1 1 0 local\n/tmp/a\n").entries.empty(),
+              "an older scan cache has no organization field");
+        check(parseSessionLogCache("HLSL2\nE anthropic 1 1 0\n/tmp/a\n").entries.empty(), "a scan cache entry needs its organization field");
+        check(parseSessionLogCache("HLSL2\nE anthropic 1 1 0 nope\n/tmp/a\n").entries.empty(), "an unknown organization field is rejected");
+        const auto pending = parseSessionLogCache("HLSL1\nE anthropic 1 2 0\n/tmp/claude.jsonl\n");
+        check(pending.entries.size() == 1 && pending.entries.front().accountId.empty(),
+              "an older scan cache leaves the organization unread");
         check(parseSessionLogCache("nope").entries.empty(), "a scan cache without its header is empty");
         const auto cacheFile = root / "cache.txt";
         check(storeSessionLogCache(cache, cacheFile), "the scan cache can be written");
@@ -521,6 +540,199 @@ void testActivityHistory() {
               "a provider filter keeps that provider's local session totals");
         check(activityStats(history, now, "openai").lifetimeTokens == 0.0,
               "a provider filter leaves out other providers' session totals");
+        check(std::abs(activityStats(history, now, "anthropic", "local").lifetimeTokens - (37.0 + 10.0 + 4.0)) < 0.001,
+              "session logs stay on the local account");
+        check(activityStats(history, now, "anthropic", "0").lifetimeTokens == 0.0,
+              "a saved account does not receive another account's session logs");
+        fs::remove_all(root, removeError);
+    }
+
+    {
+        constexpr std::string_view kOrgA = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        constexpr std::string_view kOrgB = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+        constexpr std::string_view kAccountA = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+        constexpr std::string_view kAccountB = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
+        constexpr std::string_view kSessionA = "11111111-1111-4111-8111-111111111111";
+        constexpr std::string_view kSessionB = "22222222-2222-4222-8222-222222222222";
+        constexpr std::string_view kSessionC = "33333333-3333-4333-8333-333333333333";
+        constexpr std::string_view kSessionD = "44444444-4444-4444-8444-444444444444";
+        const auto assistant = [](std::string_view request, int tokens) {
+            return std::format(
+                "{{\"type\":\"assistant\",\"requestId\":\"{}\",\"timestamp\":\"2026-06-14T15:00:00Z\","
+                "\"message\":{{\"usage\":{{\"input_tokens\":{}}}}}}}\n",
+                request, tokens);
+        };
+        const auto organizationLine = [](std::string_view organization) {
+            return std::format(
+                "{{\"type\":\"attachment\",\"attachment\":{{\"type\":\"credential_org\",\"organizationUuid\":\"{}\"}}}}\n",
+                organization);
+        };
+        namespace fs = std::filesystem;
+        const auto root = fs::temp_directory_path() / "hl-claude-orgs";
+        const auto home = root / "home";
+        std::error_code removeError;
+        fs::remove_all(root, removeError);
+        const auto sessionA = home / ".claude" / "projects" / "demo" / (std::string(kSessionA) + ".jsonl");
+        const auto sessionAChild = home / ".claude" / "projects" / "demo" / std::string(kSessionA) / "subagents" / "agent.jsonl";
+        const auto sessionB = home / ".claude" / "projects" / "demo" / (std::string(kSessionB) + ".jsonl");
+        const auto sessionBChild = home / ".claude" / "projects" / "demo" / std::string(kSessionB) / "subagents" / "agent.jsonl";
+        const auto sessionC = home / ".claude" / "projects" / "demo" / (std::string(kSessionC) + ".jsonl");
+        const auto sessionCOne = home / ".claude" / "projects" / "demo" / std::string(kSessionC) / "subagents" / "one.jsonl";
+        const auto sessionCTwo = home / ".claude" / "projects" / "demo" / std::string(kSessionC) / "subagents" / "two.jsonl";
+        const auto sessionD = home / ".claude" / "projects" / "demo" / (std::string(kSessionD) + ".jsonl");
+        fs::create_directories(sessionAChild.parent_path());
+        fs::create_directories(sessionBChild.parent_path());
+        fs::create_directories(sessionCOne.parent_path());
+        {
+            std::ofstream parent(sessionA);
+            parent << organizationLine(kOrgA) << assistant("a-parent", 10);
+            std::ofstream child(sessionAChild);
+            child << assistant("a-child", 4);
+            std::ofstream parentB(sessionB);
+            parentB << assistant("b-parent", 7);
+            std::ofstream childB(sessionBChild);
+            childB << organizationLine(kOrgB) << assistant("b-child", 1);
+            std::ofstream parentC(sessionC);
+            parentC << organizationLine(kOrgA) << assistant("c-a", 2);
+            std::ofstream one(sessionCOne);
+            one << organizationLine(kOrgB) << assistant("c-b", 3);
+            std::ofstream two(sessionCTwo);
+            two << assistant("c-none", 5);
+            std::ofstream mixed(sessionD);
+            mixed << organizationLine(kOrgA) << organizationLine(kOrgB) << assistant("mixed", 6);
+        }
+        {
+            std::ofstream config(home / ".claude.json");
+            config << std::format(
+                "{{\"oauthAccount\":{{\"accountUuid\":\"{}\",\"emailAddress\":\"person@example.com\","
+                "\"organizationUuid\":\"{}\"}}}}\n",
+                kAccountA, kOrgA);
+            fs::create_directories(home / ".claude" / "backups");
+            std::ofstream backup(home / ".claude" / "backups" / ".claude.json.backup.1");
+            backup << std::format(
+                "{{\"oauthAccount\":{{\"accountUuid\":\"{}\",\"organizationUuid\":\"{}\"}}}}\n", kAccountB, kOrgB);
+            std::ofstream ignored(home / ".claude" / "backups" / "credentials.json");
+            ignored << "{\"oauthAccount\":{\"accountUuid\":\"eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee\","
+                       "\"organizationUuid\":\"ffffffff-ffff-4fff-8fff-ffffffffffff\"},\"accessToken\":\"secret-token\"}";
+            std::ofstream credentials(home / ".claude" / ".credentials.json");
+            credentials << "{\"claudeAiOauth\":{\"accessToken\":\"secret-token\"}}";
+        }
+
+        auto tokensForAccount = [](const std::vector<LocalSessionImport>& imports, std::string_view provider,
+                                    std::string_view account) {
+            double sum = 0.0;
+            for (const auto& import : imports) {
+                if (import.providerId != provider || import.accountId != account) continue;
+                for (const auto& day : import.days) sum += day.tokens;
+            }
+            return sum;
+        };
+        auto accountForPath = [](const SessionLogCache& cache, std::string_view suffix) {
+            for (const auto& entry : cache.entries) {
+                if (entry.path.ends_with(suffix)) return entry.accountId;
+            }
+            return std::string{};
+        };
+
+        SessionLogCache cache;
+        check(refreshSessionLogCache(cache, home) == SessionLogScan::Updated, "Claude logs that name an organization are read");
+        check(accountForPath(cache, std::string(kSessionA) + ".jsonl") == kOrgA,
+              "a transcript keeps the organization it names");
+        check(accountForPath(cache, std::string(kSessionA) + "/subagents/agent.jsonl") == "local",
+              "a sibling with no organization does not copy one into the cache");
+        check(accountForPath(cache, std::string(kSessionB) + ".jsonl") == "local",
+              "a parent with no organization stays unmarked in the cache");
+        check(accountForPath(cache, std::string(kSessionD) + ".jsonl") == "mixed",
+              "a transcript that names two organizations is not given to either");
+        const auto imports = sessionLogImports(cache);
+        check(std::abs(tokensForAccount(imports, "anthropic", kOrgA) - 16.0) < 0.001,
+              "a session's single organization covers the sibling that names none");
+        check(std::abs(tokensForAccount(imports, "anthropic", kOrgB) - 11.0) < 0.001,
+              "the other organization keeps its own transcripts");
+        check(std::abs(tokensForAccount(imports, "anthropic", "local") - 11.0) < 0.001,
+              "a session with two organizations leaves an unnamed file unattributed");
+        check(std::abs(tokensForAccount(imports, "anthropic", kOrgA) + tokensForAccount(imports, "anthropic", kOrgB)
+                       + tokensForAccount(imports, "anthropic", "local") - 38.0)
+                  < 0.001,
+              "splitting Claude logs does not drop or double a request");
+
+        const auto links = claudeOrganizationLinks(home);
+        check(links.size() == 2, "Claude config and its backups contribute one link each");
+        check(std::ranges::any_of(links, [&](const OrganizationAccountLink& link) {
+                  return link.accountUuid == kAccountA && link.organizationUuid == kOrgA;
+              }),
+              "the current Claude config pairs its account with its organization");
+        check(std::ranges::none_of(links, [](const OrganizationAccountLink& link) {
+                  return link.accountUuid.find('@') != std::string::npos || link.organizationUuid.find("secret") != std::string::npos;
+              }),
+              "organization links do not keep an email address or a token");
+
+        const std::vector<SavedAccountSlot> slots{{"0", std::string(kAccountA)}, {"1", std::string(kAccountB)}};
+        const auto assigned = assignClaudeSessionImports(imports, links, slots);
+        check(std::abs(tokensForAccount(assigned, "anthropic", "0") - 16.0) < 0.001,
+              "the linked organization is stored on that saved login");
+        check(std::abs(tokensForAccount(assigned, "anthropic", "1") - 11.0) < 0.001,
+              "the one remaining organization is stored on the one remaining login");
+        check(std::abs(tokensForAccount(assigned, "anthropic", "local") - 11.0) < 0.001,
+              "unattributed Claude logs stay off both logins");
+
+        TokenHistory history;
+        const std::vector<DailyTokens> previous{{CivilDay{2026, 6, 14}, 38.0}};
+        check(replaceImportedDailyTokens(history, "anthropic", kLocalSessionAccount, previous), "the previous local total is stored");
+        for (const auto& import : assigned) {
+            replaceImportedDailyTokens(history, import.providerId, import.accountId, import.days);
+        }
+        const auto now = timePointOnLocalDay(today, 18, 0);
+        check(std::abs(activityStats(history, now).lifetimeTokens - 38.0) < 0.001,
+              "moving Claude logs onto logins replaces the old local total");
+        check(std::abs(activityStats(history, now, "anthropic", "0").lifetimeTokens - 16.0) < 0.001,
+              "the first login shows only its own Claude logs");
+        check(std::abs(activityStats(history, now, "anthropic", "1").lifetimeTokens - 11.0) < 0.001,
+              "the second login shows only its own Claude logs");
+
+        std::string older;
+        older += "HLSL1\n";
+        for (const auto& entry : cache.entries) {
+            if (entry.providerId != "anthropic") continue;
+            older += std::format("E anthropic {} {} 1\n{}\n2026-06-01 1\n", entry.modified, entry.size, entry.path);
+        }
+        auto loaded = parseSessionLogCache(older);
+        check(!loaded.entries.empty() && std::ranges::all_of(loaded.entries, [](const SessionLogCacheEntry& entry) {
+                  return entry.accountId.empty() && entry.days.size() == 1 && std::abs(entry.days.front().tokens - 1.0) < 0.001;
+              }),
+              "an older scan cache keeps its totals and has no organization yet");
+        check(refreshSessionLogCache(loaded, home) == SessionLogScan::Updated, "an older cache is scanned for organizations");
+        check(accountForPath(loaded, std::string(kSessionA) + ".jsonl") == kOrgA,
+              "the organization scan fills the id without rereading token totals");
+        check(std::ranges::all_of(loaded.entries, [](const SessionLogCacheEntry& entry) {
+                  return entry.days.size() == 1 && entry.days.front().day == CivilDay{2026, 6, 1}
+                      && std::abs(entry.days.front().tokens - 1.0) < 0.001;
+              }),
+              "the organization scan leaves saved daily totals unchanged");
+
+        const std::vector<SavedAccountSlot> unnamed{{"0", {}}, {"1", {}}};
+        check(matchOrganizationsToSlots(links, unnamed, std::vector<std::string>{std::string(kOrgA), std::string(kOrgB)}).empty(),
+              "logins with no saved account id are not paired by guess");
+        const std::vector<OrganizationAccountLink> noLinks;
+        const std::vector<std::string> bothOrganizations{std::string(kOrgA), std::string(kOrgB)};
+        check(matchOrganizationsToSlots(noLinks, slots, bothOrganizations).empty(),
+              "two unpaired organizations are not divided between two logins");
+        const auto oneLeft = matchOrganizationsToSlots(noLinks, std::vector<SavedAccountSlot>{{"0", std::string(kAccountA)}},
+                                                       std::vector<std::string>{std::string(kOrgB)});
+        check(oneLeft.size() == 1 && oneLeft.front().organizationId == kOrgB && oneLeft.front().slotId == "0",
+              "one remaining organization pairs with the one remaining login");
+        const std::vector<OrganizationAccountLink> sameOrganization{{std::string(kAccountA), std::string(kOrgA)},
+                                                                    {std::string(kAccountB), std::string(kOrgA)}};
+        check(matchOrganizationsToSlots(sameOrganization, slots, std::vector<std::string>{std::string(kOrgA)}).empty(),
+              "one organization is not stored on two logins");
+
+        SessionLogCache pending;
+        pending.entries.push_back(SessionLogCacheEntry{"anthropic", "/tmp/a.jsonl", 1, 2, {}, {}});
+        const auto pendingText = serializeSessionLogCache(pending);
+        const auto pendingRestored = parseSessionLogCache(pendingText);
+        check(pendingText.starts_with("HLSL2\n") && pendingRestored.entries.size() == 1
+                  && pendingRestored.entries.front().accountId.empty(),
+              "a Claude file that has not been scanned stays pending across a round trip");
         fs::remove_all(root, removeError);
     }
 
@@ -530,9 +742,31 @@ void testActivityHistory() {
         recordOne(accounts, observation("anthropic", "1", AllowanceWindow::Weekly, CounterUnit::Tokens, 0, MetricState::Current, at(0, 9)));
         recordOne(accounts, observation("anthropic", "0", AllowanceWindow::Weekly, CounterUnit::Tokens, 10, MetricState::Current, at(0, 12)));
         recordOne(accounts, observation("anthropic", "1", AllowanceWindow::Weekly, CounterUnit::Tokens, 6, MetricState::Current, at(0, 12)));
-        check(accounts.days.size() == 1 && accounts.days.front().providerId == "anthropic"
-                  && std::abs(accounts.days.front().tokens - 16.0) < 0.001,
-              "accounts of one provider share that provider's daily total");
+        check(accounts.days.size() == 2, "each account of a provider keeps its own daily total");
+        check(accounts.days[0].accountId == "0" && std::abs(accounts.days[0].tokens - 10.0) < 0.001
+                  && accounts.days[1].accountId == "1" && std::abs(accounts.days[1].tokens - 6.0) < 0.001,
+              "account totals stay in slot order");
+        check(std::abs(activityStats(accounts, now).lifetimeTokens - 16.0) < 0.001, "the aggregate still adds every account");
+        check(std::abs(activityStats(accounts, now, "anthropic").lifetimeTokens - 16.0) < 0.001,
+              "a provider filter still adds every account of that provider");
+        const std::vector<DailyTokens> firstAccount{{today, 5.0}};
+        const std::vector<DailyTokens> secondAccount{{today, 9.0}};
+        const std::vector<DailyTokens> localAccount{{today, 100.0}};
+        check(replaceImportedDailyTokens(accounts, "anthropic", "0", firstAccount), "the first account import is stored");
+        check(replaceImportedDailyTokens(accounts, "anthropic", "1", secondAccount), "the second account import is stored");
+        check(replaceImportedDailyTokens(accounts, "anthropic", kLocalSessionAccount, localAccount), "a local import stays separate");
+        check(std::abs(activityStats(accounts, now, "anthropic", "0").lifetimeTokens - 15.0) < 0.001,
+              "an account view adds that account's recorded and imported days");
+        check(std::abs(activityStats(accounts, now, "anthropic", "1").lifetimeTokens - 15.0) < 0.001,
+              "the other account view does not include the first account");
+        check(std::abs(activityStats(accounts, now, "anthropic", "local").lifetimeTokens - 100.0) < 0.001,
+              "local session days are their own account");
+        check(std::abs(activityStats(accounts, now).lifetimeTokens - 130.0) < 0.001, "the aggregate counts each account once");
+        const auto savedAccounts = serializeTokenHistory(accounts);
+        const auto restoredAccounts = parseTokenHistory(savedAccounts);
+        check(std::abs(activityStats(restoredAccounts, now, "anthropic", "0").lifetimeTokens - 15.0) < 0.001
+                  && std::abs(activityStats(restoredAccounts, now, "anthropic", "1").lifetimeTokens - 15.0) < 0.001,
+              "a reloaded history keeps the accounts apart");
 
         const auto legacy = parseTokenHistory("HLHIST1\nD 2026-06-14 10\nT 1 10\n");
         check(legacy.days.size() == 1 && legacy.days.front().providerId.empty() && legacy.deltas.front().providerId.empty(),
@@ -552,6 +786,10 @@ void testActivityHistory() {
               "a provider filter adds that provider's recorded and imported days");
         check(std::abs(activityStats(mixed, now, "openai").lifetimeTokens - 5.0) < 0.001,
               "another provider filter does not include the first provider or unlabeled days");
+        check(activityStats(mixed, now, "anthropic", "0").lifetimeTokens == 0.0,
+              "a provider total saved without an account is not given to one account");
+        check(std::abs(activityStats(mixed, now, "openai", "1").lifetimeTokens - 2.0) < 0.001,
+              "an account filter keeps that account's import and leaves the unlabeled provider day");
         auto tokensOnDay = [](const ActivityCalendar& calendar, CivilDay day) {
             for (const auto& week : calendar.weeks) {
                 for (const auto& cell : week.days) {
@@ -566,10 +804,17 @@ void testActivityHistory() {
               "the provider calendar omits the unlabeled part of a day");
         check(parseTokenHistory("HLHIST1\nD 2026-06-14 4 anthropic\nD 2026-06-14 9 anthropic\n").days.empty(),
               "a duplicate provider day yields an empty history");
+        check(parseTokenHistory("HLHIST1\nD 2026-06-14 4 anthropic 0\nD 2026-06-14 9 anthropic 0\n").days.empty(),
+              "a duplicate account day yields an empty history");
+        check(parseTokenHistory("HLHIST1\nD 2026-06-14 4 anthropic 0\nD 2026-06-14 9 anthropic 1\n").days.size() == 2,
+              "the same day may belong to two accounts");
         check(parseTokenHistory("HLHIST1\nD 2026-06-14 4 anthropic\nD 2026-06-14 9 openai\n").days.size() == 2,
               "the same day may belong to two providers");
-        check(parseTokenHistory("HLHIST1\nD 2026-06-14 4 anthropic extra\n").days.empty(),
-              "an extra day field yields an empty history");
+        const auto namedAccount = parseTokenHistory("HLHIST1\nD 2026-06-14 4 anthropic extra\n");
+        check(namedAccount.days.size() == 1 && namedAccount.days.front().accountId == "extra",
+              "the field after the provider is the account");
+        check(parseTokenHistory("HLHIST1\nD 2026-06-14 4 anthropic 0 extra\n").days.empty(),
+              "an extra account field yields an empty history");
     }
 }
 } // namespace

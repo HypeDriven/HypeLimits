@@ -236,6 +236,12 @@ struct ActivityHit {
     CalendarCell cell;
 };
 
+struct ActivityFocus {
+    std::string providerId;
+    std::string accountId;
+    friend bool operator==(const ActivityFocus&, const ActivityFocus&) = default;
+};
+
 struct ActivityLayout {
     ActivityCalendar calendar;
     ActivityStats stats;
@@ -2526,8 +2532,8 @@ private:
     void syncGoogleSecretControls();
     [[nodiscard]] HWND dialogParent() const;
     [[nodiscard]] const MetricHit* hitAt(POINT client) const;
-    [[nodiscard]] std::string providerIdAt(POINT client) const;
-    void setActivityProvider(std::string providerId);
+    [[nodiscard]] ActivityFocus activityFocusAt(POINT client) const;
+    void setActivityFocus(ActivityFocus focus);
     [[nodiscard]] const ProviderSnapshot& hitSnapshotFor(const MetricHit& hit) const;
     [[nodiscard]] bool authenticationFailedAt(POINT client) const;
     void handleMonitorClick(POINT client);
@@ -2598,7 +2604,7 @@ private:
     std::jthread sessionScanThread_;
     std::atomic_bool sessionScanRunning_{false};
     std::optional<CivilDay> activityHoverDay_;
-    std::string activityProviderId_;
+    ActivityFocus activityFocus_;
     bool activityTracking_{false};
     HBITMAP activityBitmap_{};
     void* activityBits_{};
@@ -3542,6 +3548,8 @@ struct RefreshResult {
 struct SessionScanResult {
     bool scanned{false};
     std::vector<LocalSessionImport> imports;
+    std::vector<OrganizationAccountLink> claudeLinks;
+    std::vector<SavedAccountSlot> claudeSlots;
 };
 
 std::filesystem::path sessionLogCacheFile() {
@@ -3562,7 +3570,14 @@ void App::startSessionLogScan() {
             if (wslHomeSyncEnabled(home) && !home.home.empty()) homes.emplace_back(home.home);
         }
     }
-    sessionScanThread_ = std::jthread([this, homes = std::move(homes)] {
+    std::vector<SavedAccountSlot> claudeSlots;
+    for (const DWORD slot : listAccountSlots(L"anthropic")) {
+        SavedAccountSlot saved;
+        saved.slotId = std::to_string(slot);
+        saved.accountUuid = utf8(readString(slotIdentitySetting(L"anthropic", slot).c_str()));
+        claudeSlots.push_back(std::move(saved));
+    }
+    sessionScanThread_ = std::jthread([this, homes = std::move(homes), claudeSlots = std::move(claudeSlots)] {
         applyWorkerPriorities();
         if (!sessionLogCacheLoaded_) {
             const auto file = sessionLogCacheFile();
@@ -3571,11 +3586,13 @@ void App::startSessionLogScan() {
         }
         bool anyHome = false;
         bool changed = false;
+        std::vector<OrganizationAccountLink> claudeLinks;
         for (const auto& home : homes) {
             const auto status = refreshSessionLogCache(sessionLogCache_, home);
             if (status == SessionLogScan::Unavailable) continue;
             anyHome = true;
             if (status == SessionLogScan::Updated) changed = true;
+            for (auto& link : claudeOrganizationLinks(home)) claudeLinks.push_back(std::move(link));
         }
         auto* result = new SessionScanResult;
         result->scanned = anyHome;
@@ -3585,6 +3602,8 @@ void App::startSessionLogScan() {
                 if (!file.empty()) storeSessionLogCache(sessionLogCache_, file);
             }
             result->imports = sessionLogImports(sessionLogCache_);
+            result->claudeLinks = std::move(claudeLinks);
+            result->claudeSlots = claudeSlots;
         }
         if (!PostMessageW(trayWindow_, kSessionLogMessage, 0, reinterpret_cast<LPARAM>(result))) delete result;
         sessionScanRunning_ = false;
@@ -3777,15 +3796,20 @@ const MetricHit* App::hitAt(POINT client) const {
     return found == hits_.end() ? nullptr : &*found;
 }
 
-std::string App::providerIdAt(POINT client) const {
+ActivityFocus App::activityFocusAt(POINT client) const {
     const auto* hit = hitAt(client);
     if (!hit || hit->provider >= providers_.size()) return {};
-    return utf8(providers_[hit->provider].definition.id);
+    const auto& provider = providers_[hit->provider];
+    ActivityFocus focus;
+    focus.providerId = utf8(provider.definition.id);
+    // One row is the whole provider. Several rows are one saved account each.
+    if (provider.monitorAccounts.size() > 1) focus.accountId = std::to_string(hit->slot);
+    return focus;
 }
 
-void App::setActivityProvider(std::string providerId) {
-    if (providerId == activityProviderId_) return;
-    activityProviderId_ = std::move(providerId);
+void App::setActivityFocus(ActivityFocus focus) {
+    if (focus == activityFocus_) return;
+    activityFocus_ = std::move(focus);
     destroyActivityBitmap();
     if (activityWindow_) InvalidateRect(activityWindow_, nullptr, FALSE);
 }
@@ -4249,7 +4273,7 @@ void App::toggleMonitor() {
     const bool visible = IsWindowVisible(floatingWindow_) != FALSE;
     ShowWindow(floatingWindow_, visible ? SW_HIDE : SW_SHOWNOACTIVATE);
     writeDword(L"MonitorVisible", !visible);
-    if (visible) setActivityProvider({});
+    if (visible) setActivityFocus({});
 }
 
 void App::showTrayMenu() {
@@ -4270,13 +4294,26 @@ void App::showTrayMenu() {
 ActivityLayout App::layoutActivity() const {
     const auto now = std::chrono::system_clock::now();
     ActivityLayout layout;
-    layout.calendar = activityCalendar(activityHistory_, now, activityProviderId_);
-    layout.stats = activityStats(activityHistory_, now, activityProviderId_);
-    if (!activityProviderId_.empty()) {
+    layout.calendar = activityCalendar(activityHistory_, now, activityFocus_.providerId, activityFocus_.accountId);
+    layout.stats = activityStats(activityHistory_, now, activityFocus_.providerId, activityFocus_.accountId);
+    if (!activityFocus_.providerId.empty()) {
         const auto found = std::ranges::find_if(providers_, [&](const Provider& provider) {
-            return utf8(provider.definition.id) == activityProviderId_;
+            return utf8(provider.definition.id) == activityFocus_.providerId;
         });
-        layout.providerLabel = found == providers_.end() ? wide(activityProviderId_) : found->definition.name;
+        layout.providerLabel = found == providers_.end() ? wide(activityFocus_.providerId) : found->definition.name;
+        if (!activityFocus_.accountId.empty()) {
+            unsigned long slot = 0;
+            bool numeric = true;
+            for (const unsigned char character : activityFocus_.accountId) {
+                if (character < '0' || character > '9') {
+                    numeric = false;
+                    break;
+                }
+                slot = slot * 10 + static_cast<unsigned long>(character - '0');
+            }
+            layout.providerLabel += L" ";
+            layout.providerLabel += numeric ? std::to_wstring(slot + 1) : wide(activityFocus_.accountId);
+        }
     }
     const int weeks = std::max(1, static_cast<int>(layout.calendar.weeks.size()));
     layout.cell = 12;
@@ -4556,7 +4593,7 @@ void App::toggleActivity() {
             ScreenToClient(floatingWindow_, &client);
             RECT bounds{};
             GetClientRect(floatingWindow_, &bounds);
-            setActivityProvider(PtInRect(&bounds, client) ? providerIdAt(client) : std::string{});
+            setActivityFocus(PtInRect(&bounds, client) ? activityFocusAt(client) : ActivityFocus{});
         }
     }
     destroyActivityBitmap();
@@ -4833,7 +4870,7 @@ LRESULT App::onFloating(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
     }
     case WM_MOUSEMOVE: {
         POINT point{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
-        setActivityProvider(providerIdAt(point));
+        setActivityFocus(activityFocusAt(point));
         POINT cursor{};
         GetCursorPos(&cursor);
         const int dragDx = std::abs(static_cast<int>(cursor.x - dragStart_.x));
@@ -4864,12 +4901,12 @@ LRESULT App::onFloating(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
         return 0;
     }
     case WM_MOUSELEAVE:
-        setActivityProvider({});
+        setActivityFocus({});
         SendMessageW(tooltip_, TTM_TRACKACTIVATE, FALSE, 0);
         return 0;
     case WM_LBUTTONUP: {
         POINT point{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
-        setActivityProvider(providerIdAt(point));
+        setActivityFocus(activityFocusAt(point));
         POINT cursor{};
         GetCursorPos(&cursor);
         const bool moved = std::abs(static_cast<int>(cursor.x - dragStart_.x)) > kMonitorClickSlop
@@ -5117,7 +5154,14 @@ LRESULT App::onTray(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
         if (!completed->scanned) return 0;
         bool historyChanged = false;
         for (const auto& import : completed->imports) {
+            if (import.providerId == "anthropic") continue;
             if (replaceImportedDailyTokens(activityHistory_, import.providerId, kLocalSessionAccount, import.days)) {
+                historyChanged = true;
+            }
+        }
+        const auto claude = assignClaudeSessionImports(completed->imports, completed->claudeLinks, completed->claudeSlots);
+        for (const auto& import : claude) {
+            if (replaceImportedDailyTokens(activityHistory_, import.providerId, import.accountId, import.days)) {
                 historyChanged = true;
             }
         }

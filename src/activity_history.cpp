@@ -43,35 +43,45 @@ void addDaily(std::vector<DailyTokens>& days, CivilDay day, double tokens) {
     if (!(tokens > 0.0) || !std::isfinite(tokens)) return;
     const auto it = std::ranges::lower_bound(days, day, {}, &DailyTokens::day);
     if (it != days.end() && it->day == day) it->tokens += tokens;
-    else days.insert(it, DailyTokens{day, tokens, {}});
+    else days.insert(it, DailyTokens{day, tokens, {}, {}});
 }
 
-bool matchesProvider(std::string_view filter, std::string_view providerId) {
-    return filter.empty() || filter == providerId;
+bool matchesScope(std::string_view providerFilter, std::string_view accountFilter, std::string_view providerId,
+                  std::string_view accountId) {
+    if (!providerFilter.empty() && providerId != providerFilter) return false;
+    if (!accountFilter.empty() && accountId != accountFilter) return false;
+    return true;
 }
 
-std::vector<DailyTokens> combinedDailyTotals(const TokenHistory& history, std::string_view providerId) {
+bool dayBefore(const DailyTokens& left, const DailyTokens& right) {
+    if (left.day != right.day) return left.day < right.day;
+    if (left.providerId != right.providerId) return left.providerId < right.providerId;
+    return left.accountId < right.accountId;
+}
+
+std::vector<DailyTokens> combinedDailyTotals(const TokenHistory& history, std::string_view providerId,
+                                             std::string_view accountId) {
     std::vector<DailyTokens> days;
     for (const auto& day : history.days) {
-        if (!matchesProvider(providerId, day.providerId)) continue;
+        if (!matchesScope(providerId, accountId, day.providerId, day.accountId)) continue;
         addDaily(days, day.day, day.tokens);
     }
     for (const auto& imported : history.imported) {
-        if (!matchesProvider(providerId, imported.providerId)) continue;
+        if (!matchesScope(providerId, accountId, imported.providerId, imported.accountId)) continue;
         addDaily(days, imported.day, imported.tokens);
     }
     return days;
 }
 
-double tokensOn(const TokenHistory& history, CivilDay day, std::string_view providerId) {
+double tokensOn(const TokenHistory& history, CivilDay day, std::string_view providerId, std::string_view accountId) {
     double total = 0.0;
     const auto found = std::ranges::lower_bound(history.days, day, {}, &DailyTokens::day);
     for (auto it = found; it != history.days.end() && it->day == day; ++it) {
-        if (!matchesProvider(providerId, it->providerId)) continue;
+        if (!matchesScope(providerId, accountId, it->providerId, it->accountId)) continue;
         total += it->tokens;
     }
     for (const auto& imported : history.imported) {
-        if (imported.day != day || !matchesProvider(providerId, imported.providerId)) continue;
+        if (imported.day != day || !matchesScope(providerId, accountId, imported.providerId, imported.accountId)) continue;
         total += imported.tokens;
     }
     return total;
@@ -424,6 +434,44 @@ bool knownSessionProvider(std::string_view providerId) {
     return providerId == "anthropic" || providerId == "xai" || providerId == "moonshot";
 }
 
+bool isUuid(std::string_view text) {
+    if (text.size() != 36) return false;
+    for (std::size_t index = 0; index < text.size(); ++index) {
+        if (index == 8 || index == 13 || index == 18 || index == 23) {
+            if (text[index] != '-') return false;
+            continue;
+        }
+        const unsigned char character = static_cast<unsigned char>(text[index]);
+        const bool hex = (character >= '0' && character <= '9') || (character >= 'a' && character <= 'f')
+            || (character >= 'A' && character <= 'F');
+        if (!hex) return false;
+    }
+    return true;
+}
+
+// The session id is the first UUID path component under .claude/projects/.
+// A parent transcript and its subagent files share that component.
+std::string claudeSessionId(std::string_view path) {
+    constexpr std::string_view marker = "/.claude/projects/";
+    const auto at = path.find(marker);
+    if (at == std::string_view::npos) {
+        constexpr std::string_view prefix = ".claude/projects/";
+        if (!path.starts_with(prefix)) return {};
+        path.remove_prefix(prefix.size());
+    } else {
+        path.remove_prefix(at + marker.size());
+    }
+    while (!path.empty()) {
+        const auto slash = path.find('/');
+        auto component = slash == std::string_view::npos ? path : path.substr(0, slash);
+        if (component.ends_with(".jsonl")) component.remove_suffix(6);
+        if (isUuid(component)) return std::string(component);
+        if (slash == std::string_view::npos) break;
+        path.remove_prefix(slash + 1);
+    }
+    return {};
+}
+
 void consumeSessionLogLine(std::vector<DailyTokens>& days, std::unordered_map<std::string, SeenUse>& seen, std::string_view line) {
     if (jsonFieldEquals(line, "sessionUpdate", "turn_completed")) {
         const auto usage = jsonObjectContaining(line, "usage", "\"totalTokens\"");
@@ -465,20 +513,128 @@ void consumeSessionLogLine(std::vector<DailyTokens>& days, std::unordered_map<st
     noteOnce(days, seen, "c:" + request, localCivilDay(*when), tokens);
 }
 
-std::vector<DailyTokens> parseSessionLogStream(std::istream& input) {
+struct SessionStream {
     std::vector<DailyTokens> days;
+    // Empty when the organization was not requested. Otherwise an organization id,
+    // "local" when the file names none, or "mixed" when it names more than one.
+    std::string claudeAccount;
+    bool ok{false};
+};
+
+SessionStream parseSessionLogStream(std::istream& input, bool collectOrganization) {
+    SessionStream parsed;
     std::unordered_map<std::string, SeenUse> seen;
+    std::set<std::string> organizations;
     std::string line;
     while (std::getline(input, line)) {
         if (!line.empty() && line.back() == '\r') line.pop_back();
         if (line.size() > 64 * 1024 * 1024) continue;
+        if (collectOrganization && line.find("organizationUuid") != std::string::npos
+            && line.find("credential_org") != std::string::npos && jsonFieldEquals(line, "type", "credential_org")) {
+            const auto organization = jsonStringIn(line, "organizationUuid");
+            if (isUuid(organization)) organizations.insert(organization);
+        }
         if (line.find("\"input_tokens\"") == std::string::npos && line.find("turn_completed") == std::string::npos
             && line.find("usage.record") == std::string::npos) {
             continue;
         }
-        consumeSessionLogLine(days, seen, line);
+        consumeSessionLogLine(parsed.days, seen, line);
     }
-    return days;
+    if (!input.eof() && input.fail()) return parsed;
+    parsed.ok = true;
+    if (!collectOrganization) return parsed;
+    if (organizations.size() > 1) parsed.claudeAccount = "mixed";
+    else if (organizations.size() == 1) parsed.claudeAccount = *organizations.begin();
+    else parsed.claudeAccount = std::string(kLocalSessionAccount);
+    return parsed;
+}
+
+// Organization id only. Empty when the file could not be read, so the caller retries.
+// Stops once two organizations are known. Does not parse token totals.
+std::string claudeOrganizationAccount(std::istream& input) {
+    std::set<std::string> organizations;
+    std::string line;
+    while (std::getline(input, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (line.size() > 64 * 1024 * 1024) continue;
+        if (line.find("organizationUuid") == std::string::npos || line.find("credential_org") == std::string::npos) continue;
+        if (!jsonFieldEquals(line, "type", "credential_org")) continue;
+        const auto organization = jsonStringIn(line, "organizationUuid");
+        if (!isUuid(organization)) continue;
+        organizations.insert(organization);
+        if (organizations.size() > 1) return "mixed";
+    }
+    if (!input.eof() && input.fail()) return {};
+    if (organizations.empty()) return std::string(kLocalSessionAccount);
+    return *organizations.begin();
+}
+
+std::string readConfigTail(const std::filesystem::path& file) {
+    constexpr std::uint64_t kFullLimit = 4 * 1024 * 1024;
+    constexpr std::uint64_t kTailLimit = 1024 * 1024;
+    std::error_code error;
+    const auto size = std::filesystem::file_size(file, error);
+    if (error || size == 0) return {};
+    std::ifstream input(file, std::ios::binary);
+    if (!input) return {};
+    auto take = size;
+    if (size > kFullLimit) {
+        input.seekg(static_cast<std::streamoff>(size - kTailLimit));
+        take = kTailLimit;
+    }
+    std::string text(static_cast<std::size_t>(take), '\0');
+    input.read(text.data(), static_cast<std::streamsize>(take));
+    text.resize(static_cast<std::size_t>(input.gcount()));
+    return text;
+}
+
+std::vector<OrganizationAccountLink> linksInClaudeConfig(std::string_view text) {
+    std::vector<OrganizationAccountLink> links;
+    std::size_t from = 0;
+    while (from < text.size()) {
+        const auto at = text.find("\"oauthAccount\"", from);
+        if (at == std::string_view::npos) break;
+        const auto open = text.find('{', at + std::string_view{"\"oauthAccount\""}.size());
+        if (open == std::string_view::npos) break;
+        const auto end = matchingJsonBrace(text, open);
+        if (end <= open) {
+            from = open + 1;
+            continue;
+        }
+        const auto object = text.substr(open, end - open);
+        const auto account = jsonStringIn(object, "accountUuid");
+        const auto organization = jsonStringIn(object, "organizationUuid");
+        if (isUuid(account) && isUuid(organization)) links.push_back(OrganizationAccountLink{account, organization});
+        from = end;
+    }
+    return links;
+}
+
+void appendUniqueLinks(std::vector<OrganizationAccountLink>& into, std::vector<OrganizationAccountLink> more) {
+    for (auto& link : more) {
+        const bool exists = std::ranges::any_of(into, [&](const OrganizationAccountLink& have) {
+            return have.accountUuid == link.accountUuid && have.organizationUuid == link.organizationUuid;
+        });
+        if (!exists) into.push_back(std::move(link));
+    }
+}
+
+bool cacheAccountId(std::string_view field, std::string& accountId) {
+    if (field == "pending") {
+        accountId.clear();
+        return true;
+    }
+    if (field == "local" || field == "mixed" || isUuid(field)) {
+        accountId = std::string(field);
+        return true;
+    }
+    return false;
+}
+
+std::string cacheAccountLabel(const SessionLogCacheEntry& entry) {
+    if (!entry.accountId.empty()) return entry.accountId;
+    if (entry.providerId == "anthropic") return "pending";
+    return std::string(kLocalSessionAccount);
 }
 
 std::string pathKey(const std::filesystem::path& path) {
@@ -609,17 +765,16 @@ bool recordTokenObservations(TokenHistory& history, std::span<const TokenObserva
         if (suppressSession || !(delta > 0.0)) continue;
 
         const CivilDay day = localCivilDay(observation.observedAt);
-        const auto dayIt = std::ranges::lower_bound(history.days, day, {}, &DailyTokens::day);
-        auto match = dayIt;
-        while (match != history.days.end() && match->day == day && match->providerId != observation.providerId) ++match;
-        if (match != history.days.end() && match->day == day) match->tokens += delta;
-        else {
-            auto insertAt = dayIt;
-            while (insertAt != history.days.end() && insertAt->day == day && insertAt->providerId < observation.providerId) ++insertAt;
-            history.days.insert(insertAt, DailyTokens{day, delta, observation.providerId});
+        DailyTokens row{day, delta, observation.providerId, observation.accountId};
+        const auto match = std::ranges::lower_bound(history.days, row, dayBefore);
+        if (match != history.days.end() && match->day == day && match->providerId == observation.providerId
+            && match->accountId == observation.accountId) {
+            match->tokens += delta;
+        } else {
+            history.days.insert(match, std::move(row));
         }
         const auto deltaIt = std::ranges::upper_bound(history.deltas, observation.observedAt, {}, &TokenDelta::at);
-        history.deltas.insert(deltaIt, TokenDelta{observation.observedAt, delta, observation.providerId});
+        history.deltas.insert(deltaIt, TokenDelta{observation.observedAt, delta, observation.providerId, observation.accountId});
         changed = true;
     }
     return changed;
@@ -669,7 +824,7 @@ std::optional<std::vector<DailyTokens>> parseCodexDailyTokens(std::string_view j
 
 std::vector<DailyTokens> parseSessionLogTokens(std::string_view jsonl) {
     std::istringstream input{std::string(jsonl)};
-    return parseSessionLogStream(input);
+    return parseSessionLogStream(input, false).days;
 }
 
 SessionLogScan refreshSessionLogCache(SessionLogCache& cache, const std::filesystem::path& home) {
@@ -710,17 +865,28 @@ SessionLogScan refreshSessionLogCache(SessionLogCache& cache, const std::filesys
             const auto found = kept.find(key);
             if (found != kept.end() && found->second.providerId == root.provider && found->second.modified == stamp
                 && found->second.size == size) {
+                // An older cache has the token totals but no organization. Read that id only.
+                if (std::string_view{root.provider} != "anthropic" || !found->second.accountId.empty()) return;
+                std::ifstream organizationInput(file, std::ios::binary);
+                if (!organizationInput) return;
+                const auto account = claudeOrganizationAccount(organizationInput);
+                if (account.empty()) return;
+                found->second.accountId = account;
+                changed = true;
                 return;
             }
             std::ifstream input(file, std::ios::binary);
             if (!input) return;
+            const bool claude = std::string_view{root.provider} == "anthropic";
+            const auto parsed = parseSessionLogStream(input, claude);
+            if (!parsed.ok) return;
             SessionLogCacheEntry entry;
             entry.providerId = root.provider;
             entry.path = key;
             entry.modified = stamp;
             entry.size = static_cast<std::uint64_t>(size);
-            entry.days = parseSessionLogStream(input);
-            if (!input.eof() && input.fail()) return;
+            entry.accountId = claude ? parsed.claudeAccount : std::string(kLocalSessionAccount);
+            entry.days = parsed.days;
             if (found == kept.end()) kept.emplace(key, std::move(entry));
             else found->second = std::move(entry);
             changed = true;
@@ -749,10 +915,56 @@ SessionLogScan refreshSessionLogCache(SessionLogCache& cache, const std::filesys
 }
 
 std::vector<LocalSessionImport> sessionLogImports(const SessionLogCache& cache) {
+    std::unordered_map<std::string, std::set<std::string>> organizationsBySession;
+    for (const auto& entry : cache.entries) {
+        if (entry.providerId != "anthropic" || !isUuid(entry.accountId)) continue;
+        const auto session = claudeSessionId(entry.path);
+        if (session.empty()) continue;
+        organizationsBySession[session].insert(entry.accountId);
+    }
+    std::unordered_map<std::string, std::string> inheritedOrganization;
+    for (const auto& [session, organizations] : organizationsBySession) {
+        if (organizations.size() == 1) inheritedOrganization.emplace(session, *organizations.begin());
+    }
+
+    std::unordered_map<std::string, std::vector<DailyTokens>> claudeDays;
+    bool anyClaude = false;
+    for (const auto& entry : cache.entries) {
+        if (entry.providerId != "anthropic") continue;
+        anyClaude = true;
+        std::string account{kLocalSessionAccount};
+        if (isUuid(entry.accountId)) {
+            account = entry.accountId;
+        } else if (entry.accountId == kLocalSessionAccount) {
+            const auto session = claudeSessionId(entry.path);
+            if (const auto found = inheritedOrganization.find(session); found != inheritedOrganization.end()) {
+                account = found->second;
+            }
+        }
+        for (const auto& day : entry.days) addDaily(claudeDays[account], day.day, day.tokens);
+    }
+
     std::vector<LocalSessionImport> imports;
-    for (const char* provider : {"anthropic", "xai", "moonshot"}) {
-        LocalSessionImport import;
-        import.providerId = provider;
+    if (!anyClaude || claudeDays.empty()) {
+        imports.push_back(LocalSessionImport{"anthropic", std::string(kLocalSessionAccount), {}});
+    } else {
+        std::vector<std::string> accounts;
+        accounts.reserve(claudeDays.size());
+        for (const auto& [account, days] : claudeDays) {
+            if (!days.empty()) accounts.push_back(account);
+        }
+        std::ranges::sort(accounts);
+        if (accounts.empty()) {
+            imports.push_back(LocalSessionImport{"anthropic", std::string(kLocalSessionAccount), {}});
+        } else {
+            for (const auto& account : accounts) {
+                imports.push_back(LocalSessionImport{"anthropic", account, std::move(claudeDays[account])});
+            }
+        }
+    }
+
+    for (const char* provider : {"xai", "moonshot"}) {
+        LocalSessionImport import{std::string(provider), std::string(kLocalSessionAccount), {}};
         for (const auto& entry : cache.entries) {
             if (entry.providerId != provider) continue;
             for (const auto& day : entry.days) addDaily(import.days, day.day, day.tokens);
@@ -762,10 +974,145 @@ std::vector<LocalSessionImport> sessionLogImports(const SessionLogCache& cache) 
     return imports;
 }
 
+std::vector<OrganizationAccountLink> claudeOrganizationLinks(const std::filesystem::path& home) {
+    std::vector<OrganizationAccountLink> links;
+    appendUniqueLinks(links, linksInClaudeConfig(readConfigTail(home / ".claude.json")));
+    std::error_code error;
+    const auto backups = home / ".claude" / "backups";
+    if (!std::filesystem::is_directory(backups, error) || error) return links;
+    std::filesystem::directory_iterator it(backups, std::filesystem::directory_options::skip_permission_denied, error);
+    if (error) return links;
+    const std::filesystem::directory_iterator end;
+    while (it != end) {
+        error.clear();
+        const auto name = it->path().filename().generic_u8string();
+        const std::string filename(name.begin(), name.end());
+        if (it->is_regular_file(error) && !error && filename.starts_with(".claude.json.backup")) {
+            appendUniqueLinks(links, linksInClaudeConfig(readConfigTail(it->path())));
+        }
+        error.clear();
+        it.increment(error);
+        if (error) break;
+    }
+    return links;
+}
+
+std::vector<OrganizationSlotMatch> matchOrganizationsToSlots(std::span<const OrganizationAccountLink> links,
+                                                            std::span<const SavedAccountSlot> slots,
+                                                            std::span<const std::string> organizationIds) {
+    const bool anyIdentity = std::ranges::any_of(slots, [](const SavedAccountSlot& slot) { return isUuid(slot.accountUuid); });
+    if (!anyIdentity) return {};
+
+    std::unordered_map<std::string, std::vector<std::size_t>> slotsByAccount;
+    for (std::size_t index = 0; index < slots.size(); ++index) {
+        if (!parseId(slots[index].slotId) || !isUuid(slots[index].accountUuid)) continue;
+        slotsByAccount[slots[index].accountUuid].push_back(index);
+    }
+
+    std::unordered_map<std::string, std::string> organizationByAccount;
+    std::set<std::string> ambiguousAccounts;
+    for (const auto& link : links) {
+        if (!isUuid(link.accountUuid) || !isUuid(link.organizationUuid)) continue;
+        if (ambiguousAccounts.contains(link.accountUuid)) continue;
+        const auto [it, inserted] = organizationByAccount.try_emplace(link.accountUuid, link.organizationUuid);
+        if (!inserted && it->second != link.organizationUuid) {
+            organizationByAccount.erase(it);
+            ambiguousAccounts.insert(link.accountUuid);
+        }
+    }
+
+    std::unordered_map<std::string, std::size_t> organizationToSlot;
+    std::set<std::string> conflictedOrganizations;
+    for (const auto& [account, indexes] : slotsByAccount) {
+        if (indexes.size() != 1) continue;
+        const auto link = organizationByAccount.find(account);
+        if (link == organizationByAccount.end()) continue;
+        const auto& organization = link->second;
+        if (conflictedOrganizations.contains(organization)) continue;
+        const auto [it, inserted] = organizationToSlot.try_emplace(organization, indexes.front());
+        if (!inserted && it->second != indexes.front()) {
+            organizationToSlot.erase(it);
+            conflictedOrganizations.insert(organization);
+        }
+    }
+
+    std::vector<char> slotUsed(slots.size(), 0);
+    for (const auto& [organization, index] : organizationToSlot) slotUsed[index] = 1;
+
+    std::vector<std::string> leftoverOrganizations;
+    for (const auto& organization : organizationIds) {
+        if (!isUuid(organization) || organizationToSlot.contains(organization) || conflictedOrganizations.contains(organization)) {
+            continue;
+        }
+        if (std::ranges::find(leftoverOrganizations, organization) == leftoverOrganizations.end()) {
+            leftoverOrganizations.push_back(organization);
+        }
+    }
+    std::vector<std::size_t> leftoverSlots;
+    for (std::size_t index = 0; index < slots.size(); ++index) {
+        if (!parseId(slots[index].slotId) || slotUsed[index]) continue;
+        leftoverSlots.push_back(index);
+    }
+    if (leftoverOrganizations.size() == 1 && leftoverSlots.size() == 1) {
+        organizationToSlot.emplace(leftoverOrganizations.front(), leftoverSlots.front());
+    }
+
+    std::vector<OrganizationSlotMatch> matches;
+    matches.reserve(organizationToSlot.size());
+    for (const auto& [organization, index] : organizationToSlot) {
+        matches.push_back(OrganizationSlotMatch{organization, slots[index].slotId});
+    }
+    std::ranges::sort(matches, [](const OrganizationSlotMatch& left, const OrganizationSlotMatch& right) {
+        if (left.slotId != right.slotId) return left.slotId < right.slotId;
+        return left.organizationId < right.organizationId;
+    });
+    return matches;
+}
+
+std::vector<LocalSessionImport> assignClaudeSessionImports(std::span<const LocalSessionImport> imports,
+                                                          std::span<const OrganizationAccountLink> links,
+                                                          std::span<const SavedAccountSlot> slots) {
+    std::vector<std::string> organizations;
+    for (const auto& import : imports) {
+        if (import.providerId == "anthropic" && isUuid(import.accountId)) organizations.push_back(import.accountId);
+    }
+    const auto matches = matchOrganizationsToSlots(links, slots, organizations);
+    std::unordered_map<std::string, std::string> slotForOrganization;
+    for (const auto& match : matches) slotForOrganization.emplace(match.organizationId, match.slotId);
+
+    std::unordered_map<std::string, std::vector<DailyTokens>> daysByAccount;
+    std::vector<std::string> slotOrder;
+    for (const auto& slot : slots) {
+        if (!parseId(slot.slotId) || daysByAccount.contains(slot.slotId)) continue;
+        daysByAccount.emplace(slot.slotId, std::vector<DailyTokens>{});
+        slotOrder.push_back(slot.slotId);
+    }
+    const std::string local{kLocalSessionAccount};
+    daysByAccount.emplace(local, std::vector<DailyTokens>{});
+    for (const auto& import : imports) {
+        if (import.providerId != "anthropic") continue;
+        std::string account = local;
+        if (const auto found = slotForOrganization.find(import.accountId); found != slotForOrganization.end()) {
+            account = found->second;
+        }
+        for (const auto& day : import.days) addDaily(daysByAccount[account], day.day, day.tokens);
+    }
+
+    std::vector<LocalSessionImport> assigned;
+    assigned.reserve(slotOrder.size() + 1);
+    for (const auto& slotId : slotOrder) {
+        assigned.push_back(LocalSessionImport{"anthropic", slotId, std::move(daysByAccount[slotId])});
+    }
+    assigned.push_back(LocalSessionImport{"anthropic", local, std::move(daysByAccount[local])});
+    return assigned;
+}
+
 std::string serializeSessionLogCache(const SessionLogCache& cache) {
-    std::string text = "HLSL1\n";
+    std::string text = "HLSL2\n";
     for (const auto& entry : cache.entries) {
         if (!knownSessionProvider(entry.providerId) || entry.path.empty() || entry.path.find('\n') != std::string::npos) continue;
+        const auto account = cacheAccountLabel(entry);
+        if (account.find(' ') != std::string::npos || account.find('\n') != std::string::npos) continue;
         text += "E ";
         text += entry.providerId;
         text += ' ';
@@ -774,6 +1121,8 @@ std::string serializeSessionLogCache(const SessionLogCache& cache) {
         text += std::to_string(entry.size);
         text += ' ';
         text += std::to_string(entry.days.size());
+        text += ' ';
+        text += account;
         text += '\n';
         text += entry.path;
         text += '\n';
@@ -799,7 +1148,8 @@ SessionLogCache parseSessionLogCache(std::string_view text) {
         return true;
     };
     std::string_view line;
-    if (!nextLine(line) || line != "HLSL1") return {};
+    if (!nextLine(line) || (line != "HLSL1" && line != "HLSL2")) return {};
+    const bool version2 = line == "HLSL2";
     std::set<std::string> paths;
     while (nextLine(line)) {
         if (line.empty()) continue;
@@ -809,7 +1159,14 @@ SessionLogCache parseSessionLogCache(std::string_view text) {
         const auto modifiedField = takeField(rest);
         const auto sizeField = takeField(rest);
         const auto countField = takeField(rest);
-        if (!providerField || !modifiedField || !sizeField || !countField || !rest.empty()) return {};
+        std::string accountId;
+        if (version2) {
+            const auto accountField = takeField(rest);
+            if (!providerField || !modifiedField || !sizeField || !countField || !accountField || !rest.empty()) return {};
+            if (!cacheAccountId(*accountField, accountId)) return {};
+        } else if (!providerField || !modifiedField || !sizeField || !countField || !rest.empty()) {
+            return {};
+        }
         if (!knownSessionProvider(*providerField)) return {};
         long long modified = 0;
         unsigned long long size = 0;
@@ -830,6 +1187,7 @@ SessionLogCache parseSessionLogCache(std::string_view text) {
         entry.path = std::string(line);
         entry.modified = modified;
         entry.size = size;
+        entry.accountId = std::move(accountId);
         if (!paths.insert(entry.path).second) return {};
         entry.days.reserve(static_cast<std::size_t>(count));
         for (unsigned long long index = 0; index < count; ++index) {
@@ -839,7 +1197,7 @@ SessionLogCache parseSessionLogCache(std::string_view text) {
             CivilDay day;
             double tokens = 0.0;
             if (!parseDate(line.substr(0, space), day) || !parseDouble(line.substr(space + 1), tokens) || !(tokens > 0.0)) return {};
-            entry.days.push_back(DailyTokens{day, tokens, {}});
+            entry.days.push_back(DailyTokens{day, tokens, {}, {}});
         }
         cache.entries.push_back(std::move(entry));
     }
@@ -922,12 +1280,13 @@ bool replaceImportedDailyTokens(TokenHistory& history, std::string_view provider
     return true;
 }
 
-ActivityStats activityStats(const TokenHistory& history, TimePoint now, std::string_view providerId) {
+ActivityStats activityStats(const TokenHistory& history, TimePoint now, std::string_view providerId,
+                             std::string_view accountId) {
     ActivityStats stats;
     int run = 0;
     bool inRun = false;
     CivilDay previous{};
-    const auto days = combinedDailyTotals(history, providerId);
+    const auto days = combinedDailyTotals(history, providerId, accountId);
     for (const auto& day : days) {
         stats.lifetimeTokens += day.tokens;
         stats.peakTokensPerDay = std::max(stats.peakTokensPerDay, day.tokens);
@@ -945,8 +1304,8 @@ ActivityStats activityStats(const TokenHistory& history, TimePoint now, std::str
 
     const CivilDay today = localCivilDay(now);
     // Today still at zero does not erase a streak that was alive yesterday.
-    CivilDay cursor = tokensOn(history, today, providerId) > 0.0 ? today : shiftCivilDay(today, -1);
-    while (tokensOn(history, cursor, providerId) > 0.0 && stats.currentStreakDays < 100000) {
+    CivilDay cursor = tokensOn(history, today, providerId, accountId) > 0.0 ? today : shiftCivilDay(today, -1);
+    while (tokensOn(history, cursor, providerId, accountId) > 0.0 && stats.currentStreakDays < 100000) {
         ++stats.currentStreakDays;
         cursor = shiftCivilDay(cursor, -1);
     }
@@ -954,7 +1313,8 @@ ActivityStats activityStats(const TokenHistory& history, TimePoint now, std::str
     return stats;
 }
 
-ActivityCalendar activityCalendar(const TokenHistory& history, TimePoint now, std::string_view providerId) {
+ActivityCalendar activityCalendar(const TokenHistory& history, TimePoint now, std::string_view providerId,
+                                   std::string_view accountId) {
     const CivilDay today = localCivilDay(now);
     const CivilDay earliest = shiftCivilDay(today, -364);
     const CivilDay start = shiftCivilDay(earliest, -sundayIndex(earliest));
@@ -967,7 +1327,7 @@ ActivityCalendar activityCalendar(const TokenHistory& history, TimePoint now, st
         for (int row = 0; row < 7 && cursor <= today; ++row) {
             CalendarCell cell;
             cell.day = cursor;
-            cell.tokens = tokensOn(history, cursor, providerId);
+            cell.tokens = tokensOn(history, cursor, providerId, accountId);
             if (cell.tokens > 0.0) positive.push_back(cell.tokens);
             column.days[static_cast<std::size_t>(row)] = cell;
             cursor = shiftCivilDay(cursor, 1);
@@ -989,14 +1349,12 @@ ActivityCalendar activityCalendar(const TokenHistory& history, TimePoint now, st
 
 std::string serializeTokenHistory(const TokenHistory& history) {
     auto days = history.days;
-    std::ranges::sort(days, [](const DailyTokens& left, const DailyTokens& right) {
-        if (left.day != right.day) return left.day < right.day;
-        return left.providerId < right.providerId;
-    });
+    std::ranges::sort(days, dayBefore);
     auto deltas = history.deltas;
     std::ranges::sort(deltas, [](const TokenDelta& left, const TokenDelta& right) {
         if (left.at != right.at) return left.at < right.at;
-        return left.providerId < right.providerId;
+        if (left.providerId != right.providerId) return left.providerId < right.providerId;
+        return left.accountId < right.accountId;
     });
     auto baselines = history.baselines;
     std::ranges::sort(baselines, [](const TokenBaseline& left, const TokenBaseline& right) {
@@ -1022,6 +1380,10 @@ std::string serializeTokenHistory(const TokenHistory& history) {
         if (!day.providerId.empty()) {
             text += ' ';
             text += day.providerId;
+            if (!day.accountId.empty() && parseId(day.accountId)) {
+                text += ' ';
+                text += day.accountId;
+            }
         }
         text += '\n';
     }
@@ -1035,6 +1397,10 @@ std::string serializeTokenHistory(const TokenHistory& history) {
         if (!delta.providerId.empty()) {
             text += ' ';
             text += delta.providerId;
+            if (!delta.accountId.empty() && parseId(delta.accountId)) {
+                text += ' ';
+                text += delta.accountId;
+            }
         }
         text += '\n';
     }
@@ -1096,28 +1462,40 @@ TokenHistory parseTokenHistory(std::string_view text) {
             const auto amount = takeField(rest);
             if (!date || !amount) return {};
             std::optional<std::string_view> provider;
+            std::optional<std::string_view> account;
             if (!rest.empty()) {
                 provider = takeField(rest);
-                if (!provider || !rest.empty() || !parseId(*provider)) return {};
+                if (!provider || !parseId(*provider)) return {};
+                if (!rest.empty()) {
+                    account = takeField(rest);
+                    if (!account || !rest.empty() || !parseId(*account)) return {};
+                }
             }
             DailyTokens day;
             if (!parseDate(*date, day.day) || !parseDouble(*amount, day.tokens) || !(day.tokens > 0.0)) return {};
             if (provider) day.providerId = std::string{*provider};
+            if (account) day.accountId = std::string{*account};
             history.days.push_back(day);
         } else if (kind == 'T') {
             const auto stamp = takeField(rest);
             const auto amount = takeField(rest);
             if (!stamp || !amount) return {};
             std::optional<std::string_view> provider;
+            std::optional<std::string_view> account;
             if (!rest.empty()) {
                 provider = takeField(rest);
-                if (!provider || !rest.empty() || !parseId(*provider)) return {};
+                if (!provider || !parseId(*provider)) return {};
+                if (!rest.empty()) {
+                    account = takeField(rest);
+                    if (!account || !rest.empty() || !parseId(*account)) return {};
+                }
             }
             long long milliseconds = 0;
             TokenDelta delta;
             if (!parseInt(*stamp, milliseconds) || !parseDouble(*amount, delta.tokens) || !(delta.tokens > 0.0)) return {};
             delta.at = fromUnixMilliseconds(milliseconds);
             if (provider) delta.providerId = std::string{*provider};
+            if (account) delta.accountId = std::string{*account};
             history.deltas.push_back(delta);
         } else if (kind == 'B') {
             const auto provider = takeField(rest);
@@ -1154,19 +1532,18 @@ TokenHistory parseTokenHistory(std::string_view text) {
     }
     if (!anyLine || !header) return {};
 
-    std::ranges::sort(history.days, [](const DailyTokens& left, const DailyTokens& right) {
-        if (left.day != right.day) return left.day < right.day;
-        return left.providerId < right.providerId;
-    });
+    std::ranges::sort(history.days, dayBefore);
     for (std::size_t index = 1; index < history.days.size(); ++index) {
-        if (history.days[index].day == history.days[index - 1].day
-            && history.days[index].providerId == history.days[index - 1].providerId) {
+        const auto& current = history.days[index];
+        const auto& previous = history.days[index - 1];
+        if (current.day == previous.day && current.providerId == previous.providerId && current.accountId == previous.accountId) {
             return {};
         }
     }
     std::ranges::sort(history.deltas, [](const TokenDelta& left, const TokenDelta& right) {
         if (left.at != right.at) return left.at < right.at;
-        return left.providerId < right.providerId;
+        if (left.providerId != right.providerId) return left.providerId < right.providerId;
+        return left.accountId < right.accountId;
     });
     std::ranges::sort(history.baselines, [](const TokenBaseline& left, const TokenBaseline& right) {
         if (left.providerId != right.providerId) return left.providerId < right.providerId;

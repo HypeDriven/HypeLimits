@@ -42,6 +42,8 @@ struct TokenDelta {
     double tokens{0};
     // Empty for an increase saved before the provider was recorded with it.
     std::string providerId;
+    // Empty when the increase was saved for the provider but not for one account.
+    std::string accountId;
 };
 
 struct DailyTokens {
@@ -49,6 +51,8 @@ struct DailyTokens {
     double tokens{0};
     // Empty for a total saved before the provider was recorded with it.
     std::string providerId;
+    // Empty when the total was saved for the provider but not for one account.
+    std::string accountId;
 };
 
 // Last absolute token counter for one provider account and allowance window.
@@ -120,11 +124,15 @@ inline constexpr std::string_view kLocalSessionAccount{"local"};
 enum class SessionLogScan { Unavailable, Unchanged, Updated };
 
 // One already-parsed log. Path is a filesystem path, never log text or a credential.
+// accountId is empty until a Claude file is scanned for its organization. After that
+// scan it is the organization id, "local" when the file names none, or "mixed" when
+// it names more than one. Grok and Kimi files use "local".
 struct SessionLogCacheEntry {
     std::string providerId;
     std::string path;
     std::int64_t modified{0};
     std::uint64_t size{0};
+    std::string accountId;
     std::vector<DailyTokens> days;
 };
 
@@ -134,7 +142,27 @@ struct SessionLogCache {
 
 struct LocalSessionImport {
     std::string providerId;
+    // Organization id, a saved slot label, or "local" for totals that belong to no one login.
+    std::string accountId;
     std::vector<DailyTokens> days;
+};
+
+// A Claude login's account id paired with the organization id stored beside it.
+// Neither value is a credential.
+struct OrganizationAccountLink {
+    std::string accountUuid;
+    std::string organizationUuid;
+};
+
+// One saved HypeLimits slot. slotId is the slot label ("0", "1"). accountUuid may be empty.
+struct SavedAccountSlot {
+    std::string slotId;
+    std::string accountUuid;
+};
+
+struct OrganizationSlotMatch {
+    std::string organizationId;
+    std::string slotId;
 };
 
 // Absolute tokens in one JSONL log. Repeated Claude requests and repeated Grok
@@ -146,7 +174,27 @@ struct LocalSessionImport {
 SessionLogScan refreshSessionLogCache(SessionLogCache& cache, const std::filesystem::path& home);
 
 // Claude, Grok, and Kimi totals from the cache. A provider with no logs is an empty list.
+// Claude rows are split by organization. A file that names no organization inherits its
+// session's organization when that session names exactly one; otherwise it stays "local".
 [[nodiscard]] std::vector<LocalSessionImport> sessionLogImports(const SessionLogCache& cache);
+
+// Account and organization ids named by ~/.claude.json and its backups. Other files are ignored.
+[[nodiscard]] std::vector<OrganizationAccountLink> claudeOrganizationLinks(const std::filesystem::path& home);
+
+// Pairs an organization with a saved slot when the slot's account id is already linked to
+// that organization. When exactly one organization and one slot are still unpaired, they
+// are paired. With no saved account ids, or with more than one of either left over, the
+// remainder stays unpaired.
+[[nodiscard]] std::vector<OrganizationSlotMatch> matchOrganizationsToSlots(
+    std::span<const OrganizationAccountLink> links, std::span<const SavedAccountSlot> slots,
+    std::span<const std::string> organizationIds);
+
+// Moves Claude imports onto the matched slot labels. Every saved slot is present, with an
+// empty day list when it has no logs. Unmatched organizations and "local" rows are summed
+// onto account "local". Other providers are ignored.
+[[nodiscard]] std::vector<LocalSessionImport> assignClaudeSessionImports(
+    std::span<const LocalSessionImport> imports, std::span<const OrganizationAccountLink> links,
+    std::span<const SavedAccountSlot> slots);
 
 [[nodiscard]] std::string serializeSessionLogCache(const SessionLogCache& cache);
 [[nodiscard]] SessionLogCache parseSessionLogCache(std::string_view text);
@@ -158,11 +206,13 @@ bool storeSessionLogCache(const SessionLogCache& cache, const std::filesystem::p
 bool replaceImportedDailyTokens(TokenHistory& history, std::string_view providerId, std::string_view accountId,
                                 std::span<const DailyTokens> days);
 
-// An empty provider id is every provider. A provider id keeps that provider's
-// imported days and the increases recorded for it. Older totals with no provider
-// stay in the all-providers view only.
-[[nodiscard]] ActivityStats activityStats(const TokenHistory& history, TimePoint now, std::string_view providerId = {});
-[[nodiscard]] ActivityCalendar activityCalendar(const TokenHistory& history, TimePoint now, std::string_view providerId = {});
+// An empty provider id is every provider. A provider id with an empty account id is
+// every account of that provider, including totals that name no account. Both ids
+// keep one account. Older totals with no provider stay in the all-providers view only.
+[[nodiscard]] ActivityStats activityStats(const TokenHistory& history, TimePoint now, std::string_view providerId = {},
+                                          std::string_view accountId = {});
+[[nodiscard]] ActivityCalendar activityCalendar(const TokenHistory& history, TimePoint now, std::string_view providerId = {},
+                                                std::string_view accountId = {});
 
 // Non-secret text. Malformed input returns an empty history.
 [[nodiscard]] std::string serializeTokenHistory(const TokenHistory& history);
