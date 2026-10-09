@@ -1,11 +1,17 @@
 #include "activity_history.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <charconv>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <limits>
 #include <set>
+#include <sstream>
+#include <unordered_map>
 #include <utility>
 
 namespace hypelimits {
@@ -37,22 +43,36 @@ void addDaily(std::vector<DailyTokens>& days, CivilDay day, double tokens) {
     if (!(tokens > 0.0) || !std::isfinite(tokens)) return;
     const auto it = std::ranges::lower_bound(days, day, {}, &DailyTokens::day);
     if (it != days.end() && it->day == day) it->tokens += tokens;
-    else days.insert(it, DailyTokens{day, tokens});
+    else days.insert(it, DailyTokens{day, tokens, {}});
 }
 
-std::vector<DailyTokens> combinedDailyTotals(const TokenHistory& history) {
+bool matchesProvider(std::string_view filter, std::string_view providerId) {
+    return filter.empty() || filter == providerId;
+}
+
+std::vector<DailyTokens> combinedDailyTotals(const TokenHistory& history, std::string_view providerId) {
     std::vector<DailyTokens> days;
-    for (const auto& day : history.days) addDaily(days, day.day, day.tokens);
-    for (const auto& imported : history.imported) addDaily(days, imported.day, imported.tokens);
+    for (const auto& day : history.days) {
+        if (!matchesProvider(providerId, day.providerId)) continue;
+        addDaily(days, day.day, day.tokens);
+    }
+    for (const auto& imported : history.imported) {
+        if (!matchesProvider(providerId, imported.providerId)) continue;
+        addDaily(days, imported.day, imported.tokens);
+    }
     return days;
 }
 
-double tokensOn(const TokenHistory& history, CivilDay day) {
+double tokensOn(const TokenHistory& history, CivilDay day, std::string_view providerId) {
     double total = 0.0;
     const auto found = std::ranges::lower_bound(history.days, day, {}, &DailyTokens::day);
-    if (found != history.days.end() && found->day == day) total += found->tokens;
+    for (auto it = found; it != history.days.end() && it->day == day; ++it) {
+        if (!matchesProvider(providerId, it->providerId)) continue;
+        total += it->tokens;
+    }
     for (const auto& imported : history.imported) {
-        if (imported.day == day) total += imported.tokens;
+        if (imported.day != day || !matchesProvider(providerId, imported.providerId)) continue;
+        total += imported.tokens;
     }
     return total;
 }
@@ -120,6 +140,51 @@ std::string jsonStringIn(std::string_view json, std::string_view key) {
     skipJsonString(json, index);
     if (index <= first + 1) return {};
     return std::string(json.substr(first + 1, index - first - 2));
+}
+
+bool jsonFieldEquals(std::string_view json, std::string_view key, std::string_view expected) {
+    const std::string needle = "\"" + std::string(key) + "\"";
+    std::size_t from = 0;
+    while (from < json.size()) {
+        const auto keyAt = json.find(needle, from);
+        if (keyAt == std::string_view::npos) return false;
+        const auto colon = json.find(':', keyAt + needle.size());
+        if (colon == std::string_view::npos) return false;
+        auto index = colon + 1;
+        while (index < json.size() && std::isspace(static_cast<unsigned char>(json[index]))) ++index;
+        if (index >= json.size() || json[index] != '"') {
+            from = keyAt + needle.size();
+            continue;
+        }
+        const auto start = index;
+        skipJsonString(json, index);
+        if (index > start + 1 && json.substr(start + 1, index - start - 2) == expected) return true;
+        from = keyAt + needle.size();
+    }
+    return false;
+}
+
+std::optional<std::string_view> jsonObjectContaining(std::string_view json, std::string_view key, std::string_view needle) {
+    const std::string quoted = "\"" + std::string(key) + "\"";
+    std::size_t from = 0;
+    while (from < json.size()) {
+        const auto keyAt = json.find(quoted, from);
+        if (keyAt == std::string_view::npos) return std::nullopt;
+        const auto colon = json.find(':', keyAt + quoted.size());
+        if (colon == std::string_view::npos) return std::nullopt;
+        auto index = colon + 1;
+        while (index < json.size() && std::isspace(static_cast<unsigned char>(json[index]))) ++index;
+        if (index >= json.size() || json[index] != '{') {
+            from = keyAt + quoted.size();
+            continue;
+        }
+        const auto end = matchingJsonBrace(json, index);
+        if (end <= index) return std::nullopt;
+        const auto object = json.substr(index, end - index);
+        if (object.find(needle) != std::string_view::npos) return object;
+        from = end;
+    }
+    return std::nullopt;
 }
 
 std::optional<std::string_view> jsonObjectIn(std::string_view json, std::string_view key) {
@@ -257,6 +322,210 @@ std::optional<std::string_view> takeField(std::string_view& rest) {
     return field;
 }
 
+double positiveSum(std::string_view json, std::initializer_list<const char*> keys) {
+    double total = 0.0;
+    for (const char* key : keys) {
+        const auto value = jsonNumberIn(json, key);
+        if (!value || !std::isfinite(*value) || !(*value > 0.0)) continue;
+        total += *value;
+    }
+    return total;
+}
+
+void removeDaily(std::vector<DailyTokens>& days, CivilDay day, double tokens) {
+    if (!(tokens > 0.0) || !std::isfinite(tokens)) return;
+    const auto it = std::ranges::lower_bound(days, day, {}, &DailyTokens::day);
+    if (it == days.end() || it->day != day) return;
+    it->tokens -= tokens;
+    if (!(it->tokens > 0.000001)) days.erase(it);
+}
+
+std::optional<TimePoint> timeFromUnix(double value) {
+    if (!std::isfinite(value) || value < 1000000000.0) return std::nullopt;
+    if (value > 10000000000.0) value /= 1000.0;
+    if (value > static_cast<double>(std::numeric_limits<std::int64_t>::max())) return std::nullopt;
+    return TimePoint{std::chrono::seconds{static_cast<std::int64_t>(value)}};
+}
+
+std::optional<TimePoint> timeFromIso(std::string_view text) {
+    if (text.size() < 19 || text[10] != 'T' || text[13] != ':' || text[16] != ':') return std::nullopt;
+    CivilDay day;
+    long long hour = 0;
+    long long minute = 0;
+    long long second = 0;
+    if (!parseDate(text.substr(0, 10), day) || !parseInt(text.substr(11, 2), hour) || !parseInt(text.substr(14, 2), minute)
+        || !parseInt(text.substr(17, 2), second)) {
+        return std::nullopt;
+    }
+    if (hour < 0 || hour > 23 || minute < 0 || minute > 59 || second < 0 || second > 60) return std::nullopt;
+    std::size_t index = 19;
+    if (index < text.size() && text[index] == '.') {
+        ++index;
+        if (index >= text.size() || !std::isdigit(static_cast<unsigned char>(text[index]))) return std::nullopt;
+        while (index < text.size() && std::isdigit(static_cast<unsigned char>(text[index]))) ++index;
+    }
+    int offsetMinutes = 0;
+    if (index < text.size() && (text[index] == 'Z' || text[index] == 'z')) {
+        ++index;
+    } else if (index < text.size() && (text[index] == '+' || text[index] == '-')) {
+        const int sign = text[index] == '-' ? -1 : 1;
+        ++index;
+        long long offsetHour = 0;
+        long long offsetMinute = 0;
+        if (index + 5 <= text.size() && text[index + 2] == ':') {
+            if (!parseInt(text.substr(index, 2), offsetHour) || !parseInt(text.substr(index + 3, 2), offsetMinute)) return std::nullopt;
+            index += 5;
+        } else if (index + 4 <= text.size()) {
+            if (!parseInt(text.substr(index, 2), offsetHour) || !parseInt(text.substr(index + 2, 2), offsetMinute)) return std::nullopt;
+            index += 4;
+        } else {
+            return std::nullopt;
+        }
+        if (offsetHour > 23 || offsetMinute > 59) return std::nullopt;
+        offsetMinutes = sign * static_cast<int>(offsetHour * 60 + offsetMinute);
+    }
+    if (index != text.size()) return std::nullopt;
+    return TimePoint{toSysDays(day)} + std::chrono::hours{hour} + std::chrono::minutes{minute} + std::chrono::seconds{second}
+        - std::chrono::minutes{offsetMinutes};
+}
+
+std::optional<TimePoint> timeFromTimestamp(std::string_view json) {
+    const auto text = jsonStringIn(json, "timestamp");
+    if (!text.empty()) {
+        if (const auto parsed = timeFromIso(text)) return parsed;
+    }
+    if (const auto stamp = jsonNumberIn(json, "timestamp")) {
+        if (const auto parsed = timeFromUnix(*stamp)) return parsed;
+    }
+    if (const auto stamp = jsonNumberIn(json, "time")) return timeFromUnix(*stamp);
+    return std::nullopt;
+}
+
+struct SeenUse {
+    double tokens{0};
+    CivilDay day{};
+};
+
+void noteOnce(std::vector<DailyTokens>& days, std::unordered_map<std::string, SeenUse>& seen, const std::string& key,
+              CivilDay day, double tokens) {
+    if (!(tokens > 0.0) || !std::isfinite(tokens)) return;
+    const auto [it, inserted] = seen.try_emplace(key, SeenUse{tokens, day});
+    if (inserted) {
+        addDaily(days, day, tokens);
+        return;
+    }
+    if (tokens <= it->second.tokens) return;
+    removeDaily(days, it->second.day, it->second.tokens);
+    addDaily(days, day, tokens);
+    it->second = SeenUse{tokens, day};
+}
+
+bool knownSessionProvider(std::string_view providerId) {
+    return providerId == "anthropic" || providerId == "xai" || providerId == "moonshot";
+}
+
+void consumeSessionLogLine(std::vector<DailyTokens>& days, std::unordered_map<std::string, SeenUse>& seen, std::string_view line) {
+    if (jsonFieldEquals(line, "sessionUpdate", "turn_completed")) {
+        const auto usage = jsonObjectContaining(line, "usage", "\"totalTokens\"");
+        const auto body = usage ? *usage : jsonObjectContaining(line, "usage", "\"inputTokens\"").value_or(std::string_view{});
+        if (body.empty()) return;
+        const auto when = timeFromTimestamp(line);
+        if (!when) return;
+        double tokens = 0.0;
+        if (const auto total = jsonNumberIn(body, "totalTokens"); total && *total > 0.0) tokens = *total;
+        else tokens = positiveSum(body, {"inputTokens", "outputTokens"});
+        auto prompt = jsonStringIn(line, "prompt_id");
+        if (prompt.empty()) prompt = jsonStringIn(line, "promptId");
+        if (prompt.empty()) prompt = "#" + std::to_string(seen.size()) + ":" + std::to_string(static_cast<long long>(tokens));
+        noteOnce(days, seen, "g:" + prompt, localCivilDay(*when), tokens);
+        return;
+    }
+
+    if (jsonFieldEquals(line, "type", "usage.record")) {
+        const auto scope = jsonStringIn(line, "usageScope");
+        if (!scope.empty() && scope != "turn") return;
+        const auto usage = jsonObjectContaining(line, "usage", "\"inputOther\"");
+        const auto body = usage ? *usage : jsonObjectContaining(line, "usage", "\"output\"").value_or(std::string_view{});
+        if (body.empty()) return;
+        const auto when = timeFromTimestamp(line);
+        if (!when) return;
+        const double tokens = positiveSum(body, {"inputOther", "output", "inputCacheRead", "inputCacheCreation"});
+        if (tokens > 0.0) addDaily(days, localCivilDay(*when), tokens);
+        return;
+    }
+
+    if (!jsonFieldEquals(line, "type", "assistant") || line.find("\"input_tokens\"") == std::string_view::npos) return;
+    const auto usage = jsonObjectContaining(line, "usage", "\"input_tokens\"");
+    if (!usage) return;
+    const auto when = timeFromTimestamp(line);
+    if (!when) return;
+    const double tokens = positiveSum(*usage, {"input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens", "output_tokens"});
+    auto request = jsonStringIn(line, "requestId");
+    if (request.empty()) request = "#" + std::to_string(seen.size()) + ":" + std::to_string(static_cast<long long>(tokens));
+    noteOnce(days, seen, "c:" + request, localCivilDay(*when), tokens);
+}
+
+std::vector<DailyTokens> parseSessionLogStream(std::istream& input) {
+    std::vector<DailyTokens> days;
+    std::unordered_map<std::string, SeenUse> seen;
+    std::string line;
+    while (std::getline(input, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (line.size() > 64 * 1024 * 1024) continue;
+        if (line.find("\"input_tokens\"") == std::string::npos && line.find("turn_completed") == std::string::npos
+            && line.find("usage.record") == std::string::npos) {
+            continue;
+        }
+        consumeSessionLogLine(days, seen, line);
+    }
+    return days;
+}
+
+std::string pathKey(const std::filesystem::path& path) {
+    const auto normal = path.lexically_normal().generic_u8string();
+    return std::string(normal.begin(), normal.end());
+}
+
+bool underHome(std::string_view path, std::string_view home) {
+    return path.size() > home.size() && path.starts_with(home) && path[home.size()] == '/';
+}
+
+std::int64_t modifiedStamp(const std::filesystem::file_time_type& time) {
+    return static_cast<std::int64_t>(time.time_since_epoch().count());
+}
+
+const char* providerForSessionFile(const std::filesystem::path& home, const std::filesystem::path& file) {
+    const auto key = pathKey(file);
+    const auto root = pathKey(home);
+    const std::string claude = root + "/.claude/projects/";
+    const std::string grok = root + "/.grok/sessions/";
+    const std::string kimi = root + "/.kimi-code/sessions/";
+    const auto name = file.filename().generic_u8string();
+    const std::string filename(name.begin(), name.end());
+    if (key.starts_with(claude) && filename.ends_with(".jsonl")) return "anthropic";
+    if (key.starts_with(grok) && filename == "updates.jsonl") return "xai";
+    if (key.starts_with(kimi) && filename == "wire.jsonl") return "moonshot";
+    return nullptr;
+}
+
+bool walkListed(const std::filesystem::path& root, const auto& visit) {
+    std::error_code error;
+    const bool directory = std::filesystem::is_directory(root, error);
+    if (error) return false;
+    if (!directory) return true;
+    std::filesystem::recursive_directory_iterator it(root, std::filesystem::directory_options::skip_permission_denied, error);
+    if (error) return false;
+    const std::filesystem::recursive_directory_iterator end;
+    while (it != end) {
+        error.clear();
+        if (it->is_regular_file(error) && !error) visit(it->path());
+        error.clear();
+        it.increment(error);
+        if (error) return false;
+    }
+    return true;
+}
+
 std::int64_t toUnixMilliseconds(TimePoint time) {
     return std::chrono::duration_cast<std::chrono::milliseconds>(time.time_since_epoch()).count();
 }
@@ -341,10 +610,16 @@ bool recordTokenObservations(TokenHistory& history, std::span<const TokenObserva
 
         const CivilDay day = localCivilDay(observation.observedAt);
         const auto dayIt = std::ranges::lower_bound(history.days, day, {}, &DailyTokens::day);
-        if (dayIt != history.days.end() && dayIt->day == day) dayIt->tokens += delta;
-        else history.days.insert(dayIt, DailyTokens{day, delta});
+        auto match = dayIt;
+        while (match != history.days.end() && match->day == day && match->providerId != observation.providerId) ++match;
+        if (match != history.days.end() && match->day == day) match->tokens += delta;
+        else {
+            auto insertAt = dayIt;
+            while (insertAt != history.days.end() && insertAt->day == day && insertAt->providerId < observation.providerId) ++insertAt;
+            history.days.insert(insertAt, DailyTokens{day, delta, observation.providerId});
+        }
         const auto deltaIt = std::ranges::upper_bound(history.deltas, observation.observedAt, {}, &TokenDelta::at);
-        history.deltas.insert(deltaIt, TokenDelta{observation.observedAt, delta});
+        history.deltas.insert(deltaIt, TokenDelta{observation.observedAt, delta, observation.providerId});
         changed = true;
     }
     return changed;
@@ -392,6 +667,224 @@ std::optional<std::vector<DailyTokens>> parseCodexDailyTokens(std::string_view j
     return days;
 }
 
+std::vector<DailyTokens> parseSessionLogTokens(std::string_view jsonl) {
+    std::istringstream input{std::string(jsonl)};
+    return parseSessionLogStream(input);
+}
+
+SessionLogScan refreshSessionLogCache(SessionLogCache& cache, const std::filesystem::path& home) {
+    std::error_code error;
+    if (!std::filesystem::is_directory(home, error) || error) return SessionLogScan::Unavailable;
+    const auto homeKey = pathKey(home);
+    if (homeKey.empty()) return SessionLogScan::Unavailable;
+
+    struct Root {
+        const char* provider;
+        std::filesystem::path path;
+    };
+    const Root roots[] = {
+        {"anthropic", home / ".claude" / "projects"},
+        {"xai", home / ".grok" / "sessions"},
+        {"moonshot", home / ".kimi-code" / "sessions"},
+    };
+
+    std::unordered_map<std::string, SessionLogCacheEntry> kept;
+    kept.reserve(cache.entries.size());
+    for (auto& entry : cache.entries) kept.emplace(entry.path, std::move(entry));
+
+    bool changed = false;
+    for (const auto& root : roots) {
+        std::unordered_map<std::string, bool> live;
+        const bool listed = walkListed(root.path, [&](const std::filesystem::path& file) {
+            const char* provider = providerForSessionFile(home, file);
+            if (provider == nullptr || std::string_view{provider} != root.provider) return;
+            error.clear();
+            const auto size = std::filesystem::file_size(file, error);
+            if (error) return;
+            error.clear();
+            const auto modified = std::filesystem::last_write_time(file, error);
+            if (error) return;
+            const auto key = pathKey(file);
+            const auto stamp = modifiedStamp(modified);
+            live.emplace(key, true);
+            const auto found = kept.find(key);
+            if (found != kept.end() && found->second.providerId == root.provider && found->second.modified == stamp
+                && found->second.size == size) {
+                return;
+            }
+            std::ifstream input(file, std::ios::binary);
+            if (!input) return;
+            SessionLogCacheEntry entry;
+            entry.providerId = root.provider;
+            entry.path = key;
+            entry.modified = stamp;
+            entry.size = static_cast<std::uint64_t>(size);
+            entry.days = parseSessionLogStream(input);
+            if (!input.eof() && input.fail()) return;
+            if (found == kept.end()) kept.emplace(key, std::move(entry));
+            else found->second = std::move(entry);
+            changed = true;
+        });
+        if (!listed) continue;
+        for (auto it = kept.begin(); it != kept.end();) {
+            if (it->second.providerId == root.provider && underHome(it->first, homeKey) && !live.contains(it->first)) {
+                it = kept.erase(it);
+                changed = true;
+            } else {
+                ++it;
+            }
+        }
+    }
+
+    cache.entries.clear();
+    cache.entries.reserve(kept.size());
+    for (auto& [path, entry] : kept) {
+        (void)path;
+        cache.entries.push_back(std::move(entry));
+    }
+    std::ranges::sort(cache.entries, [](const SessionLogCacheEntry& left, const SessionLogCacheEntry& right) {
+        return left.path < right.path;
+    });
+    return changed ? SessionLogScan::Updated : SessionLogScan::Unchanged;
+}
+
+std::vector<LocalSessionImport> sessionLogImports(const SessionLogCache& cache) {
+    std::vector<LocalSessionImport> imports;
+    for (const char* provider : {"anthropic", "xai", "moonshot"}) {
+        LocalSessionImport import;
+        import.providerId = provider;
+        for (const auto& entry : cache.entries) {
+            if (entry.providerId != provider) continue;
+            for (const auto& day : entry.days) addDaily(import.days, day.day, day.tokens);
+        }
+        imports.push_back(std::move(import));
+    }
+    return imports;
+}
+
+std::string serializeSessionLogCache(const SessionLogCache& cache) {
+    std::string text = "HLSL1\n";
+    for (const auto& entry : cache.entries) {
+        if (!knownSessionProvider(entry.providerId) || entry.path.empty() || entry.path.find('\n') != std::string::npos) continue;
+        text += "E ";
+        text += entry.providerId;
+        text += ' ';
+        text += std::to_string(entry.modified);
+        text += ' ';
+        text += std::to_string(entry.size);
+        text += ' ';
+        text += std::to_string(entry.days.size());
+        text += '\n';
+        text += entry.path;
+        text += '\n';
+        for (const auto& day : entry.days) {
+            text += formatDate(day.day);
+            text += ' ';
+            text += formatDouble(day.tokens);
+            text += '\n';
+        }
+    }
+    return text;
+}
+
+SessionLogCache parseSessionLogCache(std::string_view text) {
+    SessionLogCache cache;
+    std::size_t lineStart = 0;
+    auto nextLine = [&](std::string_view& line) {
+        if (lineStart > text.size()) return false;
+        const auto end = text.find('\n', lineStart);
+        line = text.substr(lineStart, end == std::string_view::npos ? std::string_view::npos : end - lineStart);
+        if (!line.empty() && line.back() == '\r') line.remove_suffix(1);
+        lineStart = end == std::string_view::npos ? text.size() + 1 : end + 1;
+        return true;
+    };
+    std::string_view line;
+    if (!nextLine(line) || line != "HLSL1") return {};
+    std::set<std::string> paths;
+    while (nextLine(line)) {
+        if (line.empty()) continue;
+        if (!line.starts_with("E ")) return {};
+        std::string_view rest = line.substr(2);
+        const auto providerField = takeField(rest);
+        const auto modifiedField = takeField(rest);
+        const auto sizeField = takeField(rest);
+        const auto countField = takeField(rest);
+        if (!providerField || !modifiedField || !sizeField || !countField || !rest.empty()) return {};
+        if (!knownSessionProvider(*providerField)) return {};
+        long long modified = 0;
+        unsigned long long size = 0;
+        unsigned long long count = 0;
+        if (!parseInt(*modifiedField, modified)) return {};
+        {
+            const auto parsed = std::from_chars(sizeField->data(), sizeField->data() + sizeField->size(), size);
+            if (parsed.ec != std::errc{} || parsed.ptr != sizeField->data() + sizeField->size()) return {};
+        }
+        {
+            const auto parsed = std::from_chars(countField->data(), countField->data() + countField->size(), count);
+            if (parsed.ec != std::errc{} || parsed.ptr != countField->data() + countField->size()) return {};
+        }
+        if (count > 100000) return {};
+        if (!nextLine(line) || line.empty() || line.find('\r') != std::string_view::npos) return {};
+        SessionLogCacheEntry entry;
+        entry.providerId = std::string(*providerField);
+        entry.path = std::string(line);
+        entry.modified = modified;
+        entry.size = size;
+        if (!paths.insert(entry.path).second) return {};
+        entry.days.reserve(static_cast<std::size_t>(count));
+        for (unsigned long long index = 0; index < count; ++index) {
+            if (!nextLine(line)) return {};
+            const auto space = line.find(' ');
+            if (space == std::string_view::npos) return {};
+            CivilDay day;
+            double tokens = 0.0;
+            if (!parseDate(line.substr(0, space), day) || !parseDouble(line.substr(space + 1), tokens) || !(tokens > 0.0)) return {};
+            entry.days.push_back(DailyTokens{day, tokens, {}});
+        }
+        cache.entries.push_back(std::move(entry));
+    }
+    return cache;
+}
+
+bool storeSessionLogCache(const SessionLogCache& cache, const std::filesystem::path& path) {
+    std::error_code error;
+    if (path.has_parent_path()) std::filesystem::create_directories(path.parent_path(), error);
+    std::filesystem::path temporary = path;
+    temporary += ".tmp";
+    {
+        std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
+        if (!output) return false;
+        const auto text = serializeSessionLogCache(cache);
+        output.write(text.data(), static_cast<std::streamsize>(text.size()));
+        if (!output) {
+            std::filesystem::remove(temporary, error);
+            return false;
+        }
+    }
+    error.clear();
+    std::filesystem::rename(temporary, path, error);
+    if (error) {
+        error.clear();
+        std::filesystem::remove(path, error);
+        error.clear();
+        std::filesystem::rename(temporary, path, error);
+    }
+    if (error) std::filesystem::remove(temporary, error);
+    return !error;
+}
+
+SessionLogCache loadSessionLogCache(const std::filesystem::path& path) {
+    std::error_code error;
+    const auto size = std::filesystem::file_size(path, error);
+    if (error || size > 16 * 1024 * 1024) return {};
+    std::ifstream input(path, std::ios::binary);
+    if (!input) return {};
+    std::ostringstream buffer;
+    buffer << input.rdbuf();
+    if (!input && !input.eof()) return {};
+    return parseSessionLogCache(buffer.str());
+}
+
 bool replaceImportedDailyTokens(TokenHistory& history, std::string_view providerId, std::string_view accountId,
                                 std::span<const DailyTokens> days) {
     if (!parseId(providerId) || !parseId(accountId)) return false;
@@ -429,12 +922,12 @@ bool replaceImportedDailyTokens(TokenHistory& history, std::string_view provider
     return true;
 }
 
-ActivityStats activityStats(const TokenHistory& history, TimePoint now, std::chrono::seconds refreshInterval) {
+ActivityStats activityStats(const TokenHistory& history, TimePoint now, std::string_view providerId) {
     ActivityStats stats;
     int run = 0;
     bool inRun = false;
     CivilDay previous{};
-    const auto days = combinedDailyTotals(history);
+    const auto days = combinedDailyTotals(history, providerId);
     for (const auto& day : days) {
         stats.lifetimeTokens += day.tokens;
         stats.peakTokensPerDay = std::max(stats.peakTokensPerDay, day.tokens);
@@ -452,33 +945,16 @@ ActivityStats activityStats(const TokenHistory& history, TimePoint now, std::chr
 
     const CivilDay today = localCivilDay(now);
     // Today still at zero does not erase a streak that was alive yesterday.
-    CivilDay cursor = tokensOn(history, today) > 0.0 ? today : shiftCivilDay(today, -1);
-    while (tokensOn(history, cursor) > 0.0 && stats.currentStreakDays < 100000) {
+    CivilDay cursor = tokensOn(history, today, providerId) > 0.0 ? today : shiftCivilDay(today, -1);
+    while (tokensOn(history, cursor, providerId) > 0.0 && stats.currentStreakDays < 100000) {
         ++stats.currentStreakDays;
         cursor = shiftCivilDay(cursor, -1);
     }
 
-    if (history.deltas.empty()) return stats;
-    std::vector<TimePoint> times;
-    times.reserve(history.deltas.size());
-    for (const auto& delta : history.deltas) times.push_back(delta.at);
-    std::ranges::sort(times);
-    const auto limit = refreshInterval < std::chrono::seconds::zero() ? std::chrono::seconds::zero() : refreshInterval * 2;
-    auto start = times.front();
-    auto previousTime = start;
-    for (std::size_t index = 1; index < times.size(); ++index) {
-        if (times[index] - previousTime <= limit) {
-            previousTime = times[index];
-            continue;
-        }
-        stats.longestTask = std::max(stats.longestTask, std::chrono::duration_cast<std::chrono::seconds>(previousTime - start));
-        start = previousTime = times[index];
-    }
-    stats.longestTask = std::max(stats.longestTask, std::chrono::duration_cast<std::chrono::seconds>(previousTime - start));
     return stats;
 }
 
-ActivityCalendar activityCalendar(const TokenHistory& history, TimePoint now) {
+ActivityCalendar activityCalendar(const TokenHistory& history, TimePoint now, std::string_view providerId) {
     const CivilDay today = localCivilDay(now);
     const CivilDay earliest = shiftCivilDay(today, -364);
     const CivilDay start = shiftCivilDay(earliest, -sundayIndex(earliest));
@@ -491,7 +967,7 @@ ActivityCalendar activityCalendar(const TokenHistory& history, TimePoint now) {
         for (int row = 0; row < 7 && cursor <= today; ++row) {
             CalendarCell cell;
             cell.day = cursor;
-            cell.tokens = tokensOn(history, cursor);
+            cell.tokens = tokensOn(history, cursor, providerId);
             if (cell.tokens > 0.0) positive.push_back(cell.tokens);
             column.days[static_cast<std::size_t>(row)] = cell;
             cursor = shiftCivilDay(cursor, 1);
@@ -511,35 +987,17 @@ ActivityCalendar activityCalendar(const TokenHistory& history, TimePoint now) {
     return calendar;
 }
 
-std::string formatTaskDuration(std::chrono::seconds duration) {
-    if (duration < std::chrono::seconds::zero()) duration = std::chrono::seconds::zero();
-    const auto total = duration.count();
-    const auto days = total / 86400;
-    const auto hours = (total % 86400) / 3600;
-    const auto minutes = (total % 3600) / 60;
-    const auto seconds = total % 60;
-    if (days > 0) {
-        if (hours > 0 && minutes > 0) return std::format("{}d {}h {}m", days, hours, minutes);
-        if (hours > 0) return std::format("{}d {}h", days, hours);
-        if (minutes > 0) return std::format("{}d {}m", days, minutes);
-        return std::format("{}d", days);
-    }
-    if (hours > 0) {
-        if (minutes > 0) return std::format("{}h {}m", hours, minutes);
-        return std::format("{}h", hours);
-    }
-    if (minutes > 0) {
-        if (seconds > 0) return std::format("{}m {}s", minutes, seconds);
-        return std::format("{}m", minutes);
-    }
-    return std::format("{}s", seconds);
-}
-
 std::string serializeTokenHistory(const TokenHistory& history) {
     auto days = history.days;
-    std::ranges::sort(days, {}, &DailyTokens::day);
+    std::ranges::sort(days, [](const DailyTokens& left, const DailyTokens& right) {
+        if (left.day != right.day) return left.day < right.day;
+        return left.providerId < right.providerId;
+    });
     auto deltas = history.deltas;
-    std::ranges::sort(deltas, {}, &TokenDelta::at);
+    std::ranges::sort(deltas, [](const TokenDelta& left, const TokenDelta& right) {
+        if (left.at != right.at) return left.at < right.at;
+        return left.providerId < right.providerId;
+    });
     auto baselines = history.baselines;
     std::ranges::sort(baselines, [](const TokenBaseline& left, const TokenBaseline& right) {
         if (left.providerId != right.providerId) return left.providerId < right.providerId;
@@ -556,18 +1014,28 @@ std::string serializeTokenHistory(const TokenHistory& history) {
     std::string text = "HLHIST1\n";
     for (const auto& day : days) {
         if (!(day.tokens > 0.0) || !std::isfinite(day.tokens)) continue;
+        if (!day.providerId.empty() && !parseId(day.providerId)) continue;
         text += "D ";
         text += formatDate(day.day);
         text += ' ';
         text += formatDouble(day.tokens);
+        if (!day.providerId.empty()) {
+            text += ' ';
+            text += day.providerId;
+        }
         text += '\n';
     }
     for (const auto& delta : deltas) {
         if (!(delta.tokens > 0.0) || !std::isfinite(delta.tokens)) continue;
+        if (!delta.providerId.empty() && !parseId(delta.providerId)) continue;
         text += "T ";
         text += std::to_string(toUnixMilliseconds(delta.at));
         text += ' ';
         text += formatDouble(delta.tokens);
+        if (!delta.providerId.empty()) {
+            text += ' ';
+            text += delta.providerId;
+        }
         text += '\n';
     }
     for (const auto& baseline : baselines) {
@@ -626,18 +1094,30 @@ TokenHistory parseTokenHistory(std::string_view text) {
         if (kind == 'D') {
             const auto date = takeField(rest);
             const auto amount = takeField(rest);
-            if (!date || !amount || !rest.empty()) return {};
+            if (!date || !amount) return {};
+            std::optional<std::string_view> provider;
+            if (!rest.empty()) {
+                provider = takeField(rest);
+                if (!provider || !rest.empty() || !parseId(*provider)) return {};
+            }
             DailyTokens day;
             if (!parseDate(*date, day.day) || !parseDouble(*amount, day.tokens) || !(day.tokens > 0.0)) return {};
+            if (provider) day.providerId = std::string{*provider};
             history.days.push_back(day);
         } else if (kind == 'T') {
             const auto stamp = takeField(rest);
             const auto amount = takeField(rest);
-            if (!stamp || !amount || !rest.empty()) return {};
+            if (!stamp || !amount) return {};
+            std::optional<std::string_view> provider;
+            if (!rest.empty()) {
+                provider = takeField(rest);
+                if (!provider || !rest.empty() || !parseId(*provider)) return {};
+            }
             long long milliseconds = 0;
             TokenDelta delta;
             if (!parseInt(*stamp, milliseconds) || !parseDouble(*amount, delta.tokens) || !(delta.tokens > 0.0)) return {};
             delta.at = fromUnixMilliseconds(milliseconds);
+            if (provider) delta.providerId = std::string{*provider};
             history.deltas.push_back(delta);
         } else if (kind == 'B') {
             const auto provider = takeField(rest);
@@ -674,11 +1154,20 @@ TokenHistory parseTokenHistory(std::string_view text) {
     }
     if (!anyLine || !header) return {};
 
-    std::ranges::sort(history.days, {}, &DailyTokens::day);
+    std::ranges::sort(history.days, [](const DailyTokens& left, const DailyTokens& right) {
+        if (left.day != right.day) return left.day < right.day;
+        return left.providerId < right.providerId;
+    });
     for (std::size_t index = 1; index < history.days.size(); ++index) {
-        if (history.days[index].day == history.days[index - 1].day) return {};
+        if (history.days[index].day == history.days[index - 1].day
+            && history.days[index].providerId == history.days[index - 1].providerId) {
+            return {};
+        }
     }
-    std::ranges::sort(history.deltas, {}, &TokenDelta::at);
+    std::ranges::sort(history.deltas, [](const TokenDelta& left, const TokenDelta& right) {
+        if (left.at != right.at) return left.at < right.at;
+        return left.providerId < right.providerId;
+    });
     std::ranges::sort(history.baselines, [](const TokenBaseline& left, const TokenBaseline& right) {
         if (left.providerId != right.providerId) return left.providerId < right.providerId;
         if (left.accountId != right.accountId) return left.accountId < right.accountId;

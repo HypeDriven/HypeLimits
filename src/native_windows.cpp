@@ -55,6 +55,7 @@
 #include <cmath>
 #include <cwchar>
 #include <cwctype>
+#include <filesystem>
 #include <format>
 #include <functional>
 #include <memory>
@@ -78,6 +79,7 @@ constexpr UINT kTrayMessage = WM_APP + 1;
 constexpr UINT kRefreshCompleteMessage = WM_APP + 2;
 constexpr UINT kNetworkChangedMessage = WM_APP + 3;
 constexpr UINT kAutoReauthMessage = WM_APP + 4;
+constexpr UINT kSessionLogMessage = WM_APP + 5;
 constexpr UINT_PTR kPollTimer = 1;
 constexpr UINT_PTR kFlashTimer = 2;
 constexpr UINT_PTR kActivityTimer = 3;
@@ -237,6 +239,7 @@ struct ActivityHit {
 struct ActivityLayout {
     ActivityCalendar calendar;
     ActivityStats stats;
+    std::wstring providerLabel;
     int originX{56};
     int originY{78};
     int cell{12};
@@ -2490,6 +2493,7 @@ private:
     [[nodiscard]] POINT activityToLogical(POINT client) const;
     [[nodiscard]] ResizeEdge activityResizeEdgeAt(POINT client) const;
     bool refresh(bool queueIfBusy = false, bool scheduled = false);
+    void startSessionLogScan();
     void armPollTimer();
     void connectProvider();
     void addAccount();
@@ -2522,6 +2526,8 @@ private:
     void syncGoogleSecretControls();
     [[nodiscard]] HWND dialogParent() const;
     [[nodiscard]] const MetricHit* hitAt(POINT client) const;
+    [[nodiscard]] std::string providerIdAt(POINT client) const;
+    void setActivityProvider(std::string providerId);
     [[nodiscard]] const ProviderSnapshot& hitSnapshotFor(const MetricHit& hit) const;
     [[nodiscard]] bool authenticationFailedAt(POINT client) const;
     void handleMonitorClick(POINT client);
@@ -2587,7 +2593,12 @@ private:
     int logicalHeight_{48};
     AlertEngine alerts_;
     TokenHistory activityHistory_;
+    SessionLogCache sessionLogCache_;
+    bool sessionLogCacheLoaded_{false};
+    std::jthread sessionScanThread_;
+    std::atomic_bool sessionScanRunning_{false};
     std::optional<CivilDay> activityHoverDay_;
+    std::string activityProviderId_;
     bool activityTracking_{false};
     HBITMAP activityBitmap_{};
     void* activityBits_{};
@@ -3528,8 +3539,61 @@ struct RefreshResult {
     std::vector<DailyTokens> importedDays;
 };
 
+struct SessionScanResult {
+    bool scanned{false};
+    std::vector<LocalSessionImport> imports;
+};
+
+std::filesystem::path sessionLogCacheFile() {
+    PWSTR local{};
+    if (FAILED(SHGetKnownFolderPath(FOLDERID_LocalAppData, 0, nullptr, &local)) || !local) return {};
+    const std::filesystem::path path = std::filesystem::path(local) / "HypeLimits" / "session-log-tokens.txt";
+    CoTaskMemFree(local);
+    return path;
+}
+
+void App::startSessionLogScan() {
+    if (sessionScanRunning_.exchange(true)) return;
+    std::vector<std::filesystem::path> homes;
+    const auto profile = userProfile();
+    if (!profile.empty()) homes.emplace_back(profile);
+    if (wslTokenSyncEnabled()) {
+        for (const auto& home : cachedWslHomes) {
+            if (wslHomeSyncEnabled(home) && !home.home.empty()) homes.emplace_back(home.home);
+        }
+    }
+    sessionScanThread_ = std::jthread([this, homes = std::move(homes)] {
+        applyWorkerPriorities();
+        if (!sessionLogCacheLoaded_) {
+            const auto file = sessionLogCacheFile();
+            if (!file.empty()) sessionLogCache_ = loadSessionLogCache(file);
+            sessionLogCacheLoaded_ = true;
+        }
+        bool anyHome = false;
+        bool changed = false;
+        for (const auto& home : homes) {
+            const auto status = refreshSessionLogCache(sessionLogCache_, home);
+            if (status == SessionLogScan::Unavailable) continue;
+            anyHome = true;
+            if (status == SessionLogScan::Updated) changed = true;
+        }
+        auto* result = new SessionScanResult;
+        result->scanned = anyHome;
+        if (anyHome) {
+            if (changed) {
+                const auto file = sessionLogCacheFile();
+                if (!file.empty()) storeSessionLogCache(sessionLogCache_, file);
+            }
+            result->imports = sessionLogImports(sessionLogCache_);
+        }
+        if (!PostMessageW(trayWindow_, kSessionLogMessage, 0, reinterpret_cast<LPARAM>(result))) delete result;
+        sessionScanRunning_ = false;
+    });
+}
+
 // Returns false when no refresh is or will be in flight, so the caller must keep the poll timer armed itself.
 bool App::refresh(bool queueIfBusy, bool scheduled) {
+    startSessionLogScan();
     if (signInInProgress_) return false;
     if (refreshing_.exchange(true)) {
         // A reconnect during an in-flight refresh would otherwise keep the old rejected-credential result on screen.
@@ -3711,6 +3775,19 @@ const MetricHit* App::hitAt(POINT client) const {
     const POINT logical = toLogical(client);
     const auto found = std::find_if(hits_.begin(), hits_.end(), [&](const MetricHit& hit) { return PtInRect(&hit.rect, logical); });
     return found == hits_.end() ? nullptr : &*found;
+}
+
+std::string App::providerIdAt(POINT client) const {
+    const auto* hit = hitAt(client);
+    if (!hit || hit->provider >= providers_.size()) return {};
+    return utf8(providers_[hit->provider].definition.id);
+}
+
+void App::setActivityProvider(std::string providerId) {
+    if (providerId == activityProviderId_) return;
+    activityProviderId_ = std::move(providerId);
+    destroyActivityBitmap();
+    if (activityWindow_) InvalidateRect(activityWindow_, nullptr, FALSE);
 }
 
 const ProviderSnapshot& App::hitSnapshotFor(const MetricHit& hit) const {
@@ -4172,6 +4249,7 @@ void App::toggleMonitor() {
     const bool visible = IsWindowVisible(floatingWindow_) != FALSE;
     ShowWindow(floatingWindow_, visible ? SW_HIDE : SW_SHOWNOACTIVATE);
     writeDword(L"MonitorVisible", !visible);
+    if (visible) setActivityProvider({});
 }
 
 void App::showTrayMenu() {
@@ -4191,10 +4269,15 @@ void App::showTrayMenu() {
 
 ActivityLayout App::layoutActivity() const {
     const auto now = std::chrono::system_clock::now();
-    const auto refreshInterval = std::chrono::seconds{static_cast<std::chrono::seconds::rep>(pollIntervalMs() / 1000ULL)};
     ActivityLayout layout;
-    layout.calendar = activityCalendar(activityHistory_, now);
-    layout.stats = activityStats(activityHistory_, now, refreshInterval);
+    layout.calendar = activityCalendar(activityHistory_, now, activityProviderId_);
+    layout.stats = activityStats(activityHistory_, now, activityProviderId_);
+    if (!activityProviderId_.empty()) {
+        const auto found = std::ranges::find_if(providers_, [&](const Provider& provider) {
+            return utf8(provider.definition.id) == activityProviderId_;
+        });
+        layout.providerLabel = found == providers_.end() ? wide(activityProviderId_) : found->definition.name;
+    }
     const int weeks = std::max(1, static_cast<int>(layout.calendar.weeks.size()));
     layout.cell = 12;
     layout.gap = 3;
@@ -4316,20 +4399,18 @@ void App::renderActivityBitmap() {
     const wchar_t* statLabels[] = {
         L"Lifetime tokens",
         L"Peak tokens per day",
-        L"Longest task",
         L"Longest streak",
         L"Current streak",
     };
     const std::wstring statValues[] = {
         formatTokenCount(layout.stats.lifetimeTokens),
         formatTokenCount(layout.stats.peakTokensPerDay),
-        wide(formatTaskDuration(layout.stats.longestTask)),
         std::format(L"{} day{}", layout.stats.longestStreakDays, layout.stats.longestStreakDays == 1 ? L"" : L"s"),
         std::format(L"{} day{}", layout.stats.currentStreakDays, layout.stats.currentStreakDays == 1 ? L"" : L"s"),
     };
-    const int statWidth = std::max(120, (layout.width - 32) / 5);
+    const int statWidth = std::max(120, (layout.width - 32) / 4);
     const auto labelSelected = SelectObject(mem, labelFont);
-    for (int index = 0; index < 5; ++index) {
+    for (int index = 0; index < 4; ++index) {
         RECT label = scaled({16 + index * statWidth, 12, 16 + (index + 1) * statWidth - 8, 28});
         RECT value = scaled({16 + index * statWidth, 30, 16 + (index + 1) * statWidth - 8, 58});
         SetTextColor(mem, kActivityMuted);
@@ -4402,17 +4483,22 @@ void App::renderActivityBitmap() {
         legendY + layout.cell,
     });
     DrawTextW(mem, L"More", -1, &more, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_NOCLIP);
-    const std::wstring yearTotal = std::format(L"{} tokens in the last year", formatTokenCount(layout.calendar.yearTokens));
+    const std::wstring yearTotal = layout.providerLabel.empty()
+        ? std::format(L"{} tokens in the last year", formatTokenCount(layout.calendar.yearTokens))
+        : std::format(L"{} — {} tokens in the last year", layout.providerLabel, formatTokenCount(layout.calendar.yearTokens));
     RECT year = scaled({more.right / scale + 8, legendY, layout.width - 16, legendY + layout.cell});
     DrawTextW(mem, yearTotal.c_str(), -1, &year, DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_NOCLIP);
 
-    std::wstring readout = L"Point at a day to see its token count and date.";
+    std::wstring readout = layout.providerLabel.empty()
+        ? L"Point at a day to see its token count and date."
+        : layout.providerLabel + L". Point at a day to see its token count and date.";
     if (activityHoverDay_) {
         const auto found = std::ranges::find_if(layout.hits, [&](const ActivityHit& hit) {
             return hit.cell.day == *activityHoverDay_;
         });
         if (found != layout.hits.end()) {
             readout = std::format(L"{} tokens on {}", formatTokenCount(found->cell.tokens), formatActivityDay(found->cell.day));
+            if (!layout.providerLabel.empty()) readout += L" — " + layout.providerLabel;
         }
     }
     RECT readoutRect = scaled({16, legendY + layout.cell + 12, layout.width - 16, legendY + layout.cell + 34});
@@ -4463,6 +4549,16 @@ void App::toggleActivity() {
     ShowWindow(activityWindow_, SW_SHOW);
     SetForegroundWindow(activityWindow_);
     writeDword(L"ActivityVisible", 1);
+    if (floatingWindow_ && IsWindowVisible(floatingWindow_)) {
+        POINT cursor{};
+        if (GetCursorPos(&cursor)) {
+            POINT client = cursor;
+            ScreenToClient(floatingWindow_, &client);
+            RECT bounds{};
+            GetClientRect(floatingWindow_, &bounds);
+            setActivityProvider(PtInRect(&bounds, client) ? providerIdAt(client) : std::string{});
+        }
+    }
     destroyActivityBitmap();
     InvalidateRect(activityWindow_, nullptr, FALSE);
 }
@@ -4737,6 +4833,7 @@ LRESULT App::onFloating(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
     }
     case WM_MOUSEMOVE: {
         POINT point{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+        setActivityProvider(providerIdAt(point));
         POINT cursor{};
         GetCursorPos(&cursor);
         const int dragDx = std::abs(static_cast<int>(cursor.x - dragStart_.x));
@@ -4766,8 +4863,13 @@ LRESULT App::onFloating(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
         }
         return 0;
     }
-    case WM_MOUSELEAVE: SendMessageW(tooltip_, TTM_TRACKACTIVATE, FALSE, 0); return 0;
+    case WM_MOUSELEAVE:
+        setActivityProvider({});
+        SendMessageW(tooltip_, TTM_TRACKACTIVATE, FALSE, 0);
+        return 0;
     case WM_LBUTTONUP: {
+        POINT point{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+        setActivityProvider(providerIdAt(point));
         POINT cursor{};
         GetCursorPos(&cursor);
         const bool moved = std::abs(static_cast<int>(cursor.x - dragStart_.x)) > kMonitorClickSlop
@@ -4787,10 +4889,7 @@ LRESULT App::onFloating(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
             syncFloatingWindowSize();
             InvalidateRect(hwnd, nullptr, FALSE);
         }
-        if (click && !wasResizing) {
-            POINT point{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
-            handleMonitorClick(point);
-        }
+        if (click && !wasResizing) handleMonitorClick(point);
         return 0;
     }
     case WM_CAPTURECHANGED:
@@ -5013,6 +5112,22 @@ LRESULT App::onTray(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
         return 0;
     }
     switch (message) {
+    case kSessionLogMessage: {
+        std::unique_ptr<SessionScanResult> completed(reinterpret_cast<SessionScanResult*>(lParam));
+        if (!completed->scanned) return 0;
+        bool historyChanged = false;
+        for (const auto& import : completed->imports) {
+            if (replaceImportedDailyTokens(activityHistory_, import.providerId, kLocalSessionAccount, import.days)) {
+                historyChanged = true;
+            }
+        }
+        if (historyChanged) {
+            writeString(L"ActivityHistory", wide(serializeTokenHistory(activityHistory_)));
+            destroyActivityBitmap();
+            if (activityWindow_) InvalidateRect(activityWindow_, nullptr, FALSE);
+        }
+        return 0;
+    }
     case kRefreshCompleteMessage: {
         std::unique_ptr<std::vector<RefreshResult>> completed(reinterpret_cast<std::vector<RefreshResult>*>(lParam));
         for (auto& result : *completed) {
