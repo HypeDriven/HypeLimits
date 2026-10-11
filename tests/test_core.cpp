@@ -1227,6 +1227,42 @@ int main() {
     secondAccount.refreshToken = "other-refresh";
     check(!sameCredentialAccount(firstAccount, secondAccount), "unidentified newer CLI login cannot replace selected account");
     check(!sameCredentialAccount(TokenRecord{}, TokenRecord{}), "empty credentials do not prove identity");
+
+    check(appendTokenFingerprint("", "aa") == "aa" && appendTokenFingerprint("aa,bb", "cc") == "aa,bb,cc",
+          "earlier refresh tokens are remembered in order");
+    check(appendTokenFingerprint("aa,bb", "bb") == "aa,bb" && appendTokenFingerprint("aa,bb", "") == "aa,bb",
+          "known or empty fingerprints are not appended");
+    check(appendTokenFingerprint("aa,bb,cc", "dd", 3) == "bb,cc,dd", "the oldest remembered token is dropped first");
+    check(tokenChainContains("aa,bb", "bb") && !tokenChainContains("aa,bb", "b") && !tokenChainContains("aa,bb", ""),
+          "only a whole fingerprint matches a remembered token");
+    TokenRecord selectedLogin;
+    selectedLogin.accessToken = "selected-access";
+    selectedLogin.refreshToken = "selected-refresh";
+    selectedLogin.expiresAtMs = nowMs + 3'600'000;
+    TokenRecord cliFile = selectedLogin;
+    check(selectedCliTargetAction(cliFile, selectedLogin, false, nowMs) == CliTargetAction::Keep,
+          "a CLI file already on the selected token is left alone");
+    cliFile.accessToken = "previous-access";
+    check(selectedCliTargetAction(cliFile, selectedLogin, false, nowMs) == CliTargetAction::Write,
+          "a CLI file on the selected refresh token gets its renewed access token");
+    cliFile.refreshToken = "previous-refresh";
+    cliFile.expiresAtMs = nowMs - 1'000;
+    check(selectedCliTargetAction(cliFile, selectedLogin, true, nowMs) == CliTargetAction::Write,
+          "a stale copy of the selected account is rewritten in every CLI home");
+    check(selectedCliTargetAction(cliFile, selectedLogin, false, nowMs) == CliTargetAction::Keep,
+          "an expired login the selected account never held is the CLI's own");
+    cliFile.expiresAtMs = nowMs + 1'800'000;
+    check(selectedCliTargetAction(cliFile, selectedLogin, false, nowMs) == CliTargetAction::Keep,
+          "an older live login in a CLI file is not replaced in the background");
+    cliFile.expiresAtMs = nowMs + 7'200'000;
+    check(selectedCliTargetAction(cliFile, selectedLogin, false, nowMs) == CliTargetAction::AdoptIfSameAccount,
+          "a newer login a CLI made is adopted only once its account is proven");
+    TokenRecord cliApiKey;
+    cliApiKey.accessToken = "sk-cli-key";
+    check(selectedCliTargetAction(cliApiKey, selectedLogin, false, nowMs) == CliTargetAction::Keep,
+          "an API key in a CLI file is not a login to replace");
+    check(selectedCliTargetAction(cliFile, cliApiKey, true, nowMs) == CliTargetAction::Keep,
+          "a selected credential without a refresh token is never pushed in the background");
     codexWinner.idToken = "new-account-identity";
     const auto identityMerged = mergeCliCredentialJson(CliCredentialFormat::CodexTokens, codexExisting, codexWinner);
     check(parseCliTokenRecord(CliCredentialFormat::CodexTokens, identityMerged).idToken == "new-account-identity",

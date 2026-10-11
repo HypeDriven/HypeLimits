@@ -20,7 +20,7 @@ Antigravity in-app Google sign-in and Google token refresh need the Google OAuth
 
 ## Multiple accounts
 
-Use **Options → provider → Add account** to save another credential. Right-click the provider row in the floating widget (or click **Choose account**) to switch. The selected credential is written to supported Windows and discovered WSL CLI files, excluding unchecked WSL users. Credentials remain in Windows Credential Manager.
+Use **Options → provider → Add account** to save another credential. Right-click the provider row in the floating widget (or click **Choose account**) to switch. The selected credential is written to supported Windows and discovered WSL CLI files, excluding unchecked WSL users. While it stays selected, a token refresh made by HypeLimits or by one CLI is passed on to the other CLI homes; a different login made in a CLI is left alone until you select the account again. Credentials remain in Windows Credential Manager.
 
 Enable **Automatically rotate accounts when allowance runs out** on each provider tab to switch after polling confirms exhaustion. Depleted accounts are skipped until their reported reset; accounts without a reset time can be retried manually. Rotation stops when no eligible account remains.
 

@@ -2,6 +2,7 @@
 
 #include "provider_parsing.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <cctype>
 #include <ctime>
@@ -245,6 +246,41 @@ bool cliLoginMayRecoverSlot(std::string_view slotIdentity, std::string_view logi
     if (!slotIdentity.empty()) return slotIdentity == loginIdentity;
     if (!managed) return true;
     return selectedSlot && !ownedByOtherSlot;
+}
+
+bool tokenChainContains(std::string_view chain, std::string_view fingerprint) {
+    if (fingerprint.empty()) return false;
+    while (!chain.empty()) {
+        const auto comma = chain.find(',');
+        if (chain.substr(0, comma) == fingerprint) return true;
+        if (comma == std::string_view::npos) break;
+        chain.remove_prefix(comma + 1);
+    }
+    return false;
+}
+
+std::string appendTokenFingerprint(std::string_view chain, std::string_view fingerprint, std::size_t limit) {
+    if (fingerprint.empty() || fingerprint.find(',') != std::string_view::npos || tokenChainContains(chain, fingerprint)) {
+        return std::string(chain);
+    }
+    std::string out(chain);
+    if (!out.empty()) out.push_back(',');
+    out += fingerprint;
+    // Oldest entries go first: a CLI file that far behind is no longer recognizably this account's.
+    for (auto count = static_cast<std::size_t>(std::ranges::count(out, ',')) + 1; count > limit; --count) {
+        out.erase(0, out.find(',') + 1);
+    }
+    return out;
+}
+
+CliTargetAction selectedCliTargetAction(const TokenRecord& file, const TokenRecord& selected,
+                                        bool fileHoldsEarlierToken, std::int64_t nowMs) {
+    if (selected.accessToken.empty() || selected.refreshToken.empty()) return CliTargetAction::Keep;
+    if (file.accessToken == selected.accessToken && file.refreshToken == selected.refreshToken) return CliTargetAction::Keep;
+    if (fileHoldsEarlierToken || file.refreshToken == selected.refreshToken) return CliTargetAction::Write;
+    if (file.accessToken.empty() || file.refreshToken.empty()) return CliTargetAction::Keep;
+    return pickLatestValidToken(selected, file, nowMs) == TokenPick::Right ? CliTargetAction::AdoptIfSameAccount
+                                                                         : CliTargetAction::Keep;
 }
 
 bool tokenRecordUsable(const TokenRecord& record, std::int64_t nowMs) {

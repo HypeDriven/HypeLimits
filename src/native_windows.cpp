@@ -851,11 +851,12 @@ std::string jsonEscape(std::string_view value) {
     return out;
 }
 
-std::string packAuthJson(const AuthMaterial& auth) {
+std::string packAuthJson(const AuthMaterial& auth, std::string_view priorRefresh = {}) {
     std::string json = std::format("{{\"access_token\":\"{}\",\"refresh_token\":\"{}\",\"account_id\":\"{}\",\"team_id\":\"{}\"",
                                    jsonEscape(auth.token), jsonEscape(auth.refreshToken), jsonEscape(auth.accountId), jsonEscape(auth.teamId));
     if (auth.expiresAtMs) json += std::format(",\"expires_at\":{}", *auth.expiresAtMs);
     if (auth.observedAtMs) json += std::format(",\"observed_at\":{}", *auth.observedAtMs);
+    if (!priorRefresh.empty()) json += ",\"prior_refresh\":\"" + jsonEscape(priorRefresh) + "\"";
     json += ",\"id_token\":\"" + jsonEscape(auth.idToken) + "\"}";
     return json;
 }
@@ -883,8 +884,38 @@ AuthMaterial parseAuthJson(const std::string& json) {
     return auth;
 }
 
+std::string sha256Url(std::string_view input);
+
+// Identifies a refresh token without keeping it.
+std::string tokenFingerprint(std::string_view token) {
+    return token.empty() ? std::string{} : sha256Url(token).substr(0, 16);
+}
+
+// Fingerprints of the refresh tokens this slot held before its current one, plus the current one's. A CLI file
+// still holding an earlier token is a stale copy of this account, not a login the CLI made.
+struct StoredTokenChain {
+    std::string earlier;
+    std::string current;
+};
+
+StoredTokenChain storedTokenChain(std::wstring_view id) {
+    StoredTokenChain chain;
+    if (auto stored = CredentialStore::loadUtf8(id)) {
+        if (!stored->empty() && stored->front() == '{') {
+            chain.earlier = jsonString(*stored, "prior_refresh").value_or("");
+            auto refresh = jsonString(*stored, "refresh_token").value_or(jsonString(*stored, "refreshToken").value_or(""));
+            chain.current = tokenFingerprint(refresh);
+            SecureZeroMemory(refresh.data(), refresh.size());
+        }
+        SecureZeroMemory(stored->data(), stored->size());
+    }
+    return chain;
+}
+
 bool saveAuth(std::wstring_view id, const AuthMaterial& auth) {
-    std::string packed = packAuthJson(auth);
+    auto chain = storedTokenChain(id);
+    if (chain.current != tokenFingerprint(auth.refreshToken)) chain.earlier = appendTokenFingerprint(chain.earlier, chain.current);
+    std::string packed = packAuthJson(auth, chain.earlier);
     const bool ok = CredentialStore::saveUtf8(id, packed);
     SecureZeroMemory(packed.data(), packed.size());
     return ok;
@@ -2212,6 +2243,59 @@ bool adoptNewerCliToken(std::wstring_view id, AuthMaterial& auth) {
     return usable;
 }
 
+// Keeps a selected account's CLI files on that account's current token. Selection gives every CLI home the same
+// credential, so the first holder to refresh it leaves the others with a consumed refresh token and a forced
+// sign-in. A newer login a CLI made for this same account is adopted first; then every file still holding one of
+// the account's earlier tokens is rewritten. Any other login in a CLI file is the CLI's own and is left alone.
+void syncSelectedAccountToCli(std::wstring_view credentialId, std::wstring_view id, DWORD slot, AuthMaterial& auth) {
+    if (!managedAccounts(id) || !backgroundSyncAllowed(id)) return;
+    if (!readDword((accountSettingFor(id, slot) + L".SelectionSync").c_str(), 0)) return;
+    const auto format = cliFormatForProvider(utf8(id));
+    if (!format || auth.token.empty() || auth.refreshToken.empty()) return;
+    struct Target {
+        std::wstring path;
+        std::string body;
+        TokenRecord record;
+    };
+    std::vector<Target> targets;
+    for (const auto& path : allCliReadPaths(id)) {
+        auto body = readUtf8File(path);
+        if (!body) continue;
+        auto record = parseCliTokenRecord(*format, *body);
+        targets.push_back({path, std::move(*body), std::move(record)});
+    }
+    const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+    auto earlier = storedTokenChain(credentialId).earlier;
+    const auto actionFor = [&](const Target& target) {
+        return selectedCliTargetAction(target.record, recordFromAuth(auth),
+                                       tokenChainContains(earlier, tokenFingerprint(target.record.refreshToken)), nowMs);
+    };
+    // Only an unexpired access token is adopted, and only for a slot whose account is known, so this never rotates a
+    // CLI's refresh token and never lets another account's login replace the selected one.
+    const std::string identity = utf8(readString(slotIdentitySetting(id, slot).c_str()));
+    for (const auto& target : targets) {
+        if (identity.empty() || actionFor(target) != CliTargetAction::AdoptIfSameAccount) continue;
+        AuthMaterial login = authFromRecord(target.record);
+        if (accessTokenExpiryMs(login) && !accessTokenNeedsRefresh(login) && credentialIdentity(id, login) == identity
+            && saveAuth(credentialId, login)) {
+            auth = login;
+            earlier = storedTokenChain(credentialId).earlier;
+        }
+        SecureZeroMemory(login.token.data(), login.token.size());
+        SecureZeroMemory(login.refreshToken.data(), login.refreshToken.size());
+    }
+    for (auto& target : targets) {
+        if (actionFor(target) == CliTargetAction::Write) {
+            auto merged = mergeCliCredentialJson(*format, target.body, recordFromAuth(auth));
+            writeUtf8FileAtomic(target.path, merged);
+            SecureZeroMemory(merged.data(), merged.size());
+        }
+        SecureZeroMemory(target.body.data(), target.body.size());
+        SecureZeroMemory(target.record.accessToken.data(), target.record.accessToken.size());
+        SecureZeroMemory(target.record.refreshToken.data(), target.record.refreshToken.size());
+    }
+}
+
 struct CodexDailyFetch {
     DWORD status{0};
     std::optional<std::vector<DailyTokens>> days;
@@ -2404,7 +2488,11 @@ void fetchProviderUsage(std::wstring_view credentialId, AuthMaterial& auth, Prov
             SecureZeroMemory(login.refreshToken.data(), login.refreshToken.size());
         }
     }
-    if (gotData && !authenticationRejected) rememberSlotIdentity(id, slot, auth);
+    if (gotData && !authenticationRejected) {
+        rememberSlotIdentity(id, slot, auth);
+        // The token just worked, so it is safe to hand to the selected account's other CLI homes.
+        if (slotMarker == std::wstring_view::npos) syncSelectedAccountToCli(credentialId, id, slot, auth);
+    }
     finishRefresh(snapshot, gotData, authenticationRejected, lastStatus, lastError);
 }
 

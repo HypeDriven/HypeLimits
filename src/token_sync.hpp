@@ -38,6 +38,18 @@ enum class TokenPick { Left, Right, Tie };
 // and never a login another slot is known to own.
 [[nodiscard]] bool cliLoginMayRecoverSlot(std::string_view slotIdentity, std::string_view loginIdentity, bool managed,
                                           bool selectedSlot, bool ownedByOtherSlot);
+// A selected account's credential is shared by every CLI home, so whichever holder refreshes first strands the
+// others on a consumed refresh token. A slot therefore remembers fingerprints of the refresh tokens it held before.
+[[nodiscard]] std::string appendTokenFingerprint(std::string_view chain, std::string_view fingerprint, std::size_t limit = 32);
+[[nodiscard]] bool tokenChainContains(std::string_view chain, std::string_view fingerprint);
+
+enum class CliTargetAction { Keep, Write, AdoptIfSameAccount };
+
+// What background sync does with one CLI file while an account is selected. Write replaces a stale copy of the
+// selected account's own token. AdoptIfSameAccount is a newer login the CLI made itself: the caller adopts it only
+// after proving it belongs to the selected account. Any other login is the CLI's own and is kept.
+[[nodiscard]] CliTargetAction selectedCliTargetAction(const TokenRecord& file, const TokenRecord& selected,
+                                                      bool fileHoldsEarlierToken, std::int64_t nowMs);
 [[nodiscard]] bool tokenRecordUsable(const TokenRecord& record, std::int64_t nowMs);
 [[nodiscard]] TokenPick pickLatestValidToken(const TokenRecord& left, const TokenRecord& right, std::int64_t nowMs);
 [[nodiscard]] std::size_t pickLatestValidTokenIndex(std::span<const TokenRecord> records, std::int64_t nowMs);
