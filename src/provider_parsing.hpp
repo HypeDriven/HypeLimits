@@ -31,6 +31,8 @@ struct ProviderUsage {
 [[nodiscard]] std::optional<std::string> jsonString(std::string_view json, std::string_view key, std::size_t start = 0);
 [[nodiscard]] std::optional<double> jsonNumber(std::string_view json, std::string_view key, std::size_t start = 0);
 [[nodiscard]] std::optional<TimePoint> parseTimestamp(std::string_view value);
+// Delta-seconds form of an HTTP Retry-After header, capped at one day. HTTP dates are not used by these providers.
+[[nodiscard]] std::optional<std::chrono::seconds> parseRetryAfter(std::string_view value);
 
 [[nodiscard]] std::optional<BalanceValue> parseMoonshotBalance(std::string_view json);
 [[nodiscard]] std::optional<BalanceValue> parseDeepSeekBalance(std::string_view json);

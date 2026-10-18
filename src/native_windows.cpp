@@ -1211,6 +1211,7 @@ struct HttpResponse {
     std::string error;
     std::wstring url;
     std::wstring location;
+    std::optional<std::chrono::seconds> retryAfter;
 };
 
 struct HttpRequest {
@@ -1257,6 +1258,12 @@ HttpResponse httpsRequest(const HttpRequest& spec) {
         if (WinHttpQueryHeaders(request, WINHTTP_QUERY_LOCATION, WINHTTP_HEADER_NAME_BY_INDEX, location, &locationSize,
                                 WINHTTP_NO_HEADER_INDEX)) {
             result.location = location;
+        }
+        wchar_t retryAfter[64]{};
+        DWORD retryAfterSize = sizeof(retryAfter);
+        if (WinHttpQueryHeaders(request, WINHTTP_QUERY_RETRY_AFTER, WINHTTP_HEADER_NAME_BY_INDEX, retryAfter, &retryAfterSize,
+                                WINHTTP_NO_HEADER_INDEX)) {
+            result.retryAfter = parseRetryAfter(utf8(retryAfter));
         }
         DWORD urlSize = 0;
         WinHttpQueryOption(request, WINHTTP_OPTION_URL, nullptr, &urlSize);
@@ -2074,6 +2081,10 @@ void failMetric(Metric& metric, DWORD status, const std::string& error) {
         return;
     }
     metric.state = metricHasLastValue(metric) ? MetricState::Stale : MetricState::Error;
+    if (status == 429) {
+        metric.diagnostic = "The provider is rate limiting usage checks for this account; HypeLimits waits before asking again.";
+        return;
+    }
     metric.diagnostic = error.empty() ? "The provider returned HTTP " + std::to_string(status) + "." : error;
 }
 
@@ -2098,7 +2109,9 @@ bool mergeHttpUsage(ProviderSnapshot& snapshot, const HttpResponse& response, co
     lastStatus = response.status;
     lastError = response.error;
     if (response.status == 401 || response.status == 403) authenticationRejected = true;
+    if (response.status == 429 && response.retryAfter) snapshot.rateLimitedUntil = now + *response.retryAfter;
     if (response.status == 200 && parsed) {
+        snapshot.rateLimitedUntil.reset();
         applyUsage(snapshot, *parsed, now, threshold, barFull);
         return true;
     }
@@ -2689,6 +2702,8 @@ private:
     TokenHistory activityHistory_;
     SessionLogCache sessionLogCache_;
     bool sessionLogCacheLoaded_{false};
+    // Claude slot label -> imported local token total at the previous session-log scan.
+    std::vector<std::pair<std::string, double>> claudeLocalTotals_;
     std::jthread sessionScanThread_;
     std::atomic_bool sessionScanRunning_{false};
     std::optional<CivilDay> activityHoverDay_;
@@ -3715,12 +3730,17 @@ bool App::refresh(bool queueIfBusy, bool scheduled) {
         return false;
     }
     lastRefreshTick_ = nowTick;
+    // An account the provider rate limited keeps its last values until the Retry-After time passes.
+    const auto nowTime = std::chrono::system_clock::now();
     for (auto& provider : providers_) {
         if (!provider.polling || !provider.connected) continue;
-        for (auto& metric : provider.snapshot.metrics) {
-            if (metricFetchable(provider.definition.id, metric.kind)) metric.state = MetricState::Refreshing;
+        if (!providerRateLimited(provider.snapshot, nowTime)) {
+            for (auto& metric : provider.snapshot.metrics) {
+                if (metricFetchable(provider.definition.id, metric.kind)) metric.state = MetricState::Refreshing;
+            }
         }
         for (auto& account : provider.monitorAccounts) {
+            if (providerRateLimited(account.snapshot, nowTime)) continue;
             for (auto& metric : account.snapshot.metrics) {
                 if (metricFetchable(provider.definition.id, metric.kind)) metric.state = MetricState::Refreshing;
             }
@@ -3738,6 +3758,7 @@ bool App::refresh(bool queueIfBusy, bool scheduled) {
         const DWORD threshold = readDword((prefix + L".ThresholdCents").c_str(), 1000);
         const DWORD barFull = readDword((prefix + L".CreditBarFullCents").c_str(), 10000);
         for (auto& account : provider.monitorAccounts) {
+            if (providerRateLimited(account.snapshot, nowTime)) continue;
             const bool isActive = account.slot == active;
             AuthMaterial auth = isActive ? loadAuth(provider.definition.id) : loadStoredAuth(accountKey(provider.definition.id, account.slot));
             if (auth.token.empty()) {
@@ -5253,6 +5274,24 @@ LRESULT App::onTray(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
                 historyChanged = true;
             }
         }
+        // New tokens in an account's local Claude logs are drawdown even when its usage endpoint gave no new numbers.
+        const auto drawing = accountsWithNewLocalTokens(claudeLocalTotals_, claude);
+        const auto anthropic = std::ranges::find_if(providers_, [](const Provider& p) { return p.definition.id == L"anthropic"; });
+        if (!drawing.empty() && anthropic != providers_.end()) {
+            const auto now = std::chrono::system_clock::now();
+            const DWORD active = activeAccount(anthropic->definition.id);
+            for (auto& account : anthropic->monitorAccounts) {
+                if (std::ranges::find(drawing, std::to_string(account.slot)) == drawing.end()) continue;
+                markLocalDrawdown(account.snapshot, now);
+                if (account.slot == active) markLocalDrawdown(anthropic->snapshot, now);
+                for (const auto& metric : account.snapshot.metrics) {
+                    if (!metric.lastDrawdownAt || *metric.lastDrawdownAt != now) continue;
+                    const std::wstring prefix = accountSettingFor(anthropic->definition.id, account.slot) + L"." + std::to_wstring(static_cast<int>(metric.kind));
+                    writeQword((prefix + L".DrawdownUnix").c_str(), static_cast<ULONGLONG>(std::chrono::duration_cast<std::chrono::seconds>(now.time_since_epoch()).count()));
+                }
+            }
+            updateAll();
+        }
         if (historyChanged) {
             writeString(L"ActivityHistory", wide(serializeTokenHistory(activityHistory_)));
             destroyActivityBitmap();
@@ -5266,8 +5305,13 @@ LRESULT App::onTray(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
             if (result.index >= providers_.size()) continue;
             auto& provider = providers_[result.index];
             result.snapshot.enabled = provider.snapshot.enabled;
-            if (result.active) provider.snapshot = result.snapshot;
             const auto row = std::ranges::find_if(provider.monitorAccounts, [&](const MonitorAccount& account) { return account.slot == result.slot; });
+            // A local-log drawdown found while this poll was in flight is newer than the poll's starting copy.
+            if (row != provider.monitorAccounts.end()) keepLaterDrawdowns(result.snapshot, row->snapshot);
+            if (result.active) {
+                keepLaterDrawdowns(result.snapshot, provider.snapshot);
+                provider.snapshot = result.snapshot;
+            }
             if (row != provider.monitorAccounts.end()) row->snapshot = result.snapshot;
             for (const auto& metric : result.snapshot.metrics) {
                 if ((metric.state != MetricState::Current && metric.state != MetricState::Stale) || !metric.observedAt) continue;
@@ -5320,7 +5364,9 @@ LRESULT App::onTray(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
         }
         for (auto& provider : providers_) {
             if (!std::exchange(provider.polling, false)) continue;
-            const bool failed = provider.connected && providerPollFailed(provider.snapshot);
+            // A rate-limited account already waits for its own Retry-After; it must not hold back the other accounts.
+            const bool failed = provider.connected && providerPollFailed(provider.snapshot)
+                && !providerRateLimited(provider.snapshot, std::chrono::system_clock::now());
             provider.failureStreak = failed ? std::min(provider.failureStreak + 1, 5U) : 0U;
             provider.nextPollTick = lastRefreshTick_ + (pollIntervalMs() << provider.failureStreak);
         }

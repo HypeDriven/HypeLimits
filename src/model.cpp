@@ -181,6 +181,24 @@ bool usageDrewDownSince(const Metric& previous, const Metric& current) {
     return false;
 }
 
+bool providerRateLimited(const ProviderSnapshot& provider, TimePoint now) {
+    return provider.rateLimitedUntil && *provider.rateLimitedUntil > now;
+}
+
+void markLocalDrawdown(ProviderSnapshot& provider, TimePoint now) {
+    for (auto& metric : provider.metrics) {
+        if (metric.visibleOnMonitor()) metric.lastDrawdownAt = now;
+    }
+}
+
+void keepLaterDrawdowns(ProviderSnapshot& target, const ProviderSnapshot& source) {
+    for (auto& metric : target.metrics) {
+        const auto match = std::ranges::find_if(source.metrics, [&](const Metric& other) { return other.kind == metric.kind; });
+        if (match == source.metrics.end() || !match->lastDrawdownAt) continue;
+        if (!metric.lastDrawdownAt || *metric.lastDrawdownAt < *match->lastDrawdownAt) metric.lastDrawdownAt = match->lastDrawdownAt;
+    }
+}
+
 std::string_view metricKindName(MetricKind kind) {
     switch (kind) {
     case MetricKind::Session: return "Session";

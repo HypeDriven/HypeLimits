@@ -108,6 +108,19 @@ std::optional<double> jsonNumber(std::string_view json, std::string_view key, st
     return numberAt(json, key, start);
 }
 
+std::optional<std::chrono::seconds> parseRetryAfter(std::string_view value) {
+    while (!value.empty() && (value.front() == ' ' || value.front() == '\t')) value.remove_prefix(1);
+    while (!value.empty() && (value.back() == ' ' || value.back() == '\t' || value.back() == '\r' || value.back() == '\n')) value.remove_suffix(1);
+    if (value.empty() || !std::ranges::all_of(value, [](char c) { return c >= '0' && c <= '9'; })) return std::nullopt;
+    constexpr long long kMax = 24 * 60 * 60;
+    long long seconds = 0;
+    for (const char c : value) {
+        seconds = seconds * 10 + (c - '0');
+        if (seconds > kMax) return std::chrono::seconds{kMax};
+    }
+    return std::chrono::seconds{seconds};
+}
+
 std::optional<TimePoint> parseTimestamp(std::string_view value) {
     if (value.empty()) return std::nullopt;
     if (looksLikeUnix(value)) {

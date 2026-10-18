@@ -44,6 +44,18 @@ void recordOne(TokenHistory& history, TokenObservation sample) {
 }
 
 void testActivityHistory() {
+    {
+        std::vector<std::pair<std::string, double>> totals;
+        std::vector<LocalSessionImport> imports = {{"anthropic", "0", {{CivilDay{2026, 10, 18}, 100}}},
+                                                   {"anthropic", "2", {}},
+                                                   {"anthropic", std::string(kLocalSessionAccount), {{CivilDay{2026, 10, 18}, 5}}}};
+        check(accountsWithNewLocalTokens(totals, imports).empty(), "the first local scan is only a baseline");
+        imports[1].days.push_back({CivilDay{2026, 10, 18}, 40});
+        imports[2].days[0].tokens = 50;
+        const auto grew = accountsWithNewLocalTokens(totals, imports);
+        check(grew == std::vector<std::string>{"2"}, "only a slot whose local tokens grew is drawing down");
+        check(accountsWithNewLocalTokens(totals, imports).empty(), "unchanged local totals are idle");
+    }
     const CivilDay today{2026, 6, 15};
     const auto now = timePointOnLocalDay(today, 15, 0);
     check(localCivilDay(now) == today, "local noon helper stays on the requested civil day");
@@ -881,6 +893,26 @@ int main() {
     Metric creditAfter;
     creditAfter.remaining = 32.0;
     check(usageDrewDownSince(creditBefore, creditAfter), "lower remaining credit counts as drawdown");
+
+    ProviderSnapshot limited;
+    limited.metrics = {percentage(MetricKind::Session, 10, 100)};
+    check(!providerRateLimited(limited, recent), "no Retry-After means the account is polled");
+    limited.rateLimitedUntil = recent + std::chrono::seconds{419};
+    check(providerRateLimited(limited, recent), "an account waits until its Retry-After time");
+    check(!providerRateLimited(limited, recent + std::chrono::seconds{419}), "polling resumes once Retry-After passes");
+    check(parseRetryAfter(" 419\r\n") == std::chrono::seconds{419}, "Retry-After seconds are parsed");
+    check(parseRetryAfter("999999999") == std::chrono::seconds{86400}, "Retry-After is capped at one day");
+    check(!parseRetryAfter("Wed, 21 Oct 2026 07:28:00 GMT") && !parseRetryAfter(""), "HTTP-date Retry-After is ignored");
+    markLocalDrawdown(limited, recent);
+    check(limited.metrics[0].lastDrawdownAt == recent, "local token activity marks a visible allowance as drawing down");
+    ProviderSnapshot polledCopy;
+    polledCopy.metrics = {percentage(MetricKind::Session, 10, 100)};
+    polledCopy.metrics[0].lastDrawdownAt = recent - std::chrono::seconds{600};
+    keepLaterDrawdowns(polledCopy, limited);
+    check(polledCopy.metrics[0].lastDrawdownAt == recent, "a poll result keeps a later local drawdown");
+    limited.metrics[0].lastDrawdownAt = recent - std::chrono::seconds{900};
+    keepLaterDrawdowns(polledCopy, limited);
+    check(polledCopy.metrics[0].lastDrawdownAt == recent, "an older local drawdown does not replace a newer poll drawdown");
 
     ProviderSnapshot polled;
     polled.metrics = {percentage(MetricKind::Session, 10, 100), Metric{MetricKind::ApiCredit, MetricState::Stale}};

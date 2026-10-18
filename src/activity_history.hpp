@@ -9,6 +9,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace hypelimits {
@@ -195,6 +196,11 @@ SessionLogScan refreshSessionLogCache(SessionLogCache& cache, const std::filesys
 [[nodiscard]] std::vector<LocalSessionImport> assignClaudeSessionImports(
     std::span<const LocalSessionImport> imports, std::span<const OrganizationAccountLink> links,
     std::span<const SavedAccountSlot> slots);
+
+// Accounts whose imported token total grew since the previous call, then records the new totals.
+// An account seen for the first time is only a baseline. "local" is never returned.
+[[nodiscard]] std::vector<std::string> accountsWithNewLocalTokens(std::vector<std::pair<std::string, double>>& totals,
+                                                                  std::span<const LocalSessionImport> imports);
 
 [[nodiscard]] std::string serializeSessionLogCache(const SessionLogCache& cache);
 [[nodiscard]] SessionLogCache parseSessionLogCache(std::string_view text);

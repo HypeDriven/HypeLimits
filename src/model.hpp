@@ -45,6 +45,8 @@ struct ProviderSnapshot {
     bool enabled{true};
     std::vector<Metric> metrics;
     std::optional<TimePoint> lastSuccessfulRefresh;
+    // Set from a 429 Retry-After. This account is not polled again before then.
+    std::optional<TimePoint> rateLimitedUntil;
 };
 
 struct AggregateStatus {
@@ -78,6 +80,11 @@ inline constexpr std::chrono::seconds kUsageActivityFade{60 * 60};
 [[nodiscard]] double usageActivityBrightness(std::optional<TimePoint> lastDrawdownAt, TimePoint now);
 [[nodiscard]] RgbColor applyUsageActivity(RgbColor color, double activity);
 [[nodiscard]] bool usageDrewDownSince(const Metric& previous, const Metric& current);
+[[nodiscard]] bool providerRateLimited(const ProviderSnapshot& provider, TimePoint now);
+// Local CLI logs show this account spending tokens, even if the usage endpoint has no new numbers.
+void markLocalDrawdown(ProviderSnapshot& provider, TimePoint now);
+// A poll result carries the drawdown times from when it started; keep any later local drawdown.
+void keepLaterDrawdowns(ProviderSnapshot& target, const ProviderSnapshot& source);
 [[nodiscard]] std::string_view metricKindName(MetricKind kind);
 [[nodiscard]] std::string_view metricStateName(MetricState state);
 

@@ -1573,4 +1573,22 @@ TokenHistory parseTokenHistory(std::string_view text) {
     return history;
 }
 
+std::vector<std::string> accountsWithNewLocalTokens(std::vector<std::pair<std::string, double>>& totals,
+                                                    std::span<const LocalSessionImport> imports) {
+    std::vector<std::string> grew;
+    for (const auto& import : imports) {
+        if (import.accountId == kLocalSessionAccount) continue;
+        double total = 0;
+        for (const auto& day : import.days) total += day.tokens;
+        const auto known = std::ranges::find_if(totals, [&](const auto& entry) { return entry.first == import.accountId; });
+        if (known == totals.end()) {
+            totals.emplace_back(import.accountId, total);
+            continue;
+        }
+        if (total > known->second) grew.push_back(import.accountId);
+        known->second = total;
+    }
+    return grew;
+}
+
 } // namespace hypelimits
