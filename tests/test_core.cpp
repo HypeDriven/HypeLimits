@@ -1122,6 +1122,15 @@ int main() {
     check(tokenRecordUsable(expiredKimi, nowMs), "expired Kimi access token remains usable when a refresh token is present");
     check(kimiOauth.expiresAtMs.has_value() && *kimiOauth.expiresAtMs == 1'738'000'000'000LL,
           "Kimi expires_at seconds are converted to milliseconds");
+    TokenRecord kimiWinner;
+    kimiWinner.accessToken = "kimi-new";
+    kimiWinner.refreshToken = "kimi-r2";
+    kimiWinner.expiresAtMs = 1'738'000'900'000LL;
+    const auto kimiMerged = mergeCliCredentialJson(CliCredentialFormat::KimiCredentials,
+        R"({"access_token":"kimi-access","refresh_token":"kimi-r","expires_at":1738000000,"token_type":"Bearer","scope":"kimi-code"})", kimiWinner);
+    check(kimiMerged.find("\"expires_at\":1738000900") != std::string::npos && kimiMerged.find("1738000900000") == std::string::npos,
+          "Kimi write-back stores expires_at in seconds, as kimi-cli reads it");
+    check(kimiMerged.find("\"scope\":\"kimi-code\"") != std::string::npos, "Kimi write-back keeps the CLI's other fields");
     check(wslUserSettingKey("Ubuntu-24.04", "albert") == "WslUser.Ubuntu-24.04/albert",
           "WSL user setting key is distro/user");
     check(quoteWindowsCommandLineArgument(L"Ubuntu 24.04") == L"\"Ubuntu 24.04\"",

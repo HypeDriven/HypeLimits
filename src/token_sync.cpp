@@ -464,8 +464,12 @@ std::string mergeCliCredentialJson(CliCredentialFormat format, std::string_view 
     if (format == CliCredentialFormat::GeminiOauth) {
         json = setObjectField(std::move(json), root, "expiry_date", winner.expiresAtMs ? std::to_string(*winner.expiresAtMs) : "null");
     }
-    if (format == CliCredentialFormat::GrokAuth || format == CliCredentialFormat::KimiCredentials) {
+    if (format == CliCredentialFormat::GrokAuth) {
         json = setObjectField(std::move(json), root, "expires_at", winner.expiresAtMs ? std::to_string(*winner.expiresAtMs) : "null");
+    }
+    if (format == CliCredentialFormat::KimiCredentials) {
+        // kimi-cli compares expires_at with time.time(), so it is seconds; milliseconds would look valid forever.
+        json = setObjectField(std::move(json), root, "expires_at", winner.expiresAtMs ? std::to_string(*winner.expiresAtMs / 1000) : "null");
     }
     json = setStringField(std::move(json), root, "account_id", winner.accountId);
     json = setStringField(std::move(json), root, "team_id", winner.teamId);

@@ -2394,16 +2394,24 @@ void queryProviderUsage(std::wstring_view id, const AuthMaterial& auth, Provider
         auto response = httpsGet(L"chatgpt.com", L"/backend-api/wham/usage", auth.token, extra);
         gotData = mergeHttpUsage(snapshot, response, parseCodexUsage(response.body), now, threshold, barFull, lastStatus, lastError, authenticationRejected);
     } else if (id == L"moonshot") {
+        // A Kimi Code login works only on the coding endpoint and a Moonshot platform key only on the balance
+        // endpoint, so one endpoint refusing the credential does not reject it while the other returned data.
+        bool codingRejected = false;
+        bool balanceRejected = false;
         auto coding = httpsGet(L"api.kimi.com", L"/coding/v1/usages", auth.token, kimiUsageHeaders());
-        gotData = mergeHttpUsage(snapshot, coding, parseKimiCodingUsage(coding.body), now, threshold, barFull, lastStatus, lastError, authenticationRejected);
-        auto balance = httpsGet(L"api.moonshot.ai", L"/v1/users/me/balance", auth.token);
-        if (mergeHttpUsage(snapshot, balance, parseMoonshotBalance(balance.body) ? ProviderUsage{std::nullopt, std::nullopt, parseMoonshotBalance(balance.body)} : std::optional<ProviderUsage>{},
-                           now, threshold, barFull, lastStatus, lastError, authenticationRejected)) {
-            gotData = true;
-        } else if (!gotData) {
-            lastStatus = balance.status ? balance.status : lastStatus;
-            lastError = balance.error.empty() ? lastError : balance.error;
+        gotData = mergeHttpUsage(snapshot, coding, parseKimiCodingUsage(coding.body), now, threshold, barFull, lastStatus, lastError, codingRejected);
+        // A subscription login (it has a refresh token) has no platform balance to ask for.
+        if (auth.refreshToken.empty()) {
+            auto balance = httpsGet(L"api.moonshot.ai", L"/v1/users/me/balance", auth.token);
+            if (mergeHttpUsage(snapshot, balance, parseMoonshotBalance(balance.body) ? ProviderUsage{std::nullopt, std::nullopt, parseMoonshotBalance(balance.body)} : std::optional<ProviderUsage>{},
+                               now, threshold, barFull, lastStatus, lastError, balanceRejected)) {
+                gotData = true;
+            } else if (!gotData) {
+                lastStatus = balance.status ? balance.status : lastStatus;
+                lastError = balance.error.empty() ? lastError : balance.error;
+            }
         }
+        authenticationRejected = !gotData && (codingRejected || balanceRejected);
     } else if (id == L"deepseek") {
         // DeepSeek publishes an API key, not an OAuth refresh token.
         auto response = httpsGet(L"api.deepseek.com", L"/user/balance", auth.token);
