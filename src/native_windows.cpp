@@ -2157,12 +2157,16 @@ bool accessTokenNeedsRefresh(const AuthMaterial& auth) {
     return *expiry <= now;
 }
 
-// Stable account identity: the account id a token carries (Codex), else the Claude profile account uuid.
-// Empty when unknown. Lookups are cached per access token so a rejected slot does not re-query every poll.
-std::string credentialIdentity(std::wstring_view id, const AuthMaterial& auth) {
-    if (!auth.accountId.empty()) return auth.accountId;
-    if (id != L"anthropic" || auth.token.empty()) return {};
-    static std::map<std::size_t, std::string> cache;
+// Account and organization uuids from the Claude profile. Neither is a credential.
+struct ClaudeProfile {
+    std::string account;
+    std::string organization;
+};
+
+// Lookups are cached per access token so a rejected slot does not re-query every poll.
+ClaudeProfile claudeProfile(const AuthMaterial& auth) {
+    if (auth.token.empty()) return {};
+    static std::map<std::size_t, ClaudeProfile> cache;
     static std::mutex cacheMutex;
     const std::size_t key = std::hash<std::string>{}(auth.token);
     {
@@ -2174,21 +2178,45 @@ std::string credentialIdentity(std::wstring_view id, const AuthMaterial& auth) {
     if (response.status != 200) return {};
     const auto account = response.body.find("\"account\"");
     if (account == std::string::npos) return {};
-    std::string identity = jsonString(response.body, "uuid", account).value_or(std::string{});
+    ClaudeProfile profile;
+    profile.account = jsonString(response.body, "uuid", account).value_or(std::string{});
+    if (const auto organization = response.body.find("\"organization\""); organization != std::string::npos) {
+        profile.organization = jsonString(response.body, "uuid", organization).value_or(std::string{});
+    }
     std::lock_guard lock(cacheMutex);
     if (cache.size() > 64) cache.clear();
-    cache[key] = identity;
-    return identity;
+    cache[key] = profile;
+    return profile;
+}
+
+// Stable account identity: the account id a token carries (Codex), else the Claude profile account uuid.
+// Empty when unknown.
+std::string credentialIdentity(std::wstring_view id, const AuthMaterial& auth) {
+    if (!auth.accountId.empty()) return auth.accountId;
+    if (id != L"anthropic") return {};
+    return claudeProfile(auth).account;
 }
 
 std::wstring slotIdentitySetting(std::wstring_view id, DWORD slot) {
     return accountSettingFor(id, slot) + L".Identity";
 }
 
+std::wstring slotOrganizationSetting(std::wstring_view id, DWORD slot) {
+    return accountSettingFor(id, slot) + L".Organization";
+}
+
+// Claude also keeps the slot's organization so its local logs stay matched after the
+// CLI's own config and backups stop naming that account.
 void rememberSlotIdentity(std::wstring_view id, DWORD slot, const AuthMaterial& auth) {
-    if (!readString(slotIdentitySetting(id, slot).c_str()).empty()) return;
+    const bool haveIdentity = !readString(slotIdentitySetting(id, slot).c_str()).empty();
+    const bool haveOrganization = id != L"anthropic" || !readString(slotOrganizationSetting(id, slot).c_str()).empty();
+    if (haveIdentity && haveOrganization) return;
     const auto identity = credentialIdentity(id, auth);
-    if (!identity.empty()) writeString(slotIdentitySetting(id, slot).c_str(), wide(identity));
+    if (identity.empty()) return;
+    if (!haveIdentity) writeString(slotIdentitySetting(id, slot).c_str(), wide(identity));
+    if (haveOrganization || utf8(readString(slotIdentitySetting(id, slot).c_str())) != identity) return;
+    const auto organization = claudeProfile(auth).organization;
+    if (!organization.empty()) writeString(slotOrganizationSetting(id, slot).c_str(), wide(organization));
 }
 
 DWORD credentialSlot(std::wstring_view credentialId, std::wstring_view id) {
@@ -3674,13 +3702,17 @@ void App::startSessionLogScan() {
         }
     }
     std::vector<SavedAccountSlot> claudeSlots;
+    std::vector<OrganizationAccountLink> savedLinks;
     for (const DWORD slot : listAccountSlots(L"anthropic")) {
         SavedAccountSlot saved;
         saved.slotId = std::to_string(slot);
         saved.accountUuid = utf8(readString(slotIdentitySetting(L"anthropic", slot).c_str()));
+        auto organization = utf8(readString(slotOrganizationSetting(L"anthropic", slot).c_str()));
+        if (!saved.accountUuid.empty() && !organization.empty()) savedLinks.push_back({saved.accountUuid, std::move(organization)});
         claudeSlots.push_back(std::move(saved));
     }
-    sessionScanThread_ = std::jthread([this, homes = std::move(homes), claudeSlots = std::move(claudeSlots)] {
+    sessionScanThread_ = std::jthread([this, homes = std::move(homes), claudeSlots = std::move(claudeSlots),
+                                       savedLinks = std::move(savedLinks)] {
         applyWorkerPriorities();
         if (!sessionLogCacheLoaded_) {
             const auto file = sessionLogCacheFile();
@@ -3689,7 +3721,7 @@ void App::startSessionLogScan() {
         }
         bool anyHome = false;
         bool changed = false;
-        std::vector<OrganizationAccountLink> claudeLinks;
+        std::vector<OrganizationAccountLink> claudeLinks = savedLinks;
         for (const auto& home : homes) {
             const auto status = refreshSessionLogCache(sessionLogCache_, home);
             if (status == SessionLogScan::Unavailable) continue;
