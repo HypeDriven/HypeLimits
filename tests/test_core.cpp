@@ -377,7 +377,40 @@ void testActivityHistory() {
         check(replaceImportedDailyTokens(history, "openai", "1", replacement), "a later report replaces that account's imported days");
         check(!replaceImportedDailyTokens(history, "openai", "1", replacement), "the same report does not count twice");
         check(std::abs(activityStats(history, now).lifetimeTokens - 40.0) < 0.001, "replacement does not add to the previous import");
+        {
+            TokenHistory windowed;
+            const std::vector<DailyTokens> first{{CivilDay{2025, 6, 1}, 5.0}, {CivilDay{2026, 6, 14}, 40.0}};
+            replaceImportedDailyTokens(windowed, "openai", "1", first);
+            const std::vector<DailyTokens> later{{CivilDay{2025, 6, 1}, 99.0}, {CivilDay{2026, 6, 15}, 3.0}};
+            check(replaceImportedDailyTokens(windowed, "openai", "1", later, CivilDay{2025, 6, 2}),
+                  "a windowed report replaces the days it covers");
+            double kept = 0.0;
+            for (const auto& row : windowed.imported) kept += row.tokens;
+            check(windowed.imported.size() == 2 && windowed.imported.front().day == CivilDay{2025, 6, 1}
+                      && std::abs(kept - 8.0) < 0.001,
+                  "days older than a windowed report stay, and covered days missing from it are replaced");
+        }
 
+        {
+            TokenHistory kept;
+            const CivilDay day{2026, 6, 14};
+            const std::vector<LocalSessionImport> first{{"anthropic", "local", {{day, 30.0}}}, {"anthropic", "0", {}}};
+            check(replaceImportedDailyTokensKeepingTotals(kept, first), "a first guarded import is stored");
+            const std::vector<LocalSessionImport> moved{{"anthropic", "local", {}}, {"anthropic", "0", {{day, 30.0}}}};
+            replaceImportedDailyTokensKeepingTotals(kept, moved);
+            check(std::abs(activityStats(kept, now, "anthropic").lifetimeTokens - 30.0) < 0.001
+                      && activityStats(kept, now, "anthropic", "local").lifetimeTokens == 0.0,
+                  "a day moving between accounts is not counted twice");
+            const std::vector<LocalSessionImport> gone{{"anthropic", "local", {}}, {"anthropic", "0", {{day, 10.0}}}};
+            check(!replaceImportedDailyTokensKeepingTotals(kept, gone), "losing evidence does not change the history");
+            check(std::abs(activityStats(kept, now, "anthropic", "0").lifetimeTokens - 30.0) < 0.001,
+                  "a shrinking day keeps its total on the account that lost it");
+            const std::vector<LocalSessionImport> grew{{"anthropic", "local", {}}, {"anthropic", "0", {{day, 45.0}}}};
+            check(replaceImportedDailyTokensKeepingTotals(kept, grew), "a growing day is stored");
+            check(std::abs(activityStats(kept, now, "anthropic").lifetimeTokens - 45.0) < 0.001, "growth replaces, not adds");
+            const std::vector<LocalSessionImport> empty{{"anthropic", "local", {}}, {"anthropic", "0", {}}};
+            check(!replaceImportedDailyTokensKeepingTotals(kept, empty), "an empty rescan keeps every day");
+        }
         recordOne(history, observation("anthropic", "0", AllowanceWindow::Weekly, CounterUnit::Tokens, 0, MetricState::Current, at(0, 9)));
         recordOne(history, observation("anthropic", "0", AllowanceWindow::Weekly, CounterUnit::Tokens, 7, MetricState::Current, at(0, 12)));
         check(std::abs(activityStats(history, now).lifetimeTokens - 47.0) < 0.001,
@@ -529,8 +562,9 @@ void testActivityHistory() {
         check(std::abs(tokensFor(sessionLogImports(cache), "anthropic") - (37.0 + 10.0 + 4.0)) < 0.001,
               "an appended request adds its tokens once");
         fs::remove(home / ".kimi-code" / "sessions" / "demo" / "agents" / "main" / "wire.jsonl");
-        check(refreshSessionLogCache(cache, home) == SessionLogScan::Updated, "removing a log updates the cache");
-        check(tokensFor(sessionLogImports(cache), "moonshot") == 0.0, "a removed Kimi log drops its tokens");
+        check(refreshSessionLogCache(cache, home) == SessionLogScan::Unchanged, "removing a log keeps its cache entry");
+        check(std::abs(tokensFor(sessionLogImports(cache), "moonshot") - 21.0) < 0.001,
+              "a deleted Kimi log keeps the tokens already read from it");
         check(std::abs(tokensFor(sessionLogImports(cache), "anthropic") - (37.0 + 10.0 + 4.0)) < 0.001,
               "removing one provider's log leaves the others");
 
@@ -540,7 +574,7 @@ void testActivityHistory() {
         }
         recordOne(history, observation("anthropic", "0", AllowanceWindow::Weekly, CounterUnit::Percent, 10, MetricState::Current, when));
         recordOne(history, observation("anthropic", "0", AllowanceWindow::Weekly, CounterUnit::Percent, 40, MetricState::Current, when));
-        const double expected = 37.0 + 10.0 + 4.0 + 46.0;
+        const double expected = 37.0 + 10.0 + 4.0 + 46.0 + 21.0;
         check(std::abs(activityStats(history, now).lifetimeTokens - expected) < 0.001,
               "local session totals count, and percent allowance counters still do not");
         const auto historyText = serializeTokenHistory(history);

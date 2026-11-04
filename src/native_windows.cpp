@@ -2356,11 +2356,12 @@ CodexDailyFetch fetchCodexDailyRange(const AuthMaterial& auth, CivilDay start, C
     return {response.status, parseCodexDailyTokens(response.body)};
 }
 
-std::optional<std::vector<DailyTokens>> fetchCodexDailyTokens(const AuthMaterial& auth) {
+// start receives the first day the report covers. Older saved days are outside it and are kept.
+std::optional<std::vector<DailyTokens>> fetchCodexDailyTokens(const AuthMaterial& auth, CivilDay& start) {
     if (auth.token.empty()) return std::nullopt;
     const CivilDay today = localCivilDay(std::chrono::system_clock::now());
     const CivilDay end = shiftCivilDay(today, 1);
-    const CivilDay start = shiftCivilDay(today, -363);
+    start = shiftCivilDay(today, -363);
     const auto whole = fetchCodexDailyRange(auth, start, end);
     if (whole.status == 200) return whole.days;
     if (whole.status != 400) return std::nullopt;
@@ -3682,6 +3683,7 @@ struct RefreshResult {
     ProviderSnapshot snapshot;
     bool importedDaily{false};
     std::vector<DailyTokens> importedDays;
+    CivilDay importedFrom{};
 };
 
 struct SessionScanResult {
@@ -3830,7 +3832,7 @@ bool App::refresh(bool queueIfBusy, bool scheduled) {
                 return metric.state == MetricState::Current;
             });
             if (openai && usageReady) {
-                if (auto days = fetchCodexDailyTokens(request.auth)) {
+                if (auto days = fetchCodexDailyTokens(request.auth, request.importedFrom)) {
                     request.importedDaily = true;
                     request.importedDays = std::move(*days);
                 }
@@ -5302,18 +5304,14 @@ LRESULT App::onTray(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
         std::unique_ptr<SessionScanResult> completed(reinterpret_cast<SessionScanResult*>(lParam));
         if (!completed->scanned) return 0;
         bool historyChanged = false;
+        std::vector<LocalSessionImport> others;
         for (const auto& import : completed->imports) {
             if (import.providerId == "anthropic") continue;
-            if (replaceImportedDailyTokens(activityHistory_, import.providerId, kLocalSessionAccount, import.days)) {
-                historyChanged = true;
-            }
+            others.push_back(LocalSessionImport{import.providerId, std::string(kLocalSessionAccount), import.days});
         }
+        if (replaceImportedDailyTokensKeepingTotals(activityHistory_, others)) historyChanged = true;
         const auto claude = assignClaudeSessionImports(completed->imports, completed->claudeLinks, completed->claudeSlots);
-        for (const auto& import : claude) {
-            if (replaceImportedDailyTokens(activityHistory_, import.providerId, import.accountId, import.days)) {
-                historyChanged = true;
-            }
-        }
+        if (replaceImportedDailyTokensKeepingTotals(activityHistory_, claude)) historyChanged = true;
         // New tokens in an account's local Claude logs are drawdown even when its usage endpoint gave no new numbers.
         const auto drawing = accountsWithNewLocalTokens(claudeLocalTotals_, claude);
         const auto anthropic = std::ranges::find_if(providers_, [](const Provider& p) { return p.definition.id == L"anthropic"; });
@@ -5395,7 +5393,10 @@ LRESULT App::onTray(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
             if (!result.importedDaily || result.index >= providers_.size()) continue;
             const std::string providerId = utf8(providers_[result.index].definition.id);
             const std::string accountId = std::to_string(result.slot);
-            if (replaceImportedDailyTokens(activityHistory_, providerId, accountId, result.importedDays)) historyChanged = true;
+            if (replaceImportedDailyTokensKeepingTotals(activityHistory_,
+                    std::array{LocalSessionImport{providerId, accountId, result.importedDays}}, result.importedFrom)) {
+                historyChanged = true;
+            }
         }
         if (historyChanged) {
             writeString(L"ActivityHistory", wide(serializeTokenHistory(activityHistory_)));

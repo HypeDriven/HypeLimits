@@ -9,6 +9,7 @@
 #include <filesystem>
 #include <fstream>
 #include <limits>
+#include <map>
 #include <set>
 #include <sstream>
 #include <unordered_map>
@@ -642,10 +643,6 @@ std::string pathKey(const std::filesystem::path& path) {
     return std::string(normal.begin(), normal.end());
 }
 
-bool underHome(std::string_view path, std::string_view home) {
-    return path.size() > home.size() && path.starts_with(home) && path[home.size()] == '/';
-}
-
 std::int64_t modifiedStamp(const std::filesystem::file_time_type& time) {
     return static_cast<std::int64_t>(time.time_since_epoch().count());
 }
@@ -849,8 +846,7 @@ SessionLogScan refreshSessionLogCache(SessionLogCache& cache, const std::filesys
 
     bool changed = false;
     for (const auto& root : roots) {
-        std::unordered_map<std::string, bool> live;
-        const bool listed = walkListed(root.path, [&](const std::filesystem::path& file) {
+        walkListed(root.path, [&](const std::filesystem::path& file) {
             const char* provider = providerForSessionFile(home, file);
             if (provider == nullptr || std::string_view{provider} != root.provider) return;
             error.clear();
@@ -861,7 +857,6 @@ SessionLogScan refreshSessionLogCache(SessionLogCache& cache, const std::filesys
             if (error) return;
             const auto key = pathKey(file);
             const auto stamp = modifiedStamp(modified);
-            live.emplace(key, true);
             const auto found = kept.find(key);
             if (found != kept.end() && found->second.providerId == root.provider && found->second.modified == stamp
                 && found->second.size == size) {
@@ -891,15 +886,8 @@ SessionLogScan refreshSessionLogCache(SessionLogCache& cache, const std::filesys
             else found->second = std::move(entry);
             changed = true;
         });
-        if (!listed) continue;
-        for (auto it = kept.begin(); it != kept.end();) {
-            if (it->second.providerId == root.provider && underHome(it->first, homeKey) && !live.contains(it->first)) {
-                it = kept.erase(it);
-                changed = true;
-            } else {
-                ++it;
-            }
-        }
+        // A log that is no longer on disk keeps its saved daily totals. Once read, a day's tokens are history,
+        // so a deleted or rotated transcript does not erase them.
     }
 
     cache.entries.clear();
@@ -1234,7 +1222,7 @@ bool storeSessionLogCache(const SessionLogCache& cache, const std::filesystem::p
 SessionLogCache loadSessionLogCache(const std::filesystem::path& path) {
     std::error_code error;
     const auto size = std::filesystem::file_size(path, error);
-    if (error || size > 16 * 1024 * 1024) return {};
+    if (error || size > 64 * 1024 * 1024) return {};
     std::ifstream input(path, std::ios::binary);
     if (!input) return {};
     std::ostringstream buffer;
@@ -1244,14 +1232,20 @@ SessionLogCache loadSessionLogCache(const std::filesystem::path& path) {
 }
 
 bool replaceImportedDailyTokens(TokenHistory& history, std::string_view providerId, std::string_view accountId,
-                                std::span<const DailyTokens> days) {
+                                std::span<const DailyTokens> days, std::optional<CivilDay> coveredFrom) {
     if (!parseId(providerId) || !parseId(accountId)) return false;
-    std::vector<DailyTokens> incoming;
-    for (const auto& day : days) addDaily(incoming, day.day, day.tokens);
-
     const auto sameAccount = [&](const ImportedDailyTokens& row) {
         return row.providerId == providerId && row.accountId == accountId;
     };
+    std::vector<DailyTokens> incoming;
+    if (coveredFrom) {
+        for (const auto& row : history.imported) {
+            if (sameAccount(row) && row.day < *coveredFrom) addDaily(incoming, row.day, row.tokens);
+        }
+    }
+    for (const auto& day : days) {
+        if (!coveredFrom || day.day >= *coveredFrom) addDaily(incoming, day.day, day.tokens);
+    }
     std::vector<DailyTokens> previous;
     for (const auto& row : history.imported) {
         if (sameAccount(row)) addDaily(previous, row.day, row.tokens);
@@ -1278,6 +1272,83 @@ bool replaceImportedDailyTokens(TokenHistory& history, std::string_view provider
         return left.day < right.day;
     });
     return true;
+}
+
+bool replaceImportedDailyTokensKeepingTotals(TokenHistory& history, std::span<const LocalSessionImport> imports,
+                                             std::optional<CivilDay> coveredFrom) {
+    std::set<std::string> providers;
+    for (const auto& import : imports) {
+        if (parseId(import.providerId) && parseId(import.accountId)) providers.insert(import.providerId);
+    }
+    bool changed = false;
+    for (const auto& providerId : providers) {
+        std::set<std::string> accounts;
+        for (const auto& import : imports) {
+            if (import.providerId == providerId && parseId(import.accountId)) accounts.insert(import.accountId);
+        }
+        const auto inGroup = [&](const ImportedDailyTokens& row) {
+            return row.providerId == providerId && accounts.contains(row.accountId);
+        };
+        using Key = std::pair<std::string, CivilDay>;
+        const auto snapshot = [&] {
+            std::map<Key, double> rows;
+            for (const auto& row : history.imported) {
+                if (inGroup(row)) rows[{row.accountId, row.day}] += row.tokens;
+            }
+            return rows;
+        };
+        const auto dayTotals = [](const std::map<Key, double>& rows) {
+            std::map<CivilDay, double> totals;
+            for (const auto& [key, tokens] : rows) totals[key.second] += tokens;
+            return totals;
+        };
+
+        const auto before = snapshot();
+        for (const auto& import : imports) {
+            if (import.providerId != providerId || !parseId(import.accountId)) continue;
+            replaceImportedDailyTokens(history, providerId, import.accountId, import.days, coveredFrom);
+        }
+        auto after = snapshot();
+
+        // A day's total for this provider never drops. When logs or reports disappear, the missing tokens stay
+        // on the account that lost the most that day, so moving days between accounts does not count them twice.
+        const auto oldTotals = dayTotals(before);
+        const auto newTotals = dayTotals(after);
+        for (const auto& [day, oldTotal] : oldTotals) {
+            const auto found = newTotals.find(day);
+            const double shortfall = oldTotal - (found == newTotals.end() ? 0.0 : found->second);
+            if (shortfall <= 0.000001) continue;
+            std::string target;
+            double largestDrop = -1.0;
+            for (const auto& [key, tokens] : before) {
+                if (key.second != day) continue;
+                const auto now = after.find(key);
+                const double drop = tokens - (now == after.end() ? 0.0 : now->second);
+                if (drop > largestDrop) {
+                    largestDrop = drop;
+                    target = key.first;
+                }
+            }
+            if (target.empty()) continue;
+            after[{target, day}] += shortfall;
+            const auto row = std::ranges::find_if(history.imported, [&](const ImportedDailyTokens& item) {
+                return item.providerId == providerId && item.accountId == target && item.day == day;
+            });
+            if (row != history.imported.end()) row->tokens += shortfall;
+            else history.imported.push_back(ImportedDailyTokens{providerId, target, day, shortfall});
+        }
+        std::ranges::sort(history.imported, [](const ImportedDailyTokens& left, const ImportedDailyTokens& right) {
+            if (left.providerId != right.providerId) return left.providerId < right.providerId;
+            if (left.accountId != right.accountId) return left.accountId < right.accountId;
+            return left.day < right.day;
+        });
+
+        const bool same = std::ranges::equal(before, after, [](const auto& left, const auto& right) {
+            return left.first == right.first && std::abs(left.second - right.second) <= 0.000001;
+        });
+        if (!same) changed = true;
+    }
+    return changed;
 }
 
 ActivityStats activityStats(const TokenHistory& history, TimePoint now, std::string_view providerId,

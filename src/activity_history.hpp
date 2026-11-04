@@ -171,7 +171,7 @@ struct OrganizationSlotMatch {
 [[nodiscard]] std::vector<DailyTokens> parseSessionLogTokens(std::string_view jsonl);
 
 // Rereads changed logs under a home directory. A missing or unreadable home
-// leaves the cache alone. A home that exists drops logs that are no longer there.
+// leaves the cache alone. A log that is no longer on disk keeps its saved totals.
 SessionLogScan refreshSessionLogCache(SessionLogCache& cache, const std::filesystem::path& home);
 
 // Claude, Grok, and Kimi totals from the cache. A provider with no logs is an empty list.
@@ -208,9 +208,18 @@ bool storeSessionLogCache(const SessionLogCache& cache, const std::filesystem::p
 [[nodiscard]] SessionLogCache loadSessionLogCache(const std::filesystem::path& path);
 
 // Replaces one account's imported days. Other accounts and recorded deltas stay.
+// With coveredFrom, only days on or after it are replaced; earlier saved days stay,
+// so a report that covers a limited window does not erase older history.
 // Returns true when that account's imported days change.
 bool replaceImportedDailyTokens(TokenHistory& history, std::string_view providerId, std::string_view accountId,
-                                std::span<const DailyTokens> days);
+                                std::span<const DailyTokens> days, std::optional<CivilDay> coveredFrom = std::nullopt);
+
+// Replaces each listed account's imported days like replaceImportedDailyTokens, but a provider's
+// daily total over the listed accounts never drops. A shortfall stays on the account that lost the
+// most tokens that day, so days moving between accounts are not counted twice.
+// Returns true when any listed account's imported days change.
+bool replaceImportedDailyTokensKeepingTotals(TokenHistory& history, std::span<const LocalSessionImport> imports,
+                                             std::optional<CivilDay> coveredFrom = std::nullopt);
 
 // An empty provider id is every provider. A provider id with an empty account id is
 // every account of that provider, including totals that name no account. Both ids
