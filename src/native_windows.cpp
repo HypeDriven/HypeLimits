@@ -169,6 +169,7 @@ struct Provider {
     unsigned int failureStreak{0};
     ULONGLONG nextPollTick{0};
     bool polling{false};
+    std::optional<std::string> cliLoginsSeen;
 };
 
 struct MetricHit {
@@ -721,7 +722,20 @@ std::vector<WslHome> discoverWslHomes() {
     return homes;
 }
 
-std::vector<WslHome> cachedWslHomes;
+// Replaced from the UI thread while workers read it, so readers hold their own reference to one list.
+std::mutex wslHomesMutex;
+std::shared_ptr<const std::vector<WslHome>> wslHomesList = std::make_shared<const std::vector<WslHome>>();
+
+std::shared_ptr<const std::vector<WslHome>> cachedWslHomes() {
+    std::lock_guard lock(wslHomesMutex);
+    return wslHomesList;
+}
+
+void setCachedWslHomes(std::vector<WslHome> homes) {
+    auto list = std::make_shared<const std::vector<WslHome>>(std::move(homes));
+    std::lock_guard lock(wslHomesMutex);
+    wslHomesList = std::move(list);
+}
 
 std::wstring joinHomeRelative(const std::wstring& home, std::string_view relative) {
     std::wstring path = home;
@@ -954,7 +968,8 @@ std::vector<std::wstring> windowsCliCredentialPaths(std::wstring_view id) {
 std::vector<std::wstring> wslCliReadPaths(std::wstring_view id) {
     std::vector<std::wstring> paths;
     if (!wslTokenSyncEnabled()) return paths;
-    for (const auto& home : cachedWslHomes) {
+    const auto homes = cachedWslHomes();
+    for (const auto& home : *homes) {
         if (!wslHomeSyncEnabled(home)) continue;
         auto userPaths = cliCredentialPathsForHome(home.home, id);
         paths.insert(paths.end(), userPaths.begin(), userPaths.end());
@@ -978,7 +993,8 @@ std::vector<std::wstring> tokenSyncWritePaths(std::wstring_view id) {
     auto windows = cliSyncPath(id);
     if (!windows.empty()) paths.push_back(std::move(windows));
     if (!cliTokenSyncEnabled() || !wslTokenSyncEnabled()) return paths;
-    for (const auto& home : cachedWslHomes) {
+    const auto homes = cachedWslHomes();
+    for (const auto& home : *homes) {
         if (!wslHomeSyncEnabled(home)) continue;
         auto path = firstExistingOrFront(cliCredentialPathsForHome(home.home, id));
         if (!path.empty()) paths.push_back(std::move(path));
@@ -1089,6 +1105,7 @@ void propagateRefreshToCli(std::wstring_view id, const std::string& consumedRefr
             writeUtf8FileAtomic(path, merged);
             SecureZeroMemory(merged.data(), merged.size());
         }
+        SecureZeroMemory(record.accessToken.data(), record.accessToken.size());
         SecureZeroMemory(record.refreshToken.data(), record.refreshToken.size());
         SecureZeroMemory(body->data(), body->size());
     }
@@ -1454,7 +1471,8 @@ std::vector<AntigravityOAuthClient> clientsFromAgyBinary(const std::wstring& pat
 
 std::vector<AntigravityOAuthClient> discoverAntigravityOAuthClients() {
     std::vector<std::wstring> paths;
-    const auto homes = cachedWslHomes.empty() ? discoverWslHomes() : cachedWslHomes;
+    const auto cached = cachedWslHomes();
+    const auto homes = cached->empty() ? discoverWslHomes() : *cached;
     for (const auto& home : homes) paths.push_back(joinHomeRelative(home.home, ".local/bin/agy"));
     for (const auto& distro : listWslDistros()) {
         paths.push_back(L"\\\\wsl.localhost\\" + distro + L"\\usr\\local\\bin\\agy");
@@ -1489,18 +1507,25 @@ HttpResponse refreshAntigravityToken(const std::string& refreshToken) {
     return {};
 }
 
+// A rejected refresh token is stale (rotated elsewhere). Retrying it only invites the provider to revoke the
+// whole token family, which signs the provider's CLI out. Back off instead.
+std::map<std::wstring, ULONGLONG> refreshBlockedUntil;
+std::mutex refreshBlockedMutex;
+
+std::wstring refreshBlockKey(std::wstring_view credentialId, const AuthMaterial& auth) {
+    return std::wstring(credentialId) + L"|" + wide(auth.refreshToken.substr(auth.refreshToken.size() > 12 ? auth.refreshToken.size() - 12 : 0));
+}
+
+bool refreshTokenRejected(std::wstring_view credentialId, const AuthMaterial& auth) {
+    std::lock_guard lock(refreshBlockedMutex);
+    const auto found = refreshBlockedUntil.find(refreshBlockKey(credentialId, auth));
+    return found != refreshBlockedUntil.end() && found->second > GetTickCount64();
+}
+
 bool refreshOAuth(std::wstring_view credentialId, AuthMaterial& auth) {
     if (auth.refreshToken.empty()) return false;
-    // A rejected refresh token is stale (rotated elsewhere). Retrying it only invites the provider to revoke the
-    // whole token family, which signs the provider's CLI out. Back off instead.
-    static std::map<std::wstring, ULONGLONG> blockedUntil;
-    static std::mutex blockedMutex;
-    const std::wstring blockKey = std::wstring(credentialId) + L"|" + wide(auth.refreshToken.substr(auth.refreshToken.size() > 12 ? auth.refreshToken.size() - 12 : 0));
-    {
-        std::lock_guard lock(blockedMutex);
-        const auto found = blockedUntil.find(blockKey);
-        if (found != blockedUntil.end() && found->second > GetTickCount64()) return false;
-    }
+    const std::wstring blockKey = refreshBlockKey(credentialId, auth);
+    if (refreshTokenRejected(credentialId, auth)) return false;
     const auto slotMarker = credentialId.find(L"/account-");
     const std::wstring providerStorage = slotMarker == std::wstring_view::npos
         ? std::wstring(credentialId) : std::wstring(credentialId.substr(0, slotMarker));
@@ -1532,16 +1557,19 @@ bool refreshOAuth(std::wstring_view credentialId, AuthMaterial& auth) {
     }
     if (response.status != 200 || !jsonString(response.body, "access_token")) {
         if (response.status >= 400 && response.status < 500 && response.status != 429) {
-            std::lock_guard lock(blockedMutex);
-            blockedUntil[blockKey] = GetTickCount64() + 6ULL * 60 * 60 * 1000;
+            std::lock_guard lock(refreshBlockedMutex);
+            refreshBlockedUntil[blockKey] = GetTickCount64() + 6ULL * 60 * 60 * 1000;
         }
         return false;
     }
-    const std::string consumedRefreshToken = auth.refreshToken;
+    std::string consumedRefreshToken = auth.refreshToken;
     applyTokenResponse(auth, response.body);
-    saveAuth(credentialId, auth);
+    SecureZeroMemory(response.body.data(), response.body.size());
+    // The provider has already consumed the old refresh token, so losing this save would force a new sign-in.
+    for (int attempt = 0; attempt < 3 && !saveAuth(credentialId, auth); ++attempt) Sleep(250);
     // Only CLI files that held the consumed token are updated; other slots and other logins are untouched.
     if (slotMarker == std::wstring_view::npos) propagateRefreshToCli(id, consumedRefreshToken, auth);
+    SecureZeroMemory(consumedRefreshToken.data(), consumedRefreshToken.size());
     return true;
 }
 
@@ -2109,9 +2137,8 @@ bool mergeHttpUsage(ProviderSnapshot& snapshot, const HttpResponse& response, co
     lastStatus = response.status;
     lastError = response.error;
     if (response.status == 401 || response.status == 403) authenticationRejected = true;
-    if (response.status == 429 && response.retryAfter) snapshot.rateLimitedUntil = now + *response.retryAfter;
+    if (response.status == 429) noteRateLimited(snapshot, response.retryAfter);
     if (response.status == 200 && parsed) {
-        snapshot.rateLimitedUntil.reset();
         applyUsage(snapshot, *parsed, now, threshold, barFull);
         return true;
     }
@@ -2164,17 +2191,19 @@ struct ClaudeProfile {
 };
 
 // Lookups are cached per access token so a rejected slot does not re-query every poll.
-ClaudeProfile claudeProfile(const AuthMaterial& auth) {
+ClaudeProfile claudeProfile(const AuthMaterial& auth, DWORD* status = nullptr) {
     if (auth.token.empty()) return {};
     static std::map<std::size_t, ClaudeProfile> cache;
     static std::mutex cacheMutex;
     const std::size_t key = std::hash<std::string>{}(auth.token);
-    {
+    // A caller asking for the status is checking the token now, so an earlier answer will not do.
+    if (!status) {
         std::lock_guard lock(cacheMutex);
         if (const auto found = cache.find(key); found != cache.end()) return found->second;
     }
     const auto response = httpsGet(L"api.anthropic.com", L"/api/oauth/profile", auth.token,
                                    L"anthropic-beta: oauth-2025-04-20\r\nanthropic-version: 2023-06-01\r\n");
+    if (status) *status = response.status;
     if (response.status != 200) return {};
     const auto account = response.body.find("\"account\"");
     if (account == std::string::npos) return {};
@@ -2225,17 +2254,35 @@ DWORD credentialSlot(std::wstring_view credentialId, std::wstring_view id) {
     return static_cast<DWORD>(std::wcstoul(std::wstring(credentialId.substr(marker + 9)).c_str(), nullptr, 10));
 }
 
+// The other saved slot already recorded as this account, if any.
+std::optional<DWORD> otherSlotWithIdentity(std::wstring_view id, DWORD slot, std::string_view identity) {
+    if (identity.empty()) return std::nullopt;
+    const DWORD count = std::min<DWORD>(readDword((L"Provider." + std::wstring(id) + L".AccountCount").c_str(), 1), 100);
+    for (DWORD other = 0; other < count; ++other) {
+        if (other != slot && utf8(readString(slotIdentitySetting(id, other).c_str())) == identity) return other;
+    }
+    return std::nullopt;
+}
+
 bool cliLoginMatchesSlot(std::wstring_view id, DWORD slot, const AuthMaterial& candidate) {
     const std::string identity = credentialIdentity(id, candidate);
-    bool ownedByOther = false;
-    if (!identity.empty()) {
-        const DWORD count = std::min<DWORD>(readDword((L"Provider." + std::wstring(id) + L".AccountCount").c_str(), 1), 100);
-        for (DWORD other = 0; other < count && !ownedByOther; ++other) {
-            ownedByOther = other != slot && utf8(readString(slotIdentitySetting(id, other).c_str())) == identity;
-        }
-    }
     return cliLoginMayRecoverSlot(utf8(readString(slotIdentitySetting(id, slot).c_str())), identity,
-                                  managedAccounts(id), slot == activeAccount(id), ownedByOther);
+                                  managedAccounts(id), slot == activeAccount(id), otherSlotWithIdentity(id, slot, identity).has_value());
+}
+
+// An explicit sign-in decides which account the selected slot holds. If that is a different account, its recorded
+// identity and earlier-token fingerprints describe someone else and would let the two accounts overwrite each other.
+void bindSelectedSlotToLogin(std::wstring_view id, const AuthMaterial& auth) {
+    const DWORD slot = activeAccount(id);
+    const std::string identity = credentialIdentity(id, auth);
+    const std::string recorded = utf8(readString(slotIdentitySetting(id, slot).c_str()));
+    if (identity.empty() || identity == recorded) return;
+    writeString(slotIdentitySetting(id, slot).c_str(), wide(identity));
+    deleteSetting(slotOrganizationSetting(id, slot).c_str());
+    if (recorded.empty()) return;
+    std::string packed = packAuthJson(auth);
+    CredentialStore::saveUtf8(id, packed);
+    SecureZeroMemory(packed.data(), packed.size());
 }
 
 // Every CLI login on this PC (Windows and synced WSL homes) whose access token is still valid, newest first.
@@ -2284,15 +2331,34 @@ bool adoptNewerCliToken(std::wstring_view id, AuthMaterial& auth) {
     return usable;
 }
 
+// Changes whenever a CLI on this PC signs in or refreshes, so a new login does not wait out a provider's backoff.
+std::string cliLoginsFingerprint(std::wstring_view id) {
+    const auto format = cliFormatForProvider(utf8(id));
+    if (!format) return {};
+    std::string fingerprints;
+    for (const auto& path : allCliReadPaths(id)) {
+        auto body = readUtf8File(path);
+        if (!body) continue;
+        auto record = parseCliTokenRecord(*format, *body);
+        SecureZeroMemory(body->data(), body->size());
+        fingerprints += tokenFingerprint(record.refreshToken) + ",";
+        SecureZeroMemory(record.accessToken.data(), record.accessToken.size());
+        SecureZeroMemory(record.refreshToken.data(), record.refreshToken.size());
+    }
+    return fingerprints;
+}
+
 // Keeps a selected account's CLI files on that account's current token. Selection gives every CLI home the same
 // credential, so the first holder to refresh it leaves the others with a consumed refresh token and a forced
 // sign-in. A newer login a CLI made for this same account is adopted first; then every file still holding one of
 // the account's earlier tokens is rewritten. Any other login in a CLI file is the CLI's own and is left alone.
-void syncSelectedAccountToCli(std::wstring_view credentialId, std::wstring_view id, DWORD slot, AuthMaterial& auth) {
-    if (!managedAccounts(id) || !backgroundSyncAllowed(id)) return;
-    if (!readDword((accountSettingFor(id, slot) + L".SelectionSync").c_str(), 0)) return;
+// tokenWorked is false when usage is rate limited; the token must then match the slot's identity before it is written
+// out, while adoption proves each login itself. Returns whether a CLI login was adopted.
+bool syncSelectedAccountToCli(std::wstring_view credentialId, std::wstring_view id, DWORD slot, AuthMaterial& auth, bool tokenWorked) {
+    if (!managedAccounts(id) || !backgroundSyncAllowed(id)) return false;
+    if (!readDword((accountSettingFor(id, slot) + L".SelectionSync").c_str(), 0)) return false;
     const auto format = cliFormatForProvider(utf8(id));
-    if (!format || auth.token.empty() || auth.refreshToken.empty()) return;
+    if (!format || auth.token.empty() || auth.refreshToken.empty()) return false;
     struct Target {
         std::wstring path;
         std::string body;
@@ -2314,6 +2380,7 @@ void syncSelectedAccountToCli(std::wstring_view credentialId, std::wstring_view 
     // Only an unexpired access token is adopted, and only for a slot whose account is known, so this never rotates a
     // CLI's refresh token and never lets another account's login replace the selected one.
     const std::string identity = utf8(readString(slotIdentitySetting(id, slot).c_str()));
+    bool adopted = false;
     for (const auto& target : targets) {
         if (identity.empty() || actionFor(target) != CliTargetAction::AdoptIfSameAccount) continue;
         AuthMaterial login = authFromRecord(target.record);
@@ -2321,12 +2388,15 @@ void syncSelectedAccountToCli(std::wstring_view credentialId, std::wstring_view 
             && saveAuth(credentialId, login)) {
             auth = login;
             earlier = storedTokenChain(credentialId).earlier;
+            adopted = true;
         }
         SecureZeroMemory(login.token.data(), login.token.size());
         SecureZeroMemory(login.refreshToken.data(), login.refreshToken.size());
     }
+    const bool writable = tokenWorked || adopted
+        || (!identity.empty() && !accessTokenNeedsRefresh(auth) && credentialIdentity(id, auth) == identity);
     for (auto& target : targets) {
-        if (actionFor(target) == CliTargetAction::Write) {
+        if (writable && actionFor(target) == CliTargetAction::Write) {
             auto merged = mergeCliCredentialJson(*format, target.body, recordFromAuth(auth));
             writeUtf8FileAtomic(target.path, merged);
             SecureZeroMemory(merged.data(), merged.size());
@@ -2335,6 +2405,7 @@ void syncSelectedAccountToCli(std::wstring_view credentialId, std::wstring_view 
         SecureZeroMemory(target.record.accessToken.data(), target.record.accessToken.size());
         SecureZeroMemory(target.record.refreshToken.data(), target.record.refreshToken.size());
     }
+    return adopted;
 }
 
 struct CodexDailyFetch {
@@ -2422,13 +2493,17 @@ void queryProviderUsage(std::wstring_view id, const AuthMaterial& auth, Provider
     } else if (id == L"xai") {
         auto billing = httpsGet(L"cli-chat-proxy.grok.com", L"/v1/billing?format=credits", auth.token,
                                 L"X-XAI-Token-Auth: xai-grok-cli\r\nAccept: application/json\r\n");
-        gotData = mergeHttpUsage(snapshot, billing, parseGrokBilling(billing.body), now, threshold, barFull, lastStatus, lastError, authenticationRejected);
+        // One endpoint refusing the credential does not reject it while the other returned data (see Kimi above).
+        bool billingRejected = false;
+        bool prepaidRejected = false;
+        gotData = mergeHttpUsage(snapshot, billing, parseGrokBilling(billing.body), now, threshold, barFull, lastStatus, lastError, billingRejected);
         const std::wstring team = wide(auth.teamId.empty() ? "default" : auth.teamId);
         auto prepaid = httpsGet(L"management-api.x.ai", L"/v1/billing/teams/" + team + L"/prepaid/balance", auth.token);
         if (mergeHttpUsage(snapshot, prepaid, parseXaiPrepaidBalance(prepaid.body) ? ProviderUsage{std::nullopt, std::nullopt, parseXaiPrepaidBalance(prepaid.body)} : std::optional<ProviderUsage>{},
-                           now, threshold, barFull, lastStatus, lastError, authenticationRejected)) {
+                           now, threshold, barFull, lastStatus, lastError, prepaidRejected)) {
             gotData = true;
         }
+        authenticationRejected = !gotData && (billingRejected || prepaidRejected);
     } else if (id == L"antigravity") {
         const std::string body = R"({"metadata":{"ideType":"ANTIGRAVITY","platform":"PLATFORM_UNSPECIFIED","pluginType":"GEMINI"}})";
         const std::wstring headers = L"User-Agent: antigravity/1.107.0\r\nContent-Type: application/json\r\n";
@@ -2439,14 +2514,18 @@ void queryProviderUsage(std::wstring_view id, const AuthMaterial& auth, Provider
             auto prod = httpsRequest({host, L"/v1internal:loadCodeAssist", L"POST", auth.token, headers, body});
             if (prod.status == 200) assist = std::move(prod);
         }
-        gotData = mergeHttpUsage(snapshot, assist, parseAntigravityAssist(assist.body), now, threshold, barFull, lastStatus, lastError, authenticationRejected);
+        bool assistRejected = false;
+        bool modelsRejected = false;
+        gotData = mergeHttpUsage(snapshot, assist, parseAntigravityAssist(assist.body), now, threshold, barFull, lastStatus, lastError, assistRejected);
         std::string project = jsonString(assist.body, "cloudaicompanionProject").value_or({});
         if (!project.empty()) {
             const std::string modelsBody = std::format("{{\"project\":\"{}\"}}", jsonEscape(project));
             auto models = httpsRequest({host, L"/v1internal:fetchAvailableModels", L"POST", auth.token, headers, modelsBody});
-            if (mergeHttpUsage(snapshot, models, parseAntigravityModels(models.body), now, threshold, barFull, lastStatus, lastError, authenticationRejected)) gotData = true;
+            if (mergeHttpUsage(snapshot, models, parseAntigravityModels(models.body), now, threshold, barFull, lastStatus, lastError, modelsRejected)) gotData = true;
         }
+        authenticationRejected = !gotData && (assistRejected || modelsRejected);
     }
+    settleRateLimit(snapshot, gotData, now);
 }
 
 // Checks a login against the usage endpoint before it is adopted. An expired or rejected access token is refreshed
@@ -2468,15 +2547,18 @@ bool loginAccepted(std::wstring_view id, const ProviderSnapshot& shape, AuthMate
     return !rejected;
 }
 
+// usageRateLimited still maintains the credential (refresh, CLI adoption and sync) but does not ask for usage.
 void fetchProviderUsage(std::wstring_view credentialId, AuthMaterial& auth, ProviderSnapshot& snapshot,
-                        TimePoint now, std::optional<double> threshold, double barFull) {
+                        TimePoint now, std::optional<double> threshold, double barFull, bool usageRateLimited = false) {
     const auto slotMarker = credentialId.find(L"/account-");
     const std::wstring providerStorage = slotMarker == std::wstring_view::npos
         ? std::wstring(credentialId) : std::wstring(credentialId.substr(0, slotMarker));
     const std::wstring_view id = providerStorage;
     bool refreshed = false;
+    bool adoptedLogin = false;
     if (accessTokenNeedsRefresh(auth) && slotMarker == std::wstring_view::npos && adoptNewerCliToken(id, auth)) {
         // The CLI already holds a fresh token; no refresh needed.
+        adoptedLogin = true;
     } else if (accessTokenNeedsRefresh(auth)) {
         refreshed = refreshOAuth(credentialId, auth);
     }
@@ -2484,7 +2566,20 @@ void fetchProviderUsage(std::wstring_view credentialId, AuthMaterial& auth, Prov
     std::string lastError;
     bool gotData = false;
     bool authenticationRejected = false;
-    queryProviderUsage(id, auth, snapshot, now, threshold, barFull, lastStatus, lastError, gotData, authenticationRejected);
+    // An expired token whose refresh token was rejected needs a sign-in. Usage can't show that: its endpoint may
+    // answer 429 before it looks at the token.
+    if (!refreshed && accessTokenNeedsRefresh(auth) && refreshTokenRejected(credentialId, auth)) {
+        authenticationRejected = true;
+    } else if (!usageRateLimited || adoptedLogin) {
+        queryProviderUsage(id, auth, snapshot, now, threshold, barFull, lastStatus, lastError, gotData, authenticationRejected);
+    }
+    // While usage answers 429 a revoked Claude token looks merely stale. The profile endpoint still tells them apart;
+    // only 401 counts, since a token without the profile scope gets 403 and still works.
+    if (id == L"anthropic" && !authenticationRejected && !gotData && (usageRateLimited || lastStatus == 429)) {
+        DWORD profileStatus = 0;
+        claudeProfile(auth, &profileStatus);
+        authenticationRejected = profileStatus == 401;
+    }
     if (authenticationRejected && !refreshed && slotMarker == std::wstring_view::npos && adoptNewerCliToken(id, auth)) {
         for (auto& metric : snapshot.metrics) {
             if (metricFetchable(id, metric.kind) && metric.state != MetricState::Current) metric.state = MetricState::Refreshing;
@@ -2538,10 +2633,21 @@ void fetchProviderUsage(std::wstring_view credentialId, AuthMaterial& auth, Prov
             SecureZeroMemory(login.refreshToken.data(), login.refreshToken.size());
         }
     }
-    if (gotData && !authenticationRejected) {
-        rememberSlotIdentity(id, slot, auth);
-        // The token just worked, so it is safe to hand to the selected account's other CLI homes.
-        if (slotMarker == std::wstring_view::npos) syncSelectedAccountToCli(credentialId, id, slot, auth);
+    if (gotData && !authenticationRejected) rememberSlotIdentity(id, slot, auth);
+    // A rate limit on usage says nothing about the login, so it must not hold up passing a new login on to other homes.
+    if (slotMarker == std::wstring_view::npos && !authenticationRejected && (gotData || usageRateLimited || lastStatus == 429)
+        && syncSelectedAccountToCli(credentialId, id, slot, auth, gotData) && !gotData) {
+        // A new login gets one usage read of its own, so its numbers appear as soon as the provider allows.
+        queryProviderUsage(id, auth, snapshot, now, threshold, barFull, lastStatus, lastError, gotData, authenticationRejected);
+    }
+    if (usageRateLimited) {
+        // No read marked these as refreshing, so settle them here. A login that recovered stops being orange.
+        if (lastStatus == 0) lastStatus = 429;
+        for (auto& metric : snapshot.metrics) {
+            if (metricFetchable(id, metric.kind) && (authenticationRejected || metric.state == MetricState::AuthenticationRequired)) {
+                metric.state = MetricState::Refreshing;
+            }
+        }
     }
     finishRefresh(snapshot, gotData, authenticationRejected, lastStatus, lastError);
 }
@@ -2579,18 +2685,22 @@ COLORREF remainingColor(double remaining, double activity = 0.0) {
     return RGB(color.red, color.green, color.blue);
 }
 
-std::wstring tooltipText(const Provider& provider, const Metric& metric, DWORD slot) {
+std::wstring tooltipText(const Provider& provider, const ProviderSnapshot& snapshot, const Metric& metric, DWORD slot) {
     std::wstring text = provider.definition.name + L" — Account " + std::to_wstring(slot + 1) + L" — " + kindName(metric.kind) + L"\r\n";
     if (metric.used && metric.capacity) {
         text += std::format(L"{:.0f} / {:.0f} {} used\r\n", *metric.used, *metric.capacity, wide(metric.unit));
     }
-    if (const auto fraction = metric.remainingFraction()) {
+    if (metric.kind == MetricKind::ApiCredit && metric.remaining) {
+        text += std::format(L"{}{:.2f} remaining\r\n", wide(metric.currency), *metric.remaining);
+    } else if (const auto fraction = metric.remainingFraction()) {
         text += std::format(L"{:.0f}% remaining\r\n", *fraction * 100.0);
     } else if (metric.remaining) {
         text += std::format(L"{}{:.2f} remaining\r\n", wide(metric.currency), *metric.remaining);
     }
-    if (metric.resetAt) text += L"Resets: " + formatTime(metric.resetAt) + L"\r\n";
-    if (provider.snapshot.lastSuccessfulRefresh) text += L"Last refreshed: " + formatTime(provider.snapshot.lastSuccessfulRefresh) + L"\r\n";
+    if (metric.resetAt) {
+        text += (*metric.resetAt <= std::chrono::system_clock::now() ? L"Reset passed: " : L"Resets: ") + formatTime(metric.resetAt) + L"\r\n";
+    }
+    if (snapshot.lastSuccessfulRefresh) text += L"Last refreshed: " + formatTime(snapshot.lastSuccessfulRefresh) + L"\r\n";
     text += L"Status: " + stateName(metric.state);
     if (!metric.diagnostic.empty()) text += L"\r\n" + wide(metric.diagnostic);
     if (metric.state == MetricState::AuthenticationRequired) text += L"\r\nClick to reconnect.";
@@ -2643,6 +2753,7 @@ private:
     void addAccount();
     void showAccountMenu(std::size_t index, POINT screen);
     bool selectAccount(std::size_t index, DWORD slot, bool interactive = true);
+    void clearSelectedRateLimit(Provider& provider);
     bool rotateAccounts();
     void reloadCliConnections();
     bool attemptAutoReauth(std::size_t index);
@@ -2835,6 +2946,18 @@ std::vector<DWORD> listAccountSlots(std::wstring_view id) {
     return slots;
 }
 
+// Only credit has a currency; a plan window's unit is saved with it ("%", "requests", "credits").
+void restoreMetricUnit(Metric& metric, const std::wstring& prefix) {
+    if (metric.kind == MetricKind::ApiCredit) {
+        metric.currency = readDword((prefix + L".Currency").c_str(), 1) == 2 ? "CNY " : "$";
+        metric.unit = metric.currency;
+        return;
+    }
+    metric.currency.clear();
+    const auto unit = utf8(readString((prefix + L".Unit").c_str()));
+    metric.unit = unit.empty() ? "%" : unit;
+}
+
 void restoreAccountSnapshot(ProviderSnapshot& snapshot, std::wstring_view id, DWORD slot) {
     const std::wstring base = accountSettingFor(id, slot);
     bool restored = false;
@@ -2855,8 +2978,7 @@ void restoreAccountSnapshot(ProviderSnapshot& snapshot, std::wstring_view id, DW
         if (const auto drawdown = readQword((prefix + L".DrawdownUnix").c_str())) {
             metric.lastDrawdownAt = TimePoint{std::chrono::seconds{*drawdown}};
         }
-        metric.currency = readDword((prefix + L".Currency").c_str(), 1) == 2 ? "CNY " : "$";
-        metric.unit = metric.kind == MetricKind::ApiCredit ? metric.currency : "%";
+        restoreMetricUnit(metric, prefix);
         metric.diagnostic = "Showing the last successful value while a refresh is pending.";
         restored = true;
     }
@@ -2878,6 +3000,11 @@ void App::seedMonitorAccounts(Provider& provider) {
             row.snapshot = provider.snapshot;
         } else {
             row.snapshot = provider.snapshot;
+            // A rate limit belongs to one account and stays on it across a reseed.
+            const auto previous = std::ranges::find_if(provider.monitorAccounts, [slot](const MonitorAccount& known) { return known.slot == slot; });
+            const bool known = previous != provider.monitorAccounts.end();
+            row.snapshot.rateLimitedUntil = known ? previous->snapshot.rateLimitedUntil : std::nullopt;
+            row.snapshot.rateLimitStreak = known ? previous->snapshot.rateLimitStreak : 0U;
             row.snapshot.id = utf8(accountKey(provider.definition.id, slot));
             for (std::size_t i = 0; i < row.snapshot.metrics.size() && i < provider.definition.capabilities.size(); ++i) {
                 row.snapshot.metrics[i] = initialMetric(provider.definition.id, provider.definition.capabilities[i]);
@@ -2897,7 +3024,13 @@ std::vector<MonitorAccount> monitorRowsFor(const Provider& provider) {
 std::wstring monitorRowLabel(const Provider& provider, const MonitorAccount& account, const ProviderSnapshot& snapshot) {
     std::wstring label = provider.definition.name;
     if (provider.monitorAccounts.size() > 1) label += L" " + std::to_wstring(account.slot + 1);
-    if (providerAuthenticationFailed(snapshot)) label += L"  ·  Sign in";
+    if (providerAuthenticationFailed(snapshot)) {
+        label += L"  ·  Sign in";
+    } else if (std::ranges::any_of(snapshot.metrics, [](const Metric& metric) {
+                   return metric.visibleOnMonitor() && (metric.state == MetricState::Stale || metric.state == MetricState::Error);
+               })) {
+        label += L"  ·  Stale";
+    }
     return label;
 }
 
@@ -2957,8 +3090,7 @@ void App::createProviders() {
                 if (const auto drawdown = readQword((prefix + L".DrawdownUnix").c_str())) {
                     metric.lastDrawdownAt = TimePoint{std::chrono::seconds{*drawdown}};
                 }
-                metric.currency = readDword((prefix + L".Currency").c_str(), 1) == 2 ? "CNY " : "$";
-                metric.unit = metric.kind == MetricKind::ApiCredit ? metric.currency : "%";
+                restoreMetricUnit(metric, prefix);
                 if (metric.kind == MetricKind::ApiCredit) {
                     metric.lowBalanceThreshold = readDword((L"Provider." + provider.definition.id + L".ThresholdCents").c_str(), 1000) / 100.0;
                     metric.barFullAmount = readDword((L"Provider." + provider.definition.id + L".CreditBarFullCents").c_str(), 10000) / 100.0;
@@ -3148,13 +3280,14 @@ void App::createOptionsControls() {
 }
 
 void App::discoverAndBuildWslControls(bool forceDiscover) {
-    if (forceDiscover || wslTokenSyncEnabled()) cachedWslHomes = discoverWslHomes();
+    if (forceDiscover || wslTokenSyncEnabled()) setCachedWslHomes(discoverWslHomes());
+    const auto homes = cachedWslHomes();
     for (HWND hwnd : wslUserChecks_) {
         if (hwnd) DestroyWindow(hwnd);
     }
     wslUserChecks_.clear();
-    for (std::size_t i = 0; i < cachedWslHomes.size(); ++i) {
-        const auto& home = cachedWslHomes[i];
+    for (std::size_t i = 0; i < homes->size(); ++i) {
+        const auto& home = (*homes)[i];
         const std::wstring label = L"Sync " + home.user + L" on " + home.distro;
         HWND check = CreateWindowExW(0, L"BUTTON", label.c_str(),
             WS_CHILD | BS_AUTOCHECKBOX | WS_TABSTOP, 0, 0, 10, 10, optionsWindow_,
@@ -3327,11 +3460,16 @@ void App::updateOptions() {
     SetWindowTextW(status_, text.c_str());
     Button_SetCheck(enabled_, provider.snapshot.enabled ? BST_CHECKED : BST_UNCHECKED);
     const std::wstring thresholdName = L"Provider." + provider.definition.id + L".ThresholdCents";
-    SetWindowTextW(threshold_, std::format(L"{}.{:02}", readDword(thresholdName.c_str(), 1000) / 100,
-                                           readDword(thresholdName.c_str(), 1000) % 100).c_str());
+    // A poll can land mid-edit; leave the text being typed alone.
+    if (GetFocus() != threshold_) {
+        SetWindowTextW(threshold_, std::format(L"{}.{:02}", readDword(thresholdName.c_str(), 1000) / 100,
+                                               readDword(thresholdName.c_str(), 1000) % 100).c_str());
+    }
     const std::wstring barFullName = L"Provider." + provider.definition.id + L".CreditBarFullCents";
-    SetWindowTextW(creditBarFull_, std::format(L"{}.{:02}", readDword(barFullName.c_str(), 10000) / 100,
-                                               readDword(barFullName.c_str(), 10000) % 100).c_str());
+    if (GetFocus() != creditBarFull_) {
+        SetWindowTextW(creditBarFull_, std::format(L"{}.{:02}", readDword(barFullName.c_str(), 10000) / 100,
+                                                   readDword(barFullName.c_str(), 10000) % 100).c_str());
+    }
     const bool hasCredit = std::ranges::any_of(provider.definition.capabilities,
                                                [](MetricKind kind) { return kind == MetricKind::ApiCredit; });
     ShowWindow(threshold_, hasCredit ? SW_SHOW : SW_HIDE);
@@ -3660,7 +3798,7 @@ void App::activateTooltip(POINT clientPoint) {
         return;
     }
     const auto& hitSnapshot = hitSnapshotFor(*found);
-    activeTooltip_ = tooltipText(providers_[found->provider], hitSnapshot.metrics[std::min(found->metric, hitSnapshot.metrics.size() - 1)], found->slot);
+    activeTooltip_ = tooltipText(providers_[found->provider], hitSnapshot, hitSnapshot.metrics[std::min(found->metric, hitSnapshot.metrics.size() - 1)], found->slot);
     TOOLINFOW info{sizeof(info)};
     info.hwnd = floatingWindow_;
     info.uId = 1;
@@ -3684,6 +3822,7 @@ struct RefreshResult {
     bool importedDaily{false};
     std::vector<DailyTokens> importedDays;
     CivilDay importedFrom{};
+    bool usageRateLimited{false};
 };
 
 struct SessionScanResult {
@@ -3691,6 +3830,7 @@ struct SessionScanResult {
     std::vector<LocalSessionImport> imports;
     std::vector<OrganizationAccountLink> claudeLinks;
     std::vector<SavedAccountSlot> claudeSlots;
+    std::vector<DuplicateSessionTokens> duplicates;
 };
 
 std::filesystem::path sessionLogCacheFile() {
@@ -3707,7 +3847,8 @@ void App::startSessionLogScan() {
     const auto profile = userProfile();
     if (!profile.empty()) homes.emplace_back(profile);
     if (wslTokenSyncEnabled()) {
-        for (const auto& home : cachedWslHomes) {
+        const auto wslHomes = cachedWslHomes();
+        for (const auto& home : *wslHomes) {
             if (wslHomeSyncEnabled(home) && !home.home.empty()) homes.emplace_back(home.home);
         }
     }
@@ -3729,6 +3870,18 @@ void App::startSessionLogScan() {
             if (!file.empty()) sessionLogCache_ = loadSessionLogCache(file);
             sessionLogCacheLoaded_ = true;
         }
+        // The request ledger is large and only matters during a scan, so it stays on disk in between. Without a
+        // usable ledger every log still on disk is read again to rebuild it.
+        auto requestsFile = sessionLogCacheFile();
+        if (!requestsFile.empty()) requestsFile.replace_filename(L"session-log-requests.bin");
+        // An empty ledger beside Claude totals it should describe is as unusable as a missing one.
+        const bool usableRequests = !requestsFile.empty() && loadSessionRequests(sessionLogCache_, requestsFile)
+            && (!sessionLogCache_.requests.empty() || std::ranges::none_of(sessionLogCache_.entries, [](const SessionLogCacheEntry& entry) {
+                    return entry.providerId == "anthropic" && entry.requestsRecorded && !entry.days.empty();
+                }));
+        if (!usableRequests) {
+            for (auto& entry : sessionLogCache_.entries) entry.requestsRecorded = false;
+        }
         bool anyHome = false;
         bool changed = false;
         std::vector<OrganizationAccountLink> claudeLinks = savedLinks;
@@ -3745,11 +3898,14 @@ void App::startSessionLogScan() {
             if (changed) {
                 const auto file = sessionLogCacheFile();
                 if (!file.empty()) storeSessionLogCache(sessionLogCache_, file);
+                if (!requestsFile.empty()) storeSessionRequests(sessionLogCache_, requestsFile);
             }
             result->imports = sessionLogImports(sessionLogCache_);
+            result->duplicates = std::move(sessionLogCache_.duplicates);
             result->claudeLinks = std::move(claudeLinks);
             result->claudeSlots = claudeSlots;
         }
+        sessionLogCache_.requests = {};
         if (!PostMessageW(trayWindow_, kSessionLogMessage, 0, reinterpret_cast<LPARAM>(result))) delete result;
         sessionScanRunning_ = false;
     });
@@ -3765,6 +3921,17 @@ bool App::refresh(bool queueIfBusy, bool scheduled) {
         return true;
     }
     const ULONGLONG nowTick = GetTickCount64();
+    // A CLI sign-in or refresh is worth acting on now, even for a provider that is backing off.
+    for (auto& provider : providers_) {
+        const auto& id = provider.definition.id;
+        if (!provider.snapshot.enabled || !backgroundSyncAllowed(id)) continue;
+        auto logins = cliLoginsFingerprint(id);
+        if (provider.cliLoginsSeen && *provider.cliLoginsSeen != logins) {
+            provider.nextPollTick = 0;
+            provider.failureStreak = 0;
+        }
+        provider.cliLoginsSeen = std::move(logins);
+    }
     // A scheduled poll skips providers that are still backing off; every other trigger refreshes everything.
     for (auto& provider : providers_) provider.polling = provider.snapshot.enabled && (!scheduled || provider.nextPollTick <= nowTick);
     if (scheduled && std::ranges::none_of(providers_, &Provider::polling)) {
@@ -3800,9 +3967,14 @@ bool App::refresh(bool queueIfBusy, bool scheduled) {
         const DWORD threshold = readDword((prefix + L".ThresholdCents").c_str(), 1000);
         const DWORD barFull = readDword((prefix + L".CreditBarFullCents").c_str(), 10000);
         for (auto& account : provider.monitorAccounts) {
-            if (providerRateLimited(account.snapshot, nowTime)) continue;
             const bool isActive = account.slot == active;
+            // The selected account's credential and CLI files are still looked after while its usage is rate limited.
+            bool usageLimited = providerRateLimited(account.snapshot, nowTime);
+            if (usageLimited && !isActive) continue;
+            const std::string storedLogin = usageLimited ? storedTokenChain(provider.definition.id).current : std::string{};
             AuthMaterial auth = isActive ? loadAuth(provider.definition.id) : loadStoredAuth(accountKey(provider.definition.id, account.slot));
+            // loadAuth adopted a newer CLI login, which gets one usage read of its own.
+            if (usageLimited && tokenFingerprint(auth.refreshToken) != storedLogin) usageLimited = false;
             if (auth.token.empty()) {
                 for (auto& metric : account.snapshot.metrics) {
                     if (metricFetchable(provider.definition.id, metric.kind)) {
@@ -3812,13 +3984,16 @@ bool App::refresh(bool queueIfBusy, bool scheduled) {
                 if (isActive) provider.snapshot = account.snapshot;
                 continue;
             }
-            for (auto& metric : account.snapshot.metrics) {
-                if (metricFetchable(provider.definition.id, metric.kind)) metric.state = MetricState::Refreshing;
+            if (!usageLimited) {
+                for (auto& metric : account.snapshot.metrics) {
+                    if (metricFetchable(provider.definition.id, metric.kind)) metric.state = MetricState::Refreshing;
+                }
             }
             if (isActive) provider.snapshot = account.snapshot;
             requests.push_back({index, account.slot, isActive,
                 isActive ? provider.definition.id : accountKey(provider.definition.id, account.slot),
                 std::move(auth), threshold, barFull, account.snapshot});
+            requests.back().usageRateLimited = usageLimited;
         }
     }
     refreshThread_ = std::jthread([this, requests = std::move(requests)]() mutable {
@@ -3826,7 +4001,7 @@ bool App::refresh(bool queueIfBusy, bool scheduled) {
         const auto now = std::chrono::system_clock::now();
         for (auto& request : requests) {
             fetchProviderUsage(request.credentialId, request.auth, request.snapshot, now, request.thresholdCents / 100.0,
-                               request.barFullCents / 100.0);
+                               request.barFullCents / 100.0, request.usageRateLimited);
             const bool openai = request.credentialId == L"openai" || request.credentialId.rfind(L"openai/account-", 0) == 0;
             const bool usageReady = std::ranges::any_of(request.snapshot.metrics, [](const Metric& metric) {
                 return metric.state == MetricState::Current;
@@ -4008,13 +4183,18 @@ bool applyAccountToCli(std::wstring_view id, const AuthMaterial& auth) {
     std::vector<std::optional<std::string>> backups;
     for (const auto& path : paths) {
         auto body = readUtf8File(path);
-        if (!body && GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES) return false;
+        if (!body && GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES) {
+            for (auto& backup : backups) if (backup) SecureZeroMemory(backup->data(), backup->size());
+            return false;
+        }
         backups.push_back(std::move(body));
     }
     bool ok = true;
     for (std::size_t i = 0; i < paths.size(); ++i) {
-        const auto merged = mergeCliCredentialJson(*format, backups[i].value_or(""), recordFromAuth(auth));
-        if (writeUtf8FileAtomic(paths[i], merged)) continue;
+        auto merged = mergeCliCredentialJson(*format, backups[i].value_or(""), recordFromAuth(auth));
+        const bool written = writeUtf8FileAtomic(paths[i], merged);
+        SecureZeroMemory(merged.data(), merged.size());
+        if (written) continue;
         ok = false;
         for (std::size_t j = 0; j < i; ++j) {
             if (backups[j]) writeUtf8FileAtomic(paths[j], *backups[j]);
@@ -4054,6 +4234,8 @@ bool App::selectAccount(std::size_t index, DWORD slot, bool interactive) {
         provider.snapshot.enabled = enabled;
     } else {
         provider.snapshot.lastSuccessfulRefresh.reset();
+        provider.snapshot.rateLimitedUntil.reset();
+        provider.snapshot.rateLimitStreak = 0;
         for (auto& metric : provider.snapshot.metrics) metric = initialMetric(id, metric.kind);
     }
     provider.snapshot.id = utf8(slot ? accountKey(id, slot) : id);
@@ -4170,7 +4352,10 @@ void App::connectProvider() {
     } guard{signInInProgress_};
     persistGoogleClientSecretField();
     auto& provider = providers_[selectedProvider_];
-    const bool cliReady = !loadCliAuth(provider.definition.id).token.empty();
+    AuthMaterial cliProbe = loadCliAuth(provider.definition.id);
+    const bool cliReady = !cliProbe.token.empty();
+    SecureZeroMemory(cliProbe.token.data(), cliProbe.token.size());
+    SecureZeroMemory(cliProbe.refreshToken.data(), cliProbe.refreshToken.size());
     const bool canOAuth = providerHasSubscriptionOAuth(provider.definition.id);
     HWND parent = dialogParent();
 
@@ -4213,7 +4398,24 @@ void App::connectProvider() {
     if (chosen == kUseCli) {
         AuthMaterial cli = loadCliAuth(provider.definition.id);
         const bool accepted = loginAccepted(provider.definition.id, provider.snapshot, cli);
+        // Two slots sharing one login strand each other: whichever refreshes first consumes the other's refresh token.
+        if (accepted) {
+            const auto owner = otherSlotWithIdentity(provider.definition.id, activeAccount(provider.definition.id),
+                                                     credentialIdentity(provider.definition.id, cli));
+            if (owner) {
+                SecureZeroMemory(cli.token.data(), cli.token.size());
+                SecureZeroMemory(cli.refreshToken.data(), cli.refreshToken.size());
+                MessageBoxW(parent, (L"The " + provider.definition.name + L" CLI login on this PC is already saved as Account "
+                    + std::to_wstring(*owner + 1) + L". Select that account instead, or sign in to a different account in the CLI first.").c_str(),
+                    kAppName, MB_ICONWARNING);
+                return;
+            }
+        }
         const bool saved = accepted && saveAuth(provider.definition.id, cli);
+        if (saved) {
+            bindSelectedSlotToLogin(provider.definition.id, cli);
+            clearSelectedRateLimit(provider);
+        }
         SecureZeroMemory(cli.token.data(), cli.token.size());
         SecureZeroMemory(cli.refreshToken.data(), cli.refreshToken.size());
         if (!accepted) {
@@ -4250,6 +4452,8 @@ void App::connectProvider() {
             MessageBoxW(parent, L"Windows Credential Manager rejected the credential.", kAppName, MB_ICONERROR);
             return;
         }
+        bindSelectedSlotToLogin(provider.definition.id, auth);
+        clearSelectedRateLimit(provider);
         writeDword((accountSetting(provider.definition.id) + L".UseOfficialCli").c_str(), 1);
         provider.snapshot.enabled = true;
         writeDword((L"Provider." + provider.definition.id + L".Enabled").c_str(), 1);
@@ -4280,8 +4484,14 @@ void App::connectProvider() {
             writeDword((accountSetting(provider.definition.id) + L".UseOfficialCli").c_str(), 1);
             provider.snapshot.enabled = true;
             writeDword((L"Provider." + provider.definition.id + L".Enabled").c_str(), 1);
-            const auto pasted = parseAuthJson(utf8(secret));
+            auto pasted = parseAuthJson(utf8(secret));
             markOfficialLogin(provider.definition.id, !pasted.refreshToken.empty());
+            SecureZeroMemory(pasted.token.data(), pasted.token.size());
+            SecureZeroMemory(pasted.refreshToken.data(), pasted.refreshToken.size());
+            // A pasted credential may be any account, so the slot learns its identity again from the next good poll.
+            deleteSetting((accountSetting(provider.definition.id) + L".Identity").c_str());
+            deleteSetting((accountSetting(provider.definition.id) + L".Organization").c_str());
+            clearSelectedRateLimit(provider);
             if (selectedProvider_ < autoReauthTried_.size()) autoReauthTried_[selectedProvider_] = 0;
             provider.connected = true;
         }
@@ -4292,7 +4502,20 @@ void App::connectProvider() {
     }
 }
 
+// A new login is a new question for the provider, so the old login's rate limit does not block its first read.
+void App::clearSelectedRateLimit(Provider& provider) {
+    const DWORD active = activeAccount(provider.definition.id);
+    provider.snapshot.rateLimitedUntil.reset();
+    for (auto& account : provider.monitorAccounts) {
+        if (account.slot == active) account.snapshot.rateLimitedUntil.reset();
+    }
+}
+
 void App::updateAll() {
+    // The monitor draws these copies, so hiding or showing a provider must reach them.
+    for (auto& provider : providers_) {
+        for (auto& account : provider.monitorAccounts) account.snapshot.enabled = provider.snapshot.enabled;
+    }
     destroyMonitorBitmap();
     syncFloatingWindowSize();
     InvalidateRect(floatingWindow_, nullptr, FALSE);
@@ -4384,7 +4607,7 @@ void App::updateTrayIcon() {
     NOTIFYICONDATAW data{sizeof(data)};
     data.hWnd = trayWindow_;
     data.uID = 1;
-    data.uFlags = NIF_ICON | NIF_TIP;
+    data.uFlags = NIF_ICON | NIF_TIP | NIF_SHOWTIP;
     data.hIcon = newIcon;
     std::wstring signIn;
     for (const auto& provider : providers_) {
@@ -4397,8 +4620,9 @@ void App::updateTrayIcon() {
     if (aggregate.remainingFraction) {
         const auto found = std::find_if(providers_.begin(), providers_.end(), [&](const Provider& p) { return p.snapshot.id == aggregate.providerId; });
         if (found != providers_.end()) {
-            const std::wstring usage = std::format(L"{} — {:.0f}% {} remaining", found->definition.name,
+            std::wstring usage = std::format(L"{} — {:.0f}% {} remaining", found->definition.name,
                 *aggregate.remainingFraction * 100.0, kindName(aggregate.kind));
+            if (aggregate.resetAt) usage += L", resets " + formatTime(aggregate.resetAt);
             tooltip = signIn.empty() ? usage : tooltip + L" · " + usage;
         }
     }
@@ -4897,6 +5121,8 @@ void App::playTone(bool reset) {
     const int durationMs = reset ? 300 : 190;
     const int samples = sampleRate * durationMs / 1000;
     const DWORD dataBytes = samples * sizeof(short);
+    // SND_ASYNC keeps reading this buffer, so stop any sound still playing from it before it is replaced.
+    PlaySoundW(nullptr, nullptr, 0);
     soundBuffer_.assign(44 + dataBytes, 0);
     auto put16 = [&](std::size_t offset, WORD value) { memcpy(soundBuffer_.data() + offset, &value, sizeof(value)); };
     auto put32 = [&](std::size_t offset, DWORD value) { memcpy(soundBuffer_.data() + offset, &value, sizeof(value)); };
@@ -5154,8 +5380,12 @@ LRESULT App::onOptions(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
                 const std::wstring prefix = accountSetting(providers_[selectedProvider_].definition.id);
                 deleteSetting((prefix + L".SelectionSync").c_str());
                 deleteSetting((prefix + L".ExhaustedUntil").c_str());
+                deleteSetting((prefix + L".Identity").c_str());
+                deleteSetting((prefix + L".Organization").c_str());
+                clearSelectedRateLimit(providers_[selectedProvider_]);
+                providers_[selectedProvider_].snapshot.rateLimitStreak = 0;
                 for (const auto& metric : providers_[selectedProvider_].snapshot.metrics) {
-                    for (const auto* field : {L"UsedMicros", L"CapacityMicros", L"RemainingMicros", L"ObservedUnix", L"ResetUnix", L"Currency", L"DrawdownUnix"})
+                    for (const auto* field : {L"UsedMicros", L"CapacityMicros", L"RemainingMicros", L"ObservedUnix", L"ResetUnix", L"Currency", L"DrawdownUnix", L"Unit"})
                         deleteSetting((prefix + L"." + std::to_wstring(static_cast<int>(metric.kind)) + L"." + field).c_str());
                 }
                 deleteSetting((prefix + L".BalanceMicros").c_str());
@@ -5232,6 +5462,11 @@ LRESULT App::onOptions(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
                 for (auto& metric : providers_[selectedProvider_].snapshot.metrics) {
                     if (metric.kind == MetricKind::ApiCredit) metric.lowBalanceThreshold = dollars;
                 }
+                for (auto& account : providers_[selectedProvider_].monitorAccounts) {
+                    for (auto& metric : account.snapshot.metrics) {
+                        if (metric.kind == MetricKind::ApiCredit) metric.lowBalanceThreshold = dollars;
+                    }
+                }
             }
             return 0;
         case IdCreditBarFull:
@@ -5244,14 +5479,20 @@ LRESULT App::onOptions(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
                 for (auto& metric : providers_[selectedProvider_].snapshot.metrics) {
                     if (metric.kind == MetricKind::ApiCredit) metric.barFullAmount = dollars;
                 }
+                for (auto& account : providers_[selectedProvider_].monitorAccounts) {
+                    for (auto& metric : account.snapshot.metrics) {
+                        if (metric.kind == MetricKind::ApiCredit) metric.barFullAmount = dollars;
+                    }
+                }
                 updateAll();
             }
             return 0;
         default: {
             const int index = LOWORD(wParam) - IdWslUserFirst;
+            const auto wslHomes = cachedWslHomes();
             if (index >= 0 && static_cast<std::size_t>(index) < wslUserChecks_.size()
-                && static_cast<std::size_t>(index) < cachedWslHomes.size()) {
-                const auto& home = cachedWslHomes[static_cast<std::size_t>(index)];
+                && static_cast<std::size_t>(index) < wslHomes->size()) {
+                const auto& home = (*wslHomes)[static_cast<std::size_t>(index)];
                 writeDword(wide(wslUserSettingKey(utf8(home.distro), utf8(home.user))).c_str(),
                            Button_GetCheck(wslUserChecks_[static_cast<std::size_t>(index)]) == BST_CHECKED ? 1 : 0);
                 reloadCliConnections();
@@ -5309,9 +5550,9 @@ LRESULT App::onTray(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
             if (import.providerId == "anthropic") continue;
             others.push_back(LocalSessionImport{import.providerId, std::string(kLocalSessionAccount), import.days});
         }
-        if (replaceImportedDailyTokensKeepingTotals(activityHistory_, others)) historyChanged = true;
+        if (replaceImportedDailyTokensKeepingTotals(activityHistory_, others, std::nullopt, completed->duplicates)) historyChanged = true;
         const auto claude = assignClaudeSessionImports(completed->imports, completed->claudeLinks, completed->claudeSlots);
-        if (replaceImportedDailyTokensKeepingTotals(activityHistory_, claude)) historyChanged = true;
+        if (replaceImportedDailyTokensKeepingTotals(activityHistory_, claude, std::nullopt, completed->duplicates)) historyChanged = true;
         // New tokens in an account's local Claude logs are drawdown even when its usage endpoint gave no new numbers.
         const auto drawing = accountsWithNewLocalTokens(claudeLocalTotals_, claude);
         const auto anthropic = std::ranges::find_if(providers_, [](const Provider& p) { return p.definition.id == L"anthropic"; });
@@ -5352,8 +5593,14 @@ LRESULT App::onTray(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
             }
             if (row != provider.monitorAccounts.end()) row->snapshot = result.snapshot;
             for (const auto& metric : result.snapshot.metrics) {
-                if ((metric.state != MetricState::Current && metric.state != MetricState::Stale) || !metric.observedAt) continue;
                 const std::wstring prefix = accountSettingFor(provider.definition.id, result.slot) + L"." + std::to_wstring(static_cast<int>(metric.kind));
+                // The provider no longer reports this limit, so an old value must not come back after a restart.
+                if (metric.state == MetricState::Unsupported) {
+                    for (const auto* field : {L"UsedMicros", L"CapacityMicros", L"RemainingMicros", L"ObservedUnix", L"ResetUnix", L"Currency", L"DrawdownUnix", L"Unit"})
+                        deleteSetting((prefix + L"." + field).c_str());
+                    continue;
+                }
+                if ((metric.state != MetricState::Current && metric.state != MetricState::Stale) || !metric.observedAt) continue;
                 if (metric.used) writeQword((prefix + L".UsedMicros").c_str(), static_cast<ULONGLONG>(std::llround(*metric.used * 1000000.0)));
                 if (metric.capacity) writeQword((prefix + L".CapacityMicros").c_str(), static_cast<ULONGLONG>(std::llround(*metric.capacity * 1000000.0)));
                 if (metric.remaining) writeQword((prefix + L".RemainingMicros").c_str(), static_cast<ULONGLONG>(std::llround(*metric.remaining * 1000000.0)));
@@ -5363,7 +5610,10 @@ LRESULT App::onTray(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
                 }
                 if (metric.resetAt) {
                     writeQword((prefix + L".ResetUnix").c_str(), static_cast<ULONGLONG>(std::chrono::duration_cast<std::chrono::seconds>(metric.resetAt->time_since_epoch()).count()));
+                } else {
+                    deleteSetting((prefix + L".ResetUnix").c_str());
                 }
+                writeString((prefix + L".Unit").c_str(), wide(metric.unit));
                 writeDword((prefix + L".Currency").c_str(), metric.currency == "CNY " ? 2 : 1);
             }
         }

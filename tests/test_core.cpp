@@ -533,7 +533,7 @@ void testActivityHistory() {
               "the scan cache stores totals, not log text or secrets");
         const auto restored = parseSessionLogCache(saved);
         check(restored.entries.size() == cache.entries.size(), "a scan-cache round trip keeps every file");
-        check(saved.starts_with("HLSL2\n"), "the scan cache records which organization a file named");
+        check(saved.starts_with("HLSL3\n"), "the scan cache records which organization a file named");
         check(std::ranges::all_of(restored.entries, [](const SessionLogCacheEntry& entry) { return entry.accountId == "local"; }),
               "a log that names no organization stays unattributed in the scan cache");
         check(parseSessionLogCache("HLSL1\nE anthropic 1 1 1\n/tmp/a\n").entries.empty(), "a truncated scan cache is empty");
@@ -747,14 +747,89 @@ void testActivityHistory() {
                   return entry.accountId.empty() && entry.days.size() == 1 && std::abs(entry.days.front().tokens - 1.0) < 0.001;
               }),
               "an older scan cache keeps its totals and has no organization yet");
-        check(refreshSessionLogCache(loaded, home) == SessionLogScan::Updated, "an older cache is scanned for organizations");
-        check(accountForPath(loaded, std::string(kSessionA) + ".jsonl") == kOrgA,
-              "the organization scan fills the id without rereading token totals");
+        check(refreshSessionLogCache(loaded, home) == SessionLogScan::Updated, "an older cache is read again");
+        check(accountForPath(loaded, std::string(kSessionA) + ".jsonl") == kOrgA, "the reread fills the organization");
         check(std::ranges::all_of(loaded.entries, [](const SessionLogCacheEntry& entry) {
-                  return entry.days.size() == 1 && entry.days.front().day == CivilDay{2026, 6, 1}
-                      && std::abs(entry.days.front().tokens - 1.0) < 0.001;
+                  return entry.requestsRecorded && (entry.days.empty() || entry.days.front().day != CivilDay{2026, 6, 1});
               }),
-              "the organization scan leaves saved daily totals unchanged");
+              "the reread replaces an older cache's totals and records their requests");
+        {
+            const auto dupRoot = std::filesystem::temp_directory_path() / std::format("hl-dups-{}", std::chrono::steady_clock::now().time_since_epoch().count());
+            const auto dupHome = dupRoot / "home";
+            const auto dupProjects = dupHome / ".claude" / "projects" / "demo";
+            std::filesystem::create_directories(dupProjects);
+            const auto requestLine = [](std::string_view id, int input, int output) {
+                return std::format(R"({{"type":"assistant","requestId":"{}","timestamp":"2026-03-04T12:00:00Z","message":{{"usage":{{"input_tokens":{},"output_tokens":{}}}}}}})", id, input, output) + "\n";
+            };
+            const auto write = [&](std::string_view name, const std::string& text) {
+                std::ofstream output(dupProjects / std::string(name), std::ios::binary);
+                output << text;
+            };
+            const auto total = [](const SessionLogCache& scanned) {
+                double sum = 0.0;
+                for (const auto& entry : scanned.entries) for (const auto& day : entry.days) sum += day.tokens;
+                return sum;
+            };
+            write("a.jsonl", requestLine("shared", 10, 5) + requestLine("only-a", 1, 1));
+            write("b.jsonl", requestLine("shared", 10, 5) + requestLine("only-b", 2, 2));
+            SessionLogCache scanned;
+            check(refreshSessionLogCache(scanned, dupHome) == SessionLogScan::Updated, "transcripts sharing a request are read");
+            check(std::abs(total(scanned) - 21.0) < 0.001, "a request in two transcripts counts once");
+
+            write("c.jsonl", requestLine("shared", 10, 90));
+            refreshSessionLogCache(scanned, dupHome);
+            check(std::abs(total(scanned) - 106.0) < 0.001, "a later copy with a higher count replaces the partial one");
+
+            write("a.jsonl", requestLine("shared", 10, 5) + requestLine("only-a", 1, 1) + requestLine("more-a", 3, 3));
+            refreshSessionLogCache(scanned, dupHome);
+            check(std::abs(total(scanned) - 112.0) < 0.001, "rereading a file does not count a shared request again");
+
+            const auto ledger = dupRoot / "requests.bin";
+            check(storeSessionRequests(scanned, ledger), "the request ledger is stored");
+            const auto savedText = serializeSessionLogCache(scanned);
+            auto restored = parseSessionLogCache(savedText);
+            check(loadSessionRequests(restored, ledger) && restored.requests.size() == scanned.requests.size(), "the request ledger is restored");
+            std::filesystem::remove(dupProjects / "c.jsonl");
+            write("d.jsonl", requestLine("shared", 10, 5));
+            refreshSessionLogCache(restored, dupHome);
+            check(std::abs(total(restored) - 112.0) < 0.001, "a request stays counted once after a restart and after its file is deleted");
+            {
+                std::ofstream damaged(ledger, std::ios::binary | std::ios::app);
+                damaged << "x";
+            }
+            SessionLogCache damagedCache;
+            check(!loadSessionRequests(damagedCache, ledger) && damagedCache.requests.empty(), "a damaged ledger is rejected");
+
+            // An older cache counted the shared request twice. Rebuilding lets the saved history drop by that much only.
+            std::filesystem::remove(dupProjects / "c.jsonl");
+            std::filesystem::remove(dupProjects / "d.jsonl");
+            write("a.jsonl", requestLine("shared", 10, 5));
+            write("b.jsonl", requestLine("shared", 10, 5));
+            SessionLogCache first;
+            refreshSessionLogCache(first, dupHome);
+            std::string oldText = "HLSL2\n";
+            for (const auto& entry : first.entries) {
+                oldText += std::format("E anthropic {} {} 1 local\n{}\n2026-03-04 15\n", entry.modified, entry.size, entry.path);
+            }
+            auto legacy = parseSessionLogCache(oldText);
+            check(legacy.entries.size() == 2 && !legacy.entries[0].requestsRecorded, "an older cache has no recorded requests");
+            refreshSessionLogCache(legacy, dupHome);
+            check(std::abs(total(legacy) - 15.0) < 0.001, "rebuilding an older cache removes its double count");
+            check(legacy.duplicates.size() == 1 && std::abs(legacy.duplicates.front().tokens - 15.0) < 0.001, "the rebuild reports what was counted twice");
+            TokenHistory corrected;
+            const std::vector<DailyTokens> doubled{DailyTokens{CivilDay{2026, 3, 4}, 30.0, {}, {}}};
+            const std::vector<DailyTokens> single{DailyTokens{CivilDay{2026, 3, 4}, 15.0, {}, {}}};
+            const std::vector<LocalSessionImport> oldImport{{"anthropic", "local", doubled}};
+            const std::vector<LocalSessionImport> newImport{{"anthropic", "local", single}};
+            replaceImportedDailyTokensKeepingTotals(corrected, oldImport);
+            replaceImportedDailyTokensKeepingTotals(corrected, newImport, std::nullopt, legacy.duplicates);
+            check(corrected.imported.size() == 1 && std::abs(corrected.imported.front().tokens - 15.0) < 0.001, "saved history drops by the proven double count");
+            const std::vector<LocalSessionImport> empty{{"anthropic", "local", {}}};
+            replaceImportedDailyTokensKeepingTotals(corrected, empty);
+            check(corrected.imported.size() == 1 && std::abs(corrected.imported.front().tokens - 15.0) < 0.001, "other drops are still held at the saved total");
+            std::error_code cleanupError;
+            std::filesystem::remove_all(dupRoot, cleanupError);
+        }
 
         const std::vector<SavedAccountSlot> unnamed{{"0", {}}, {"1", {}}};
         check(matchOrganizationsToSlots(links, unnamed, std::vector<std::string>{std::string(kOrgA), std::string(kOrgB)}).empty(),
@@ -776,7 +851,7 @@ void testActivityHistory() {
         pending.entries.push_back(SessionLogCacheEntry{"anthropic", "/tmp/a.jsonl", 1, 2, {}, {}});
         const auto pendingText = serializeSessionLogCache(pending);
         const auto pendingRestored = parseSessionLogCache(pendingText);
-        check(pendingText.starts_with("HLSL2\n") && pendingRestored.entries.size() == 1
+        check(pendingText.starts_with("HLSL3\n") && pendingRestored.entries.size() == 1
                   && pendingRestored.entries.front().accountId.empty(),
               "a Claude file that has not been scanned stays pending across a round trip");
         fs::remove_all(root, removeError);
@@ -935,6 +1010,83 @@ int main() {
     check(providerRateLimited(limited, recent), "an account waits until its Retry-After time");
     check(!providerRateLimited(limited, recent + std::chrono::seconds{419}), "polling resumes once Retry-After passes");
     check(parseRetryAfter(" 419\r\n") == std::chrono::seconds{419}, "Retry-After seconds are parsed");
+    {
+        const auto idle = parseClaudeUsage(R"({"five_hour":null,"seven_day":{"utilization":25.0,"resets_at":"2026-02-12T20:00:00Z"}})");
+        check(idle && !idle->session && idle->weekly && idle->weekly->used == 25.0, "a null five_hour does not read seven_day's numbers");
+        const auto emptySession = parseClaudeUsage(R"({"five_hour":{"utilization":null,"resets_at":null},"seven_day":{"utilization":25.0,"resets_at":"2026-02-12T20:00:00Z"}})");
+        check(emptySession && !emptySession->session && emptySession->weekly, "a session with no utilization does not read seven_day's numbers");
+        check(parseTimestamp("2026-02-12T20:00:00+08:00") == parseTimestamp("2026-02-12T12:00:00Z"), "timestamp offsets are applied");
+        check(parseTimestamp("2026-02-12T20:00:00.926893-01:30") == parseTimestamp("2026-02-12T21:30:00Z"), "negative offsets are applied");
+        check(parseTimestamp("1770926400000") == parseTimestamp("1770926400"), "millisecond stamps are read as milliseconds");
+        const auto kimiDays = parseKimiCodingUsage(R"({"limits":[{"window":{"duration":7,"timeUnit":"TIME_UNIT_DAY"},"detail":{"used":10,"limit":100}}]})");
+        check(kimiDays && !kimiDays->session && kimiDays->weekly, "a Kimi window in days is weekly, not session");
+
+        AlertEngine alerts;
+        ProviderSnapshot rolling;
+        rolling.id = "rolling";
+        Metric window;
+        window.kind = MetricKind::Session;
+        window.state = MetricState::Current;
+        window.capacity = 100.0;
+        window.used = 20.0;
+        window.resetAt = recent;
+        rolling.metrics = {window};
+        (void)alerts.observe(rolling);
+        rolling.metrics[0].resetAt = recent + std::chrono::hours(5);
+        check(alerts.observe(rolling).empty(), "a roomy window rolling over plays no reset sound");
+        rolling.metrics[0].used = 95.0;
+        check(alerts.observe(rolling).size() == 1, "reaching the warning level warns once");
+        rolling.metrics[0].resetAt = *rolling.metrics[0].resetAt + std::chrono::seconds{1};
+        check(alerts.observe(rolling).empty(), "a one-second shift in the reset time neither resets nor warns again");
+        rolling.metrics[0].used = 0.0;
+        rolling.metrics[0].resetAt = *rolling.metrics[0].resetAt + std::chrono::hours(5);
+        const auto rolled = alerts.observe(rolling);
+        check(rolled.size() == 1 && rolled[0].kind == AlertKind::AllowanceReset, "a constrained window rolling over plays the reset sound");
+
+        const auto stampedAt = std::chrono::system_clock::now();
+        ProviderSnapshot plan;
+        Metric session;
+        session.kind = MetricKind::Session;
+        session.state = MetricState::Current;
+        session.capacity = 100.0;
+        session.used = 50.0;
+        session.observedAt = stampedAt;
+        Metric spent;
+        spent.kind = MetricKind::ApiCredit;
+        spent.state = MetricState::Current;
+        spent.remaining = 0.0;
+        spent.observedAt = stampedAt;
+        plan.metrics = {session, spent};
+        check(!exhaustedUntil(plan, stampedAt), "empty prepaid credit does not exhaust an account with plan allowance");
+        plan.metrics = {spent};
+        check(exhaustedUntil(plan, stampedAt).has_value(), "empty credit exhausts a credit-only account");
+
+        ProviderSnapshot old;
+        Metric past = session;
+        past.state = MetricState::Stale;
+        past.used = 99.0;
+        past.resetAt = stampedAt - std::chrono::hours(1);
+        old.metrics = {past};
+        check(!aggregateStatus({old}, stampedAt).remainingFraction, "a stale value past its reset leaves the tray aggregate");
+    }
+    check(rateLimitDelay(std::nullopt, 0) == std::chrono::seconds{300}, "a 429 without Retry-After still waits");
+    check(rateLimitDelay(std::chrono::seconds{0}, 1) == std::chrono::seconds{600}, "Retry-After 0 does not mean ask again next poll");
+    check(rateLimitDelay(std::nullopt, 40) == std::chrono::seconds{3600}, "repeated 429s wait at most an hour by default");
+    check(rateLimitDelay(std::chrono::seconds{7200}, 0) == std::chrono::seconds{7200}, "a longer Retry-After is honored");
+    {
+        ProviderSnapshot read;
+        noteRateLimited(read, std::nullopt);
+        noteRateLimited(read, std::chrono::seconds{900});
+        settleRateLimit(read, false, recent);
+        check(read.rateLimitedUntil == recent + std::chrono::seconds{900} && read.rateLimitStreak == 1,
+              "several 429s in one read count once and keep the longest wait");
+        noteRateLimited(read, std::nullopt);
+        settleRateLimit(read, true, recent);
+        check(!read.rateLimitedUntil && read.rateLimitStreak == 0 && !read.pendingRetryAfter,
+              "data from any endpoint clears the limit");
+        settleRateLimit(read, false, recent);
+        check(!read.rateLimitedUntil, "a read that failed without a 429 sets no limit");
+    }
     check(parseRetryAfter("999999999") == std::chrono::seconds{86400}, "Retry-After is capped at one day");
     check(!parseRetryAfter("Wed, 21 Oct 2026 07:28:00 GMT") && !parseRetryAfter(""), "HTTP-date Retry-After is ignored");
     markLocalDrawdown(limited, recent);

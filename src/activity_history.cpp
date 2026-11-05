@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <limits>
@@ -514,8 +515,30 @@ void consumeSessionLogLine(std::vector<DailyTokens>& days, std::unordered_map<st
     noteOnce(days, seen, "c:" + request, localCivilDay(*when), tokens);
 }
 
+// Stable across runs and builds, unlike std::hash, because these values are saved.
+std::uint64_t fnv1a(std::string_view text) {
+    std::uint64_t hash = 14695981039346656037ULL;
+    for (const char character : text) {
+        hash ^= static_cast<unsigned char>(character);
+        hash *= 1099511628211ULL;
+    }
+    return hash;
+}
+
+std::uint32_t sessionFileOwner(std::string_view path) {
+    const auto hash = fnv1a(path);
+    return static_cast<std::uint32_t>(hash ^ (hash >> 32));
+}
+
+struct SessionRequest {
+    std::uint64_t hash{0};
+    double tokens{0.0};
+    CivilDay day{};
+};
+
 struct SessionStream {
     std::vector<DailyTokens> days;
+    std::vector<SessionRequest> requests;
     // Empty when the organization was not requested. Otherwise an organization id,
     // "local" when the file names none, or "mixed" when it names more than one.
     std::string claudeAccount;
@@ -543,6 +566,10 @@ SessionStream parseSessionLogStream(std::istream& input, bool collectOrganizatio
     }
     if (!input.eof() && input.fail()) return parsed;
     parsed.ok = true;
+    // A line with no id has nothing to match in another file, so only real ids go in the ledger.
+    for (const auto& [key, use] : seen) {
+        if (key.size() > 2 && key[2] != '#') parsed.requests.push_back(SessionRequest{fnv1a(key), use.tokens, use.day});
+    }
     if (!collectOrganization) return parsed;
     if (organizations.size() > 1) parsed.claudeAccount = "mixed";
     else if (organizations.size() == 1) parsed.claudeAccount = *organizations.begin();
@@ -824,6 +851,34 @@ std::vector<DailyTokens> parseSessionLogTokens(std::string_view jsonl) {
     return parseSessionLogStream(input, false).days;
 }
 
+namespace {
+
+// Decides which file each of this file's requests is counted on. The highest count wins, because a copy can hold an
+// earlier, partial count of the same request. A request already counted elsewhere comes off this file's days; a
+// higher count here takes the request over from the file that held it.
+void settleSessionRequests(SessionLogCache& cache, std::unordered_map<std::uint32_t, SessionLogCacheEntry*>& owners,
+                           std::uint32_t self, SessionStream& parsed) {
+    for (const auto& request : parsed.requests) {
+        if (request.tokens >= 4000000000.0) continue;
+        const auto tokens = static_cast<std::uint32_t>(request.tokens);
+        const auto [use, added] = cache.requests.try_emplace(request.hash, SessionRequestUse{self, tokens, request.day});
+        if (added) continue;
+        if (use->second.owner == self) {
+            use->second.tokens = tokens;
+            use->second.day = request.day;
+        } else if (request.tokens > use->second.tokens) {
+            if (const auto holder = owners.find(use->second.owner); holder != owners.end()) {
+                removeDaily(holder->second->days, use->second.day, use->second.tokens);
+            }
+            use->second = SessionRequestUse{self, tokens, request.day};
+        } else {
+            removeDaily(parsed.days, request.day, request.tokens);
+        }
+    }
+}
+
+} // namespace
+
 SessionLogScan refreshSessionLogCache(SessionLogCache& cache, const std::filesystem::path& home) {
     std::error_code error;
     if (!std::filesystem::is_directory(home, error) || error) return SessionLogScan::Unavailable;
@@ -843,6 +898,11 @@ SessionLogScan refreshSessionLogCache(SessionLogCache& cache, const std::filesys
     std::unordered_map<std::string, SessionLogCacheEntry> kept;
     kept.reserve(cache.entries.size());
     for (auto& entry : cache.entries) kept.emplace(entry.path, std::move(entry));
+    std::unordered_map<std::uint32_t, SessionLogCacheEntry*> owners;
+    owners.reserve(kept.size());
+    for (auto& [path, entry] : kept) owners[sessionFileOwner(path)] = &entry;
+    // Totals as they were before a rebuild, to measure what it found was counted twice.
+    std::unordered_map<std::string, std::vector<DailyTokens>> rebuilt;
 
     bool changed = false;
     for (const auto& root : roots) {
@@ -859,7 +919,7 @@ SessionLogScan refreshSessionLogCache(SessionLogCache& cache, const std::filesys
             const auto stamp = modifiedStamp(modified);
             const auto found = kept.find(key);
             if (found != kept.end() && found->second.providerId == root.provider && found->second.modified == stamp
-                && found->second.size == size) {
+                && found->second.size == size && found->second.requestsRecorded) {
                 // An older cache has the token totals but no organization. Read that id only.
                 if (std::string_view{root.provider} != "anthropic" || !found->second.accountId.empty()) return;
                 std::ifstream organizationInput(file, std::ios::binary);
@@ -873,8 +933,14 @@ SessionLogScan refreshSessionLogCache(SessionLogCache& cache, const std::filesys
             std::ifstream input(file, std::ios::binary);
             if (!input) return;
             const bool claude = std::string_view{root.provider} == "anthropic";
-            const auto parsed = parseSessionLogStream(input, claude);
+            auto parsed = parseSessionLogStream(input, claude);
             if (!parsed.ok) return;
+            if (found != kept.end() && !found->second.requestsRecorded && found->second.modified == stamp
+                && found->second.size == size) {
+                rebuilt.emplace(key, found->second.days);
+            }
+            const auto self = sessionFileOwner(key);
+            settleSessionRequests(cache, owners, self, parsed);
             SessionLogCacheEntry entry;
             entry.providerId = root.provider;
             entry.path = key;
@@ -882,12 +948,22 @@ SessionLogScan refreshSessionLogCache(SessionLogCache& cache, const std::filesys
             entry.size = static_cast<std::uint64_t>(size);
             entry.accountId = claude ? parsed.claudeAccount : std::string(kLocalSessionAccount);
             entry.days = parsed.days;
-            if (found == kept.end()) kept.emplace(key, std::move(entry));
+            entry.requestsRecorded = true;
+            if (found == kept.end()) owners[self] = &kept.emplace(key, std::move(entry)).first->second;
             else found->second = std::move(entry);
             changed = true;
         });
         // A log that is no longer on disk keeps its saved daily totals. Once read, a day's tokens are history,
         // so a deleted or rotated transcript does not erase them.
+    }
+
+    for (const auto& [path, before] : rebuilt) {
+        const auto& entry = kept.at(path);
+        for (const auto& day : before) {
+            const auto now = std::ranges::lower_bound(entry.days, day.day, {}, &DailyTokens::day);
+            const double left = now != entry.days.end() && now->day == day.day ? now->tokens : 0.0;
+            if (day.tokens > left) cache.duplicates.push_back(DuplicateSessionTokens{entry.providerId, day.day, day.tokens - left});
+        }
     }
 
     cache.entries.clear();
@@ -1096,7 +1172,7 @@ std::vector<LocalSessionImport> assignClaudeSessionImports(std::span<const Local
 }
 
 std::string serializeSessionLogCache(const SessionLogCache& cache) {
-    std::string text = "HLSL2\n";
+    std::string text = "HLSL3\n";
     for (const auto& entry : cache.entries) {
         if (!knownSessionProvider(entry.providerId) || entry.path.empty() || entry.path.find('\n') != std::string::npos) continue;
         const auto account = cacheAccountLabel(entry);
@@ -1111,6 +1187,7 @@ std::string serializeSessionLogCache(const SessionLogCache& cache) {
         text += std::to_string(entry.days.size());
         text += ' ';
         text += account;
+        text += entry.requestsRecorded ? " R" : " L";
         text += '\n';
         text += entry.path;
         text += '\n';
@@ -1136,8 +1213,9 @@ SessionLogCache parseSessionLogCache(std::string_view text) {
         return true;
     };
     std::string_view line;
-    if (!nextLine(line) || (line != "HLSL1" && line != "HLSL2")) return {};
-    const bool version2 = line == "HLSL2";
+    if (!nextLine(line) || (line != "HLSL1" && line != "HLSL2" && line != "HLSL3")) return {};
+    const bool version3 = line == "HLSL3";
+    const bool version2 = version3 || line == "HLSL2";
     std::set<std::string> paths;
     while (nextLine(line)) {
         if (line.empty()) continue;
@@ -1148,8 +1226,14 @@ SessionLogCache parseSessionLogCache(std::string_view text) {
         const auto sizeField = takeField(rest);
         const auto countField = takeField(rest);
         std::string accountId;
+        bool requestsRecorded = false;
         if (version2) {
             const auto accountField = takeField(rest);
+            if (version3) {
+                const auto recordedField = takeField(rest);
+                if (!recordedField || (*recordedField != "R" && *recordedField != "L")) return {};
+                requestsRecorded = *recordedField == "R";
+            }
             if (!providerField || !modifiedField || !sizeField || !countField || !accountField || !rest.empty()) return {};
             if (!cacheAccountId(*accountField, accountId)) return {};
         } else if (!providerField || !modifiedField || !sizeField || !countField || !rest.empty()) {
@@ -1176,6 +1260,7 @@ SessionLogCache parseSessionLogCache(std::string_view text) {
         entry.modified = modified;
         entry.size = size;
         entry.accountId = std::move(accountId);
+        entry.requestsRecorded = requestsRecorded;
         if (!paths.insert(entry.path).second) return {};
         entry.days.reserve(static_cast<std::size_t>(count));
         for (unsigned long long index = 0; index < count; ++index) {
@@ -1217,6 +1302,77 @@ bool storeSessionLogCache(const SessionLogCache& cache, const std::filesystem::p
     }
     if (error) std::filesystem::remove(temporary, error);
     return !error;
+}
+
+namespace {
+
+constexpr std::string_view kRequestLedgerMagic = "HLRQ1\n";
+// hash, owner, tokens, and the day as yyyymmdd
+constexpr std::size_t kRequestRecordSize = sizeof(std::uint64_t) + 3 * sizeof(std::uint32_t);
+
+} // namespace
+
+bool storeSessionRequests(const SessionLogCache& cache, const std::filesystem::path& path) {
+    std::string bytes;
+    bytes.reserve(kRequestLedgerMagic.size() + cache.requests.size() * kRequestRecordSize);
+    bytes.append(kRequestLedgerMagic);
+    const auto put = [&bytes](const auto value) { bytes.append(reinterpret_cast<const char*>(&value), sizeof(value)); };
+    for (const auto& [hash, use] : cache.requests) {
+        put(hash);
+        put(use.owner);
+        put(use.tokens);
+        put(static_cast<std::uint32_t>(use.day.year * 10000 + static_cast<int>(use.day.month) * 100 + static_cast<int>(use.day.day)));
+    }
+    std::error_code error;
+    if (path.has_parent_path()) std::filesystem::create_directories(path.parent_path(), error);
+    std::filesystem::path temporary = path;
+    temporary += ".tmp";
+    {
+        std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
+        if (!output) return false;
+        output.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+        if (!output) {
+            std::filesystem::remove(temporary, error);
+            return false;
+        }
+    }
+    error.clear();
+    std::filesystem::rename(temporary, path, error);
+    if (error) std::filesystem::remove(temporary, error);
+    return !error;
+}
+
+bool loadSessionRequests(SessionLogCache& cache, const std::filesystem::path& path) {
+    cache.requests.clear();
+    std::ifstream input(path, std::ios::binary);
+    if (!input) return false;
+    std::ostringstream buffer;
+    buffer << input.rdbuf();
+    if (!input && !input.eof()) return false;
+    const auto bytes = std::move(buffer).str();
+    if (!std::string_view{bytes}.starts_with(kRequestLedgerMagic)
+        || (bytes.size() - kRequestLedgerMagic.size()) % kRequestRecordSize != 0) {
+        return false;
+    }
+    const std::size_t count = (bytes.size() - kRequestLedgerMagic.size()) / kRequestRecordSize;
+    cache.requests.reserve(count);
+    const char* cursor = bytes.data() + kRequestLedgerMagic.size();
+    const auto take = [&cursor](auto& value) {
+        std::memcpy(&value, cursor, sizeof(value));
+        cursor += sizeof(value);
+    };
+    for (std::size_t index = 0; index < count; ++index) {
+        std::uint64_t hash = 0;
+        std::uint32_t owner = 0;
+        std::uint32_t tokens = 0;
+        std::uint32_t day = 0;
+        take(hash);
+        take(owner);
+        take(tokens);
+        take(day);
+        cache.requests[hash] = SessionRequestUse{owner, tokens, CivilDay{static_cast<int>(day / 10000), day / 100 % 100, day % 100}};
+    }
+    return true;
 }
 
 SessionLogCache loadSessionLogCache(const std::filesystem::path& path) {
@@ -1275,7 +1431,8 @@ bool replaceImportedDailyTokens(TokenHistory& history, std::string_view provider
 }
 
 bool replaceImportedDailyTokensKeepingTotals(TokenHistory& history, std::span<const LocalSessionImport> imports,
-                                             std::optional<CivilDay> coveredFrom) {
+                                             std::optional<CivilDay> coveredFrom,
+                                             std::span<const DuplicateSessionTokens> duplicates) {
     std::set<std::string> providers;
     for (const auto& import : imports) {
         if (parseId(import.providerId) && parseId(import.accountId)) providers.insert(import.providerId);
@@ -1316,7 +1473,10 @@ bool replaceImportedDailyTokensKeepingTotals(TokenHistory& history, std::span<co
         const auto newTotals = dayTotals(after);
         for (const auto& [day, oldTotal] : oldTotals) {
             const auto found = newTotals.find(day);
-            const double shortfall = oldTotal - (found == newTotals.end() ? 0.0 : found->second);
+            double shortfall = oldTotal - (found == newTotals.end() ? 0.0 : found->second);
+            for (const auto& duplicate : duplicates) {
+                if (duplicate.providerId == providerId && duplicate.day == day) shortfall -= duplicate.tokens;
+            }
             if (shortfall <= 0.000001) continue;
             std::string target;
             double largestDrop = -1.0;

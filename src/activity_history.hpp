@@ -9,6 +9,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -135,10 +136,30 @@ struct SessionLogCacheEntry {
     std::uint64_t size{0};
     std::string accountId;
     std::vector<DailyTokens> days;
+    // False when this file's totals predate the request ledger. It is read again while it is on disk.
+    bool requestsRecorded{false};
+};
+
+// Which file a request's tokens are counted on. Holds hashes and counts, never request ids or log text.
+struct SessionRequestUse {
+    std::uint32_t owner{0};
+    std::uint32_t tokens{0};
+    CivilDay day{};
+};
+
+// Tokens a rebuild found were counted twice. Saved history may drop by exactly this much.
+struct DuplicateSessionTokens {
+    std::string providerId;
+    CivilDay day{};
+    double tokens{0.0};
 };
 
 struct SessionLogCache {
     std::vector<SessionLogCacheEntry> entries;
+    // Every request id seen across all files, so a request copied into a second transcript counts once and
+    // the file holding the highest count keeps it. Loaded only for the length of a scan.
+    std::unordered_map<std::uint64_t, SessionRequestUse> requests;
+    std::vector<DuplicateSessionTokens> duplicates;
 };
 
 struct LocalSessionImport {
@@ -206,6 +227,9 @@ SessionLogScan refreshSessionLogCache(SessionLogCache& cache, const std::filesys
 [[nodiscard]] SessionLogCache parseSessionLogCache(std::string_view text);
 bool storeSessionLogCache(const SessionLogCache& cache, const std::filesystem::path& path);
 [[nodiscard]] SessionLogCache loadSessionLogCache(const std::filesystem::path& path);
+// The request ledger is a separate binary file. A missing or damaged one is empty, and the caller rebuilds.
+bool storeSessionRequests(const SessionLogCache& cache, const std::filesystem::path& path);
+[[nodiscard]] bool loadSessionRequests(SessionLogCache& cache, const std::filesystem::path& path);
 
 // Replaces one account's imported days. Other accounts and recorded deltas stay.
 // With coveredFrom, only days on or after it are replaced; earlier saved days stay,
@@ -218,8 +242,10 @@ bool replaceImportedDailyTokens(TokenHistory& history, std::string_view provider
 // daily total over the listed accounts never drops. A shortfall stays on the account that lost the
 // most tokens that day, so days moving between accounts are not counted twice.
 // Returns true when any listed account's imported days change.
+// duplicates lets a day drop by tokens a rebuild proved were counted twice.
 bool replaceImportedDailyTokensKeepingTotals(TokenHistory& history, std::span<const LocalSessionImport> imports,
-                                             std::optional<CivilDay> coveredFrom = std::nullopt);
+                                             std::optional<CivilDay> coveredFrom = std::nullopt,
+                                             std::span<const DuplicateSessionTokens> duplicates = {});
 
 // An empty provider id is every provider. A provider id with an empty account id is
 // every account of that provider, including totals that name no account. Both ids

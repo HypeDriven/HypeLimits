@@ -75,8 +75,40 @@ UsageWindow percentWindow(double usedPercent, std::optional<TimePoint> reset) {
     return UsageWindow{usedPercent, 100.0, "%", reset};
 }
 
-std::optional<UsageWindow> windowFromObject(std::string_view json, std::size_t start, std::size_t span = 480) {
-    const auto slice = json.substr(start, std::min(span, json.size() - start));
+// The object a key (or an opening brace) at start begins. Empty when the value is null or anything else, so a search
+// inside the result can't read a neighbouring object's fields.
+std::string_view objectAt(std::string_view json, std::size_t start) {
+    if (start >= json.size()) return {};
+    std::size_t open = start;
+    if (json[open] != '{') {
+        const auto colon = json.find(':', start);
+        if (colon == std::string_view::npos) return {};
+        open = json.find_first_not_of(" \t\r\n", colon + 1);
+        if (open == std::string_view::npos || json[open] != '{') return {};
+    }
+    int depth = 0;
+    bool inString = false;
+    bool escaped = false;
+    for (std::size_t i = open; i < json.size(); ++i) {
+        const char ch = json[i];
+        if (inString) {
+            if (escaped) escaped = false;
+            else if (ch == '\\') escaped = true;
+            else if (ch == '"') inString = false;
+        } else if (ch == '"') {
+            inString = true;
+        } else if (ch == '{') {
+            ++depth;
+        } else if (ch == '}' && --depth == 0) {
+            return json.substr(open, i - open + 1);
+        }
+    }
+    return json.substr(open);
+}
+
+std::optional<UsageWindow> windowFromObject(std::string_view json, std::size_t start) {
+    const auto slice = objectAt(json, start);
+    if (slice.empty()) return std::nullopt;
     std::optional<double> used = numberAt(slice, "used_percent", 0);
     if (!used) used = numberAt(slice, "utilization", 0);
     if (!used) used = numberAt(slice, "percent", 0);
@@ -124,8 +156,9 @@ std::optional<std::chrono::seconds> parseRetryAfter(std::string_view value) {
 std::optional<TimePoint> parseTimestamp(std::string_view value) {
     if (value.empty()) return std::nullopt;
     if (looksLikeUnix(value)) {
-        const auto seconds = std::strtoll(std::string(value).c_str(), nullptr, 10);
+        auto seconds = std::strtoll(std::string(value).c_str(), nullptr, 10);
         if (seconds <= 0) return std::nullopt;
+        if (seconds >= 100000000000LL) seconds /= 1000; // A 12+ digit stamp is milliseconds.
         return TimePoint{std::chrono::seconds{seconds}};
     }
     int year = 0, month = 0, day = 0, hour = 0, minute = 0, second = 0;
@@ -142,6 +175,20 @@ std::optional<TimePoint> parseTimestamp(std::string_view value) {
     utc.tm_isdst = 0;
     const auto point = fromUtcTm(utc);
     if (point.time_since_epoch().count() == 0 && year > 1970) return std::nullopt;
+    // A "+08:00" style offset: the fields above are local to it.
+    if (const auto time = value.find('T'); time != std::string_view::npos) {
+        if (const auto sign = value.find_first_of("+-", time); sign != std::string_view::npos) {
+            int digits = 0;
+            int minutes = 0;
+            for (const char ch : value.substr(sign + 1)) {
+                if (ch < '0' || ch > '9') continue;
+                minutes += (ch - '0') * (digits == 0 ? 600 : digits == 1 ? 60 : digits == 2 ? 10 : digits == 3 ? 1 : 0);
+                ++digits;
+            }
+            const std::chrono::minutes offset{value[sign] == '+' ? minutes : -minutes};
+            return point - offset;
+        }
+    }
     return point;
 }
 
@@ -190,7 +237,7 @@ std::optional<ProviderUsage> parseClaudeUsage(std::string_view json) {
     while ((kindAt = json.find("\"kind\"", kindAt)) != std::string_view::npos) {
         const auto kind = stringAt(json, "kind", kindAt);
         const auto objectStart = json.rfind('{', kindAt);
-        const auto window = windowFromObject(json, objectStart == std::string_view::npos ? kindAt : objectStart, 560);
+        const auto window = windowFromObject(json, objectStart == std::string_view::npos ? kindAt : objectStart);
         if (window) {
             if (kind == "session" && !usage.session) usage.session = window;
             if ((kind == "weekly_all" || kind == "weekly") && !usage.weekly) usage.weekly = window;
@@ -221,7 +268,7 @@ std::optional<ProviderUsage> parseCodexUsage(std::string_view json) {
         if (at == std::string_view::npos) return;
         const auto window = windowFromObject(json, at);
         if (!window) return;
-        const auto seconds = numberAt(json.substr(at, 400), "limit_window_seconds", 0);
+        const auto seconds = numberAt(objectAt(json, at), "limit_window_seconds", 0);
         const bool session = seconds ? *seconds <= 12 * 3600 : preferSession;
         if (session) usage.session = window;
         else usage.weekly = window;
@@ -267,10 +314,11 @@ std::optional<ProviderUsage> parseKimiCodingUsage(std::string_view json) {
     ProviderUsage usage;
     const auto usageAt = json.find("\"usage\"");
     if (usageAt != std::string_view::npos) {
-        const auto used = numberAt(json, "used", usageAt);
-        const auto limit = numberAt(json, "limit", usageAt);
-        const auto remaining = numberAt(json, "remaining", usageAt);
-        auto reset = parseTimestamp(stringAt(json, "resetTime", usageAt));
+        const auto usageObject = objectAt(json, usageAt);
+        const auto used = numberAt(usageObject, "used", 0);
+        const auto limit = numberAt(usageObject, "limit", 0);
+        const auto remaining = numberAt(usageObject, "remaining", 0);
+        auto reset = parseTimestamp(stringAt(usageObject, "resetTime", 0));
         if (used && limit && *limit > 0.0) {
             usage.weekly = UsageWindow{*used, *limit, "requests", reset};
         } else if (remaining && limit && *limit > 0.0) {
@@ -279,7 +327,15 @@ std::optional<ProviderUsage> parseKimiCodingUsage(std::string_view json) {
     }
     std::size_t windowAt = 0;
     while ((windowAt = json.find("\"window\"", windowAt)) != std::string_view::npos) {
-        const auto duration = numberAt(json, "duration", windowAt);
+        const auto windowObject = objectAt(json, windowAt);
+        auto duration = numberAt(windowObject, "duration", 0);
+        // Durations count in the window's own unit; minutes when it names none.
+        if (duration) {
+            const auto unit = stringAt(windowObject, "timeUnit", 0);
+            if (unit.find("HOUR") != std::string::npos) *duration *= 60.0;
+            else if (unit.find("DAY") != std::string::npos) *duration *= 24.0 * 60.0;
+            else if (unit.find("SECOND") != std::string::npos) *duration /= 60.0;
+        }
         const auto detailAt = json.find("\"detail\"", windowAt);
         const auto window = windowFromObject(json, detailAt == std::string_view::npos ? windowAt : detailAt);
         if (window && duration) {

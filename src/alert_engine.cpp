@@ -17,7 +17,11 @@ std::vector<AlertEvent> AlertEngine::observe(const ProviderSnapshot& snapshot) {
 
         const auto key = snapshot.id + ":" + std::to_string(static_cast<int>(metric.kind));
         auto& prior = history_[key];
-        bool reset = prior.resetAt && metric.resetAt && *prior.resetAt != *metric.resetAt;
+        // A new period only earns the reset sound when the old one was constrained. The tolerance absorbs the small
+        // shifts some providers make to the same reset time between polls.
+        constexpr auto kResetTolerance = std::chrono::minutes(1);
+        bool reset = prior.resetAt && metric.resetAt && *metric.resetAt > *prior.resetAt + kResetTolerance
+            && prior.remaining && *prior.remaining <= 0.10;
 
         if (!reset && *remaining >= 0.50 &&
             ((prior.remaining && *prior.remaining <= 0.10) || prior.increaseObservations > 0)) {
@@ -35,7 +39,9 @@ std::vector<AlertEvent> AlertEngine::observe(const ProviderSnapshot& snapshot) {
 
         if (*remaining <= 0.10) {
             const auto period = metric.resetAt.value_or(TimePoint{});
-            if (!prior.warnedPeriod || *prior.warnedPeriod != period) {
+            const bool samePeriod = prior.warnedPeriod
+                && (*prior.warnedPeriod > period ? *prior.warnedPeriod - period : period - *prior.warnedPeriod) <= kResetTolerance;
+            if (!samePeriod) {
                 events.push_back({AlertKind::Warning, snapshot.id, metric.kind});
                 prior.warnedPeriod = period;
             }

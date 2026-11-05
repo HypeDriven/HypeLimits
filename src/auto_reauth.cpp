@@ -1,4 +1,5 @@
 #include "auto_reauth.hpp"
+#include "model.hpp"
 #include "webview2_min.h"
 
 #include <objbase.h>
@@ -6,6 +7,7 @@
 
 #include <algorithm>
 #include <functional>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -186,46 +188,59 @@ WebViewOAuthResult runWebViewOAuth(HWND parent, const std::wstring& startUrl, co
                                 WS_POPUP, -32000, -32000, 8, 8, parent, nullptr, GetModuleHandleW(nullptr), nullptr);
     if (!hwnd) return result;
 
-    ICoreWebView2Controller* controller{};
-    ICoreWebView2* webview{};
-    bool ready = false;
-    bool failed = false;
+    // WebView2 can call back after this function has returned, so everything its callbacks touch outlives it.
+    struct Session {
+        bool abandoned{false};
+        bool ready{false};
+        bool failed{false};
+        ICoreWebView2Controller* controller{};
+        ICoreWebView2* webview{};
+        std::wstring url;
+        std::wstring pageText;
+    };
+    auto session = std::make_shared<Session>();
+    const auto* cookiesPtr = &cookies;
 
     auto* envHandler = new EnvCompletedHandler();
-    envHandler->fn = [&](HRESULT hr, ICoreWebView2Environment* env) -> HRESULT {
+    envHandler->fn = [session, hwnd, startUrl, cookiesPtr](HRESULT hr, ICoreWebView2Environment* env) -> HRESULT {
+        if (session->abandoned) return S_OK;
         if (FAILED(hr) || !env) {
-            failed = true;
+            session->failed = true;
             return S_OK;
         }
         auto* controllerHandler = new ControllerCompletedHandler();
-        controllerHandler->fn = [&](HRESULT chr, ICoreWebView2Controller* created) -> HRESULT {
-            if (FAILED(chr) || !created) {
-                failed = true;
+        controllerHandler->fn = [session, startUrl, cookiesPtr](HRESULT chr, ICoreWebView2Controller* created) -> HRESULT {
+            if (session->abandoned) {
+                if (created) created->Close();
                 return S_OK;
             }
-            controller = created;
-            controller->AddRef();
-            controller->put_IsVisible(FALSE);
-            controller->get_CoreWebView2(&webview);
-            controller->put_Bounds(RECT{0, 0, 800, 600});
-            if (webview) {
-                injectCookies(webview, cookies);
+            if (FAILED(chr) || !created) {
+                session->failed = true;
+                return S_OK;
+            }
+            session->controller = created;
+            session->controller->AddRef();
+            session->controller->put_IsVisible(FALSE);
+            session->controller->get_CoreWebView2(&session->webview);
+            session->controller->put_Bounds(RECT{0, 0, 800, 600});
+            if (session->webview) {
+                injectCookies(session->webview, *cookiesPtr);
                 auto* nav = new NavigationStartingHandler();
-                nav->fn = [&](ICoreWebView2*, ICoreWebView2NavigationStartingEventArgs* args) -> HRESULT {
+                nav->fn = [session](ICoreWebView2*, ICoreWebView2NavigationStartingEventArgs* args) -> HRESULT {
                     if (!args) return S_OK;
                     LPWSTR uri{};
                     if (SUCCEEDED(args->get_Uri(&uri)) && uri) {
-                        result.url = uri;
+                        session->url = uri;
                         CoTaskMemFree(uri);
                     }
                     return S_OK;
                 };
                 EventRegistrationToken token{};
-                webview->add_NavigationStarting(nav, &token);
+                session->webview->add_NavigationStarting(nav, &token);
                 nav->Release();
-                webview->Navigate(startUrl.c_str());
+                session->webview->Navigate(startUrl.c_str());
             }
-            ready = true;
+            session->ready = true;
             return S_OK;
         };
         env->CreateCoreWebView2Controller(hwnd, controllerHandler);
@@ -240,11 +255,12 @@ WebViewOAuthResult runWebViewOAuth(HWND parent, const std::wstring& startUrl, co
         return result;
     }
 
-    pumpUntil(15000, [&] { return ready || failed; });
-    if (!ready || !webview) {
-        if (controller) {
-            controller->Close();
-            controller->Release();
+    pumpUntil(15000, [&] { return session->ready || session->failed; });
+    if (!session->ready || !session->webview) {
+        session->abandoned = true;
+        if (session->controller) {
+            session->controller->Close();
+            session->controller->Release();
         }
         DestroyWindow(hwnd);
         return result;
@@ -253,34 +269,41 @@ WebViewOAuthResult runWebViewOAuth(HWND parent, const std::wstring& startUrl, co
     DWORD lastScript = 0;
     pumpUntil(timeoutMs, [&] {
         LPWSTR uri{};
-        if (SUCCEEDED(webview->get_Source(&uri)) && uri) {
-            result.url = uri;
+        if (SUCCEEDED(session->webview->get_Source(&uri)) && uri) {
+            session->url = uri;
             CoTaskMemFree(uri);
         }
         const DWORD now = GetTickCount();
         if (now - lastScript > 1200) {
             lastScript = now;
             auto* text = new ExecuteScriptHandler();
-            text->fn = [&](HRESULT, LPCWSTR json) -> HRESULT {
-                if (json) result.pageText = json;
+            text->fn = [session](HRESULT, LPCWSTR json) -> HRESULT {
+                if (json) session->pageText = json;
                 return S_OK;
             };
-            webview->ExecuteScript(kPageTextScript, text);
+            session->webview->ExecuteScript(kPageTextScript, text);
             text->Release();
         }
-        const auto url8 = utf8(result.url);
-        const auto page8 = utf8(result.pageText);
-        if (url8.find("code=") != std::string::npos || page8.find("code=") != std::string::npos) return true;
+        const auto url8 = utf8(session->url);
+        const auto page8 = utf8(session->pageText);
+        // Claude's authorize URL itself carries code=true, so only a real authorization code ends the wait.
+        const auto hasCode = [](const std::string& text) {
+            return text.find("code=") != std::string::npos && extractAuthorizationCode(text).has_value();
+        };
+        if (hasCode(url8) || hasCode(page8)) return true;
         if (url8.find('#') != std::string::npos && url8.find("code") != std::string::npos) return true;
         return false;
     });
 
+    session->abandoned = true;
+    result.url = session->url;
+    result.pageText = session->pageText;
     result.ok = !result.url.empty() || !result.pageText.empty();
-    if (controller) {
-        controller->Close();
-        controller->Release();
+    if (session->controller) {
+        session->controller->Close();
+        session->controller->Release();
     }
-    if (webview) webview->Release();
+    if (session->webview) session->webview->Release();
     DestroyWindow(hwnd);
     return result;
 }

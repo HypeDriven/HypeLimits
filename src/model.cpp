@@ -9,7 +9,12 @@ namespace hypelimits {
 
 std::optional<TimePoint> exhaustedUntil(const ProviderSnapshot& provider, TimePoint now) {
     std::optional<TimePoint> until;
+    // Prepaid credit running out doesn't end a plan's allowance, so it only counts on an account with no plan window.
+    const bool planWindow = std::ranges::any_of(provider.metrics, [](const Metric& metric) {
+        return metric.kind != MetricKind::ApiCredit && metric.state == MetricState::Current;
+    });
     for (const auto& metric : provider.metrics) {
+        if (metric.kind == MetricKind::ApiCredit && planWindow) continue;
         if (metric.state != MetricState::Current || !metric.observedAt || *metric.observedAt > now ||
             now - *metric.observedAt > std::chrono::minutes(15)) continue;
         const bool empty = (metric.remaining && *metric.remaining <= 0) ||
@@ -123,7 +128,7 @@ std::optional<double> Metric::alertRemainingFraction() const {
     return remainingFraction();
 }
 
-AggregateStatus aggregateStatus(const std::vector<ProviderSnapshot>& providers) {
+AggregateStatus aggregateStatus(const std::vector<ProviderSnapshot>& providers, TimePoint now) {
     AggregateStatus result;
     for (const auto& provider : providers) {
         if (!provider.enabled) {
@@ -134,10 +139,13 @@ AggregateStatus aggregateStatus(const std::vector<ProviderSnapshot>& providers) 
             if (!metric.contributesToAggregate() || !fraction) {
                 continue;
             }
+            // A stale value from a period that has since ended says nothing about the allowance now.
+            if (metric.state == MetricState::Stale && metric.resetAt && *metric.resetAt <= now) continue;
             if (!result.remainingFraction || *fraction < *result.remainingFraction) {
                 result.remainingFraction = fraction;
                 result.providerId = provider.id;
                 result.kind = metric.kind;
+                result.resetAt = metric.resetAt;
             }
         }
     }
@@ -183,6 +191,27 @@ bool usageDrewDownSince(const Metric& previous, const Metric& current) {
 
 bool providerRateLimited(const ProviderSnapshot& provider, TimePoint now) {
     return provider.rateLimitedUntil && *provider.rateLimitedUntil > now;
+}
+
+std::chrono::seconds rateLimitDelay(std::optional<std::chrono::seconds> retryAfter, unsigned int streak) {
+    const std::chrono::seconds floor = std::min(std::chrono::seconds{300} * (1LL << std::min(streak, 4U)), std::chrono::seconds{3600});
+    return std::max(retryAfter.value_or(std::chrono::seconds{0}), floor);
+}
+
+void noteRateLimited(ProviderSnapshot& provider, std::optional<std::chrono::seconds> retryAfter) {
+    provider.pendingRetryAfter = std::max(provider.pendingRetryAfter.value_or(std::chrono::seconds{0}),
+                                          retryAfter.value_or(std::chrono::seconds{0}));
+}
+
+void settleRateLimit(ProviderSnapshot& provider, bool gotData, TimePoint now) {
+    if (gotData) {
+        provider.rateLimitedUntil.reset();
+        provider.rateLimitStreak = 0;
+    } else if (provider.pendingRetryAfter) {
+        provider.rateLimitedUntil = now + rateLimitDelay(provider.pendingRetryAfter, provider.rateLimitStreak);
+        ++provider.rateLimitStreak;
+    }
+    provider.pendingRetryAfter.reset();
 }
 
 void markLocalDrawdown(ProviderSnapshot& provider, TimePoint now) {

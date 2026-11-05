@@ -45,14 +45,18 @@ struct ProviderSnapshot {
     bool enabled{true};
     std::vector<Metric> metrics;
     std::optional<TimePoint> lastSuccessfulRefresh;
-    // Set from a 429 Retry-After. This account is not polled again before then.
+    // Set on a 429. This account's usage is not requested again before then.
     std::optional<TimePoint> rateLimitedUntil;
+    unsigned int rateLimitStreak{0};
+    // A 429 seen during the current read. settleRateLimit turns it into a limit once every endpoint has answered.
+    std::optional<std::chrono::seconds> pendingRetryAfter;
 };
 
 struct AggregateStatus {
     std::optional<double> remainingFraction;
     std::string providerId;
     MetricKind kind{MetricKind::Session};
+    std::optional<TimePoint> resetAt;
 };
 
 struct RgbColor {
@@ -64,7 +68,8 @@ struct RgbColor {
 // Only fresh, confirmed exhaustion triggers rotation. Unknown resets require manual retry.
 [[nodiscard]] std::optional<TimePoint> exhaustedUntil(const ProviderSnapshot& provider, TimePoint now);
 
-[[nodiscard]] AggregateStatus aggregateStatus(const std::vector<ProviderSnapshot>& providers);
+[[nodiscard]] AggregateStatus aggregateStatus(const std::vector<ProviderSnapshot>& providers,
+                                              TimePoint now = std::chrono::system_clock::now());
 [[nodiscard]] bool monitorIncludesProvider(const ProviderSnapshot& provider);
 [[nodiscard]] bool providerAuthenticationFailed(const ProviderSnapshot& provider);
 // A poll failed when nothing came back current and some metric is stale, errored, or rejected. Partial results
@@ -81,6 +86,12 @@ inline constexpr std::chrono::seconds kUsageActivityFade{60 * 60};
 [[nodiscard]] RgbColor applyUsageActivity(RgbColor color, double activity);
 [[nodiscard]] bool usageDrewDownSince(const Metric& previous, const Metric& current);
 [[nodiscard]] bool providerRateLimited(const ProviderSnapshot& provider, TimePoint now);
+// How long to leave an account's usage alone after a 429: the provider's Retry-After, but at least 5 minutes doubling
+// with each consecutive 429 up to an hour. A missing or zero Retry-After must not mean "ask again next poll".
+[[nodiscard]] std::chrono::seconds rateLimitDelay(std::optional<std::chrono::seconds> retryAfter, unsigned int streak);
+void noteRateLimited(ProviderSnapshot& provider, std::optional<std::chrono::seconds> retryAfter);
+// Ends one usage read. Any data clears the limit, so a 429 from one of several endpoints does not stop the others.
+void settleRateLimit(ProviderSnapshot& provider, bool gotData, TimePoint now);
 // Local CLI logs show this account spending tokens, even if the usage endpoint has no new numbers.
 void markLocalDrawdown(ProviderSnapshot& provider, TimePoint now);
 // A poll result carries the drawdown times from when it started; keep any later local drawdown.
